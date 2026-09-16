@@ -17,7 +17,6 @@ login_manager.init_app(app)
 def load_user(user_id):
     return User.get(user_id)
 
-# WAEC Grading Helper Function
 def get_waec_grade(score):
     if score >= 80: return 'A1'
     elif score >= 70: return 'B2'
@@ -39,14 +38,18 @@ def setup_db():
     cur.execute("CREATE TABLE IF NOT EXISTS classes (class_id SERIAL PRIMARY KEY, class_name VARCHAR(50) NOT NULL UNIQUE)")
     cur.execute("CREATE TABLE IF NOT EXISTS class_enrollments (enrollment_id SERIAL PRIMARY KEY, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, class_id INTEGER REFERENCES classes(class_id) ON DELETE CASCADE, academic_year VARCHAR(9) NOT NULL)")
     
-    # New: Academics & Attendance
+    # Academics & Attendance
     cur.execute("CREATE TABLE IF NOT EXISTS subjects (subject_id SERIAL PRIMARY KEY, subject_name VARCHAR(100) NOT NULL UNIQUE)")
     cur.execute("CREATE TABLE IF NOT EXISTS grades (grade_id SERIAL PRIMARY KEY, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, subject_id INTEGER REFERENCES subjects(subject_id) ON DELETE CASCADE, score INTEGER NOT NULL, waec_grade VARCHAR(2) NOT NULL, academic_year VARCHAR(9) NOT NULL, term VARCHAR(20) NOT NULL)")
     cur.execute("CREATE TABLE IF NOT EXISTS attendance (attendance_id SERIAL PRIMARY KEY, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, record_date DATE NOT NULL, status VARCHAR(10) NOT NULL, UNIQUE(student_id, record_date))")
     
+    # Financial Ledger
+    cur.execute("CREATE TABLE IF NOT EXISTS fees (fee_id SERIAL PRIMARY KEY, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, description VARCHAR(255) NOT NULL, amount_due DECIMAL(10, 2) NOT NULL, date_issued TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    cur.execute("CREATE TABLE IF NOT EXISTS payments (payment_id SERIAL PRIMARY KEY, fee_id INTEGER REFERENCES fees(fee_id) ON DELETE CASCADE, amount_paid DECIMAL(10, 2) NOT NULL, payment_method VARCHAR(50) NOT NULL, payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    
     conn.commit()
     cur.close(); conn.close()
-    return jsonify({"message": "Full School Database (Students, Classes, Grades, Attendance) Initialized!"})
+    return jsonify({"message": "Full Enterprise Database Initialized (Including Financial Ledger)!"})
 
 # --- 2. AUTHENTICATION ---
 @app.route('/api/login', methods=['POST'])
@@ -69,7 +72,7 @@ def logout():
     logout_user()
     return jsonify({"message": "Logged out successfully"})
 
-# --- 3. CORE API ROUTES (CRUD) ---
+# --- 3. CORE & ACADEMIC ROUTES ---
 @app.route('/api/students', methods=['GET'])
 @login_required
 def get_students():
@@ -80,81 +83,81 @@ def get_students():
     cur.close(); conn.close()
     return jsonify({"data": students})
 
-@app.route('/api/subjects', methods=['POST', 'GET'])
-@login_required
-def manage_subjects():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    if request.method == 'POST':
-        name = request.get_json().get('subject_name')
-        try:
-            cur.execute("INSERT INTO subjects (subject_name) VALUES (%s) RETURNING subject_id", (name,))
-            sid = cur.fetchone()['subject_id']
-            conn.commit()
-            return jsonify({"message": f"Subject added! ID: {sid}"})
-        except:
-            return jsonify({"error": "Subject exists."}), 400
-        finally:
-            cur.close(); conn.close()
-    elif request.method == 'GET':
-        cur.execute("SELECT * FROM subjects")
-        data = cur.fetchall()
-        cur.close(); conn.close()
-        return jsonify({"data": data})
-
 @app.route('/api/grades', methods=['POST'])
 @login_required
 def add_grade():
     data = request.get_json()
     score = int(data.get('score'))
     waec = get_waec_grade(score)
-    
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO grades (student_id, subject_id, score, waec_grade, academic_year, term) VALUES (%s, %s, %s, %s, %s, %s)",
-        (data.get('student_id'), data.get('subject_id'), score, waec, data.get('academic_year'), data.get('term'))
-    )
+    cur.execute("INSERT INTO grades (student_id, subject_id, score, waec_grade, academic_year, term) VALUES (%s, %s, %s, %s, %s, %s)",
+        (data.get('student_id'), data.get('subject_id'), score, waec, data.get('academic_year'), data.get('term')))
     conn.commit()
     cur.close(); conn.close()
-    return jsonify({"message": f"Score {score} ({waec}) recorded successfully!"})
-
-@app.route('/api/attendance', methods=['POST'])
-@login_required
-def mark_attendance():
-    data = request.get_json()
-    today = datetime.now().strftime('%Y-%m-%d')
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("INSERT INTO attendance (student_id, record_date, status) VALUES (%s, %s, %s)",
-                    (data.get('student_id'), today, data.get('status')))
-        conn.commit()
-        return jsonify({"message": f"Attendance marked as {data.get('status')} for today!"})
-    except psycopg2.IntegrityError:
-        conn.rollback()
-        return jsonify({"error": "Attendance already marked for this student today."}), 400
-    finally:
-        cur.close(); conn.close()
+    return jsonify({"message": f"Score {score} ({waec}) recorded!"})
 
 @app.route('/api/report_card/<int:student_id>', methods=['GET'])
 @login_required
 def get_report_card(student_id):
     conn = get_db_connection()
     cur = conn.cursor()
-    query = """
-        SELECT sub.subject_name, g.score, g.waec_grade, g.term 
-        FROM grades g
-        JOIN subjects sub ON g.subject_id = sub.subject_id
-        WHERE g.student_id = %s
-    """
-    cur.execute(query, (student_id,))
+    cur.execute("SELECT sub.subject_name, g.score, g.waec_grade, g.term FROM grades g JOIN subjects sub ON g.subject_id = sub.subject_id WHERE g.student_id = %s", (student_id,))
     grades = cur.fetchall()
     cur.close(); conn.close()
     return jsonify({"student_id": student_id, "grades": grades})
 
+# --- 4. FINANCIAL ROUTES ---
+@app.route('/api/fees/bill', methods=['POST'])
+@login_required
+def bill_student():
+    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
+    data = request.get_json()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO fees (student_id, description, amount_due) VALUES (%s, %s, %s) RETURNING fee_id", 
+                (data.get('student_id'), data.get('description'), data.get('amount_due')))
+    new_id = cur.fetchone()['fee_id']
+    conn.commit()
+    cur.close(); conn.close()
+    return jsonify({"message": f"Bill issued! Fee ID: {new_id}"}), 201
 
-# --- 4. THE REAL FRONTEND (OPTION C) ---
+@app.route('/api/fees/pay', methods=['POST'])
+@login_required
+def log_payment():
+    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
+    data = request.get_json()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO payments (fee_id, amount_paid, payment_method) VALUES (%s, %s, %s) RETURNING payment_id", 
+                (data.get('fee_id'), data.get('amount_paid'), data.get('payment_method')))
+    pid = cur.fetchone()['payment_id']
+    conn.commit()
+    cur.close(); conn.close()
+    return jsonify({"message": f"Payment of {data.get('amount_paid')} logged via {data.get('payment_method')}! Receipt ID: {pid}"}), 201
+
+@app.route('/api/statement/<int:student_id>', methods=['GET'])
+@login_required
+def get_statement(student_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Complex SQL to calculate total owed vs total paid
+    query = """
+        SELECT f.fee_id, f.description, f.amount_due, 
+               COALESCE(SUM(p.amount_paid), 0) as total_paid,
+               (f.amount_due - COALESCE(SUM(p.amount_paid), 0)) as remaining_balance
+        FROM fees f
+        LEFT JOIN payments p ON f.fee_id = p.fee_id
+        WHERE f.student_id = %s
+        GROUP BY f.fee_id, f.description, f.amount_due
+    """
+    cur.execute(query, (student_id,))
+    statement = cur.fetchall()
+    cur.close(); conn.close()
+    return jsonify({"student_id": student_id, "statement": statement}), 200
+
+
+# --- 5. THE REAL FRONTEND ---
 @app.route('/dashboard')
 def dashboard():
     html_template = """
@@ -167,92 +170,98 @@ def dashboard():
         <style>
             :root { --primary: #0f4c81; --secondary: #f4f7f6; --accent: #28a745; --text: #333; }
             body { font-family: 'Segoe UI', system-ui, sans-serif; background-color: var(--secondary); margin: 0; display: flex; color: var(--text); }
-            
-            /* Sidebar Styles */
-            .sidebar { width: 250px; background: var(--primary); color: white; min-height: 100vh; padding: 20px; box-sizing: border-box; }
+            .sidebar { width: 250px; background: var(--primary); color: white; min-height: 100vh; padding: 20px; box-sizing: border-box; position: fixed; }
             .sidebar h2 { margin-top: 0; border-bottom: 1px solid rgba(255,255,255,0.2); padding-bottom: 10px; font-size: 1.2rem; }
             .sidebar button { background: rgba(255,255,255,0.1); color: white; border: none; padding: 12px; width: 100%; text-align: left; margin-bottom: 5px; border-radius: 4px; cursor: pointer; transition: 0.3s; }
             .sidebar button:hover { background: rgba(255,255,255,0.2); }
             
-            /* Main Content Styles */
-            .main-content { flex: 1; padding: 40px; box-sizing: border-box; overflow-y: auto; height: 100vh; }
+            .main-content { margin-left: 250px; flex: 1; padding: 40px; box-sizing: border-box; min-height: 100vh; }
             .card { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 20px; }
-            h3 { margin-top: 0; color: var(--primary); }
+            h3 { margin-top: 0; color: var(--primary); border-bottom: 2px solid #eee; padding-bottom: 8px;}
             input, select { width: 100%; padding: 10px; margin-bottom: 15px; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; }
-            .btn { background: var(--primary); color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-weight: bold; width: 100%; }
+            .btn { background: var(--primary); color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-weight: bold; width: 100%; margin-bottom: 10px;}
             .btn:hover { background: #0c3e69; }
             .btn-success { background: var(--accent); }
             .btn-success:hover { background: #218838; }
-            
-            /* Grid Layouts */
             .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-            pre { background: #1e1e1e; color: #00ff00; padding: 15px; border-radius: 5px; overflow-x: auto; }
+            pre { background: #1e1e1e; color: #00ff00; padding: 15px; border-radius: 5px; overflow-x: auto; white-space: pre-wrap; }
         </style>
     </head>
     <body>
         <div class="sidebar">
             <h2>School Engine</h2>
             <button onclick="document.getElementById('auth-section').scrollIntoView()">1. Authentication</button>
-            <button onclick="document.getElementById('setup-section').scrollIntoView()">2. DB Setup</button>
-            <button onclick="document.getElementById('attendance-section').scrollIntoView()">3. Attendance</button>
-            <button onclick="document.getElementById('grades-section').scrollIntoView()">4. Grading</button>
+            <button onclick="document.getElementById('grades-section').scrollIntoView()">2. Grading</button>
+            <button onclick="document.getElementById('finance-section').scrollIntoView()">3. Financial Desk</button>
             <br><br>
+            <button class="btn-success" onclick="testSetup()">Initialize Database</button>
             <button style="background: #dc3545;" onclick="sendPost('/api/logout', {})">Secure Logout</button>
         </div>
 
         <div class="main-content">
             <h1>Administration Dashboard</h1>
 
-            <div id="setup-section" class="card">
-                <h3>System Setup (Run Once)</h3>
-                <button class="btn btn-success" onclick="testSetup()">Initialize Full Database</button>
-            </div>
-
             <div id="auth-section" class="card grid-2">
                 <div>
-                    <h3>Login</h3>
+                    <h3>System Login</h3>
                     <input type="email" id="email" placeholder="Email">
                     <input type="password" id="pass" placeholder="Password">
                     <button class="btn" onclick="sendPost('/api/login', {email: document.getElementById('email').value, password: document.getElementById('pass').value})">Login</button>
                 </div>
                 <div>
-                    <h3>Subjects Setup</h3>
-                    <input type="text" id="subjName" placeholder="e.g. Mathematics">
-                    <button class="btn" onclick="sendPost('/api/subjects', {subject_name: document.getElementById('subjName').value})">Add Subject</button>
+                    <h3>Student Roster</h3>
+                    <button class="btn" onclick="fetchData('/api/students')">Load All Students</button>
                 </div>
             </div>
 
-            <div class="grid-2">
-                <div id="attendance-section" class="card">
-                    <h3>Daily Attendance</h3>
-                    <input type="number" id="attStuId" placeholder="Student ID">
-                    <select id="attStatus">
-                        <option value="Present">Present</option>
-                        <option value="Absent">Absent</option>
-                    </select>
-                    <button class="btn btn-success" onclick="sendPost('/api/attendance', {student_id: document.getElementById('attStuId').value, status: document.getElementById('attStatus').value})">Mark Register</button>
-                </div>
-
-                <div id="grades-section" class="card">
+            <div id="grades-section" class="card grid-2">
+                <div>
                     <h3>Record Exam Grade</h3>
                     <input type="number" id="gStuId" placeholder="Student ID">
                     <input type="number" id="gSubId" placeholder="Subject ID">
                     <input type="number" id="gScore" placeholder="Score (0-100)">
                     <input type="text" id="gTerm" placeholder="Term (e.g. Term 1)">
                     <input type="text" id="gYear" placeholder="Year (e.g. 2026)">
-                    <button class="btn" onclick="sendPost('/api/grades', {student_id: document.getElementById('gStuId').value, subject_id: document.getElementById('gSubId').value, score: document.getElementById('gScore').value, term: document.getElementById('gTerm').value, academic_year: document.getElementById('gYear').value})">Save Score & Calc WAEC Grade</button>
+                    <button class="btn" onclick="sendPost('/api/grades', {student_id: document.getElementById('gStuId').value, subject_id: document.getElementById('gSubId').value, score: document.getElementById('gScore').value, term: document.getElementById('gTerm').value, academic_year: document.getElementById('gYear').value})">Save Score & Calc WAEC</button>
+                </div>
+                <div>
+                    <h3>Academic Report Card</h3>
+                    <input type="number" id="repId" placeholder="Student ID">
+                    <button class="btn" onclick="fetchData('/api/report_card/' + document.getElementById('repId').value)">Generate Term Report</button>
+                </div>
+            </div>
+
+            <!-- THE NEW FINANCIAL ENGINE -->
+            <div id="finance-section" class="card grid-2">
+                <div>
+                    <h3>1. Issue Bill</h3>
+                    <input type="number" id="bStuId" placeholder="Student ID">
+                    <input type="number" id="bAmount" placeholder="Amount Due (GHS)">
+                    <input type="text" id="bDesc" placeholder="Description (e.g. Term 1 Fees)">
+                    <button class="btn btn-success" onclick="sendPost('/api/fees/bill', {student_id: document.getElementById('bStuId').value, amount_due: document.getElementById('bAmount').value, description: document.getElementById('bDesc').value})">Issue Bill</button>
+                </div>
+                <div>
+                    <h3>2. Record Payment</h3>
+                    <input type="number" id="pFeeId" placeholder="Fee ID (from Bill)">
+                    <input type="number" id="pAmount" placeholder="Amount Paid (GHS)">
+                    <select id="pMethod">
+                        <option value="Cash">Cash</option>
+                        <option value="Mobile Money (MoMo)">Mobile Money (MoMo)</option>
+                        <option value="Bank Transfer">Bank Transfer</option>
+                    </select>
+                    <button class="btn btn-success" onclick="sendPost('/api/fees/pay', {fee_id: document.getElementById('pFeeId').value, amount_paid: document.getElementById('pAmount').value, payment_method: document.getElementById('pMethod').value})">Log Payment</button>
                 </div>
             </div>
 
             <div class="card">
-                <h3>Report Cards</h3>
-                <input type="number" id="repId" placeholder="Student ID to generate report">
-                <button class="btn" onclick="fetchData('/api/report_card/' + document.getElementById('repId').value)">Generate Term Report</button>
+                <h3>Generate Financial Statement</h3>
+                <input type="number" id="statStuId" placeholder="Student ID">
+                <button class="btn" onclick="fetchData('/api/statement/' + document.getElementById('statStuId').value)">Calculate Outstanding Balance</button>
             </div>
 
             <div class="card">
                 <h3>System Console Output</h3>
-                <pre id="output">Waiting for commands...</pre>
+                <pre id="output">System data will appear here...</pre>
             </div>
         </div>
 
