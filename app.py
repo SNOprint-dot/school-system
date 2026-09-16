@@ -47,7 +47,7 @@ def setup_db():
     cur.close(); conn.close()
     return jsonify({"message": "Full Enterprise Database Initialized!"})
 
-# --- 2. AUTHENTICATION ---
+# --- 2. AUTHENTICATION & ROLES ---
 @app.route('/api/login', methods=['POST'])
 def login():
     data = request.get_json()
@@ -61,6 +61,25 @@ def login():
         login_user(user)
         return jsonify({"message": f"Welcome back, {user.role}!"})
     return jsonify({"error": "Invalid credentials"}), 401
+
+@app.route('/api/register_teacher', methods=['POST'])
+@login_required
+def register_teacher():
+    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
+    data = request.get_json()
+    hashed = generate_password_hash(data.get('password'))
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO system_users (email, password_hash, role) VALUES (%s, %s, %s) RETURNING user_id", (data.get('email'), hashed, 'teacher'))
+        uid = cur.fetchone()['user_id']
+        conn.commit()
+        return jsonify({"message": f"Teacher account created! ID: {uid}"}), 201
+    except psycopg2.IntegrityError:
+        conn.rollback()
+        return jsonify({"error": "Email exists."}), 409
+    finally:
+        cur.close(); conn.close()
 
 @app.route('/api/logout', methods=['POST'])
 @login_required
@@ -106,6 +125,7 @@ def get_report_card(student_id):
 @app.route('/api/fees/bill', methods=['POST'])
 @login_required
 def bill_student():
+    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
     data = request.get_json()
     conn = get_db_connection()
     cur = conn.cursor()
@@ -118,6 +138,7 @@ def bill_student():
 @app.route('/api/fees/pay', methods=['POST'])
 @login_required
 def log_payment():
+    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
     data = request.get_json()
     conn = get_db_connection()
     cur = conn.cursor()
@@ -130,6 +151,7 @@ def log_payment():
 @app.route('/api/statement/<int:student_id>', methods=['GET'])
 @login_required
 def get_statement(student_id):
+    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
     conn = get_db_connection()
     cur = conn.cursor()
     query = "SELECT f.fee_id, f.description, f.amount_due, COALESCE(SUM(p.amount_paid), 0) as total_paid, (f.amount_due - COALESCE(SUM(p.amount_paid), 0)) as remaining_balance FROM fees f LEFT JOIN payments p ON f.fee_id = p.fee_id WHERE f.student_id = %s GROUP BY f.fee_id, f.description, f.amount_due"
@@ -138,30 +160,21 @@ def get_statement(student_id):
     cur.close(); conn.close()
     return jsonify({"student_id": student_id, "statement": statement}), 200
 
-# --- 4. DATA EXPORT ROUTE ---
 @app.route('/api/export/grades')
 @login_required
 def export_grades():
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("""
-        SELECT s.first_name, s.last_name, sub.subject_name, g.score, g.waec_grade, g.term, g.academic_year
-        FROM grades g
-        JOIN students s ON g.student_id = s.student_id
-        JOIN subjects sub ON g.subject_id = sub.subject_id
-    """)
+    cur.execute("SELECT s.first_name, s.last_name, sub.subject_name, g.score, g.waec_grade, g.term, g.academic_year FROM grades g JOIN students s ON g.student_id = s.student_id JOIN subjects sub ON g.subject_id = sub.subject_id")
     data = cur.fetchall()
     cur.close(); conn.close()
-    
     si = StringIO()
     cw = csv.writer(si)
     cw.writerow(['First Name', 'Last Name', 'Subject', 'Score', 'WAEC Grade', 'Term', 'Academic Year'])
-    for row in data:
-        cw.writerow([row['first_name'], row['last_name'], row['subject_name'], row['score'], row['waec_grade'], row['term'], row['academic_year']])
-    
+    for row in data: cw.writerow([row['first_name'], row['last_name'], row['subject_name'], row['score'], row['waec_grade'], row['term'], row['academic_year']])
     return Response(si.getvalue(), mimetype='text/csv', headers={"Content-Disposition": "attachment;filename=academic_data.csv"})
 
-# --- 5. THE FRONTEND ---
+# --- 4. THE DYNAMIC FRONTEND (JINJA2 TEMPLATING) ---
 @app.route('/dashboard')
 def dashboard():
     html_template = """
@@ -170,7 +183,7 @@ def dashboard():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Ghana SMS | Admin Dashboard</title>
+        <title>Ghana SMS | Secure Portal</title>
         <style>
             :root { --primary: #0f4c81; --secondary: #f4f7f6; --accent: #28a745; --text: #333; }
             body { font-family: 'Segoe UI', system-ui, sans-serif; background-color: var(--secondary); margin: 0; display: flex; color: var(--text); }
@@ -178,6 +191,8 @@ def dashboard():
             .sidebar h2 { margin-top: 0; border-bottom: 1px solid rgba(255,255,255,0.2); padding-bottom: 10px; font-size: 1.2rem; }
             .sidebar button { background: rgba(255,255,255,0.1); color: white; border: none; padding: 12px; width: 100%; text-align: left; margin-bottom: 5px; border-radius: 4px; cursor: pointer; transition: 0.3s; }
             .sidebar button:hover { background: rgba(255,255,255,0.2); }
+            .user-info { font-size: 0.85rem; color: #a5c3e0; margin-bottom: 20px; word-wrap: break-word;}
+            
             .main-content { margin-left: 250px; flex: 1; padding: 40px; box-sizing: border-box; min-height: 100vh; }
             .card { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 20px; }
             h3 { margin-top: 0; color: var(--primary); border-bottom: 2px solid #eee; padding-bottom: 8px;}
@@ -194,31 +209,47 @@ def dashboard():
     <body>
         <div class="sidebar">
             <h2>School Engine</h2>
-            <button onclick="document.getElementById('auth-section').scrollIntoView()">1. Authentication</button>
-            <button onclick="document.getElementById('grades-section').scrollIntoView()">2. Grading & Data</button>
-            <button onclick="document.getElementById('finance-section').scrollIntoView()">3. Financial Desk</button>
-            <br><br>
-            <button class="btn-success" onclick="testSetup()">Initialize Database</button>
-            <button style="background: #dc3545;" onclick="sendPost('/api/logout', {})">Secure Logout</button>
+            
+            {% if current_user.is_authenticated %}
+                <div class="user-info">
+                    Logged in as:<br>
+                    <b>{{ current_user.email }}</b><br>
+                    Role: <span style="color: #fff; text-transform: uppercase;">{{ current_user.role }}</span>
+                </div>
+                
+                <button onclick="document.getElementById('academics-section').scrollIntoView()">Academics & Data</button>
+                
+                {% if current_user.role == 'admin' %}
+                    <button onclick="document.getElementById('finance-section').scrollIntoView()">Financial Desk</button>
+                    <button onclick="document.getElementById('admin-section').scrollIntoView()">Admin Tools</button>
+                    <br><br>
+                    <button class="btn-warning" onclick="testSetup()">Initialize Database</button>
+                {% endif %}
+                
+                <br><br>
+                <button style="background: #dc3545;" onclick="logout()">Secure Logout</button>
+            
+            {% else %}
+                <div class="user-info">Please log in to access the secure portal.</div>
+            {% endif %}
         </div>
 
         <div class="main-content">
             <h1>Administration Dashboard</h1>
 
-            <div id="auth-section" class="card grid-2">
-                <div>
-                    <h3>System Login</h3>
-                    <input type="email" id="email" placeholder="Email">
-                    <input type="password" id="pass" placeholder="Password">
-                    <button class="btn" onclick="sendPost('/api/login', {email: document.getElementById('email').value, password: document.getElementById('pass').value})">Login</button>
-                </div>
-                <div>
-                    <h3>Student Roster</h3>
-                    <button class="btn" onclick="fetchData('/api/students')">Load All Students</button>
-                </div>
+            <!-- IF NOT LOGGED IN: Show only the Login Box -->
+            {% if not current_user.is_authenticated %}
+            <div class="card" style="max-width: 400px; margin: 0 auto;">
+                <h3>System Login</h3>
+                <input type="email" id="email" placeholder="Email">
+                <input type="password" id="pass" placeholder="Password">
+                <button class="btn" onclick="login()">Login to Portal</button>
             </div>
-
-            <div id="grades-section" class="card grid-2">
+            
+            <!-- IF LOGGED IN: Show the system tools -->
+            {% else %}
+            
+            <div id="academics-section" class="card grid-2">
                 <div>
                     <h3>Record Exam Grade</h3>
                     <input type="number" id="gStuId" placeholder="Student ID">
@@ -230,6 +261,7 @@ def dashboard():
                 </div>
                 <div>
                     <h3>Academic Reports & Data</h3>
+                    <button class="btn" onclick="fetchData('/api/students')">Load All Enrolled Students</button>
                     <input type="number" id="repId" placeholder="Student ID">
                     <button class="btn" onclick="fetchData('/api/report_card/' + document.getElementById('repId').value)">Generate Term Report</button>
                     <hr>
@@ -237,6 +269,8 @@ def dashboard():
                 </div>
             </div>
 
+            <!-- IF ADMIN: Unlock Finance and Admin Tools -->
+            {% if current_user.role == 'admin' %}
             <div id="finance-section" class="card grid-2">
                 <div>
                     <h3>1. Issue Bill</h3>
@@ -255,22 +289,50 @@ def dashboard():
                         <option value="Bank Transfer">Bank Transfer</option>
                     </select>
                     <button class="btn btn-success" onclick="sendPost('/api/fees/pay', {fee_id: document.getElementById('pFeeId').value, amount_paid: document.getElementById('pAmount').value, payment_method: document.getElementById('pMethod').value})">Log Payment</button>
+                    <hr>
+                    <input type="number" id="statStuId" placeholder="Student ID">
+                    <button class="btn" onclick="fetchData('/api/statement/' + document.getElementById('statStuId').value)">Calculate Outstanding Balance</button>
                 </div>
             </div>
 
-            <div class="card">
-                <h3>Generate Financial Statement</h3>
-                <input type="number" id="statStuId" placeholder="Student ID">
-                <button class="btn" onclick="fetchData('/api/statement/' + document.getElementById('statStuId').value)">Calculate Outstanding Balance</button>
+            <div id="admin-section" class="card" style="max-width: 500px;">
+                <h3>Register New Staff (Teacher)</h3>
+                <input type="email" id="tEmail" placeholder="Teacher Email">
+                <input type="password" id="tPass" placeholder="Teacher Password">
+                <button class="btn" onclick="sendPost('/api/register_teacher', {email: document.getElementById('tEmail').value, password: document.getElementById('tPass').value})">Create Teacher Account</button>
             </div>
+            {% endif %}
+            
+            {% endif %}
 
             <div class="card">
                 <h3>System Console Output</h3>
-                <pre id="output">System data will appear here...</pre>
+                <pre id="output">Waiting for data...</pre>
             </div>
         </div>
 
         <script>
+            // This new login function forces the page to refresh upon success
+            // so the Jinja2 template can instantly read the new user's role and unlock the UI!
+            async function login() {
+                const email = document.getElementById('email').value;
+                const pass = document.getElementById('pass').value;
+                const res = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({email: email, password: pass})
+                });
+                if (res.ok) {
+                    window.location.reload(); 
+                } else {
+                    const data = await res.json();
+                    document.getElementById('output').innerText = JSON.stringify(data, null, 4);
+                }
+            }
+            async function logout() {
+                await fetch('/api/logout', { method: 'POST' });
+                window.location.reload();
+            }
             async function testSetup() {
                 const res = await fetch('/api/setup_db');
                 document.getElementById('output').innerText = await res.text();
@@ -299,7 +361,7 @@ def dashboard():
     </body>
     </html>
     """
-    return render_template_string(html_template)
+    return render_template_string(html_template, current_user=current_user)
 
 if __name__ == '__main__':
     app.run(debug=True)
