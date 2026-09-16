@@ -25,8 +25,6 @@ def home():
 def setup_db():
     conn = get_db_connection()
     cur = conn.cursor()
-    
-    # 1. Students Table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS students (
             student_id SERIAL PRIMARY KEY,
@@ -37,16 +35,12 @@ def setup_db():
             enrollment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    
-    # 2. Classes Table (e.g., JHS 1, JHS 2)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS classes (
             class_id SERIAL PRIMARY KEY,
             class_name VARCHAR(50) NOT NULL UNIQUE
         )
     """)
-    
-    # 3. Enrollments Table (Links Students to Classes)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS class_enrollments (
             enrollment_id SERIAL PRIMARY KEY,
@@ -55,7 +49,6 @@ def setup_db():
             academic_year VARCHAR(9) NOT NULL
         )
     """)
-    
     conn.commit()
     cur.close()
     conn.close()
@@ -140,7 +133,6 @@ def enroll_student():
 @app.route('/api/students', methods=['GET'])
 @login_required
 def get_students():
-    # Both Admins and Teachers can view the roster
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT student_id, first_name, last_name, guardian_name, guardian_contact, enrollment_date::text FROM students ORDER BY student_id DESC")
@@ -205,6 +197,24 @@ def assign_class():
     cur.close(); conn.close()
     return jsonify({"message": f"Student {student_id} assigned to Class {class_id} for {year}!"}), 201
 
+@app.route('/api/roster/<int:class_id>', methods=['GET'])
+@login_required
+def get_class_roster(class_id):
+    # This is where the SQL JOIN magic happens
+    conn = get_db_connection()
+    cur = conn.cursor()
+    query = """
+        SELECT s.student_id, s.first_name, s.last_name, c.class_name, ce.academic_year
+        FROM class_enrollments ce
+        JOIN students s ON ce.student_id = s.student_id
+        JOIN classes c ON ce.class_id = c.class_id
+        WHERE c.class_id = %s
+    """
+    cur.execute(query, (class_id,))
+    roster = cur.fetchall()
+    cur.close(); conn.close()
+    return jsonify({"status": "success", "class_id": class_id, "students": roster}), 200
+
 
 # --- 5. ENHANCED DASHBOARD FRONTEND ---
 @app.route('/test_ui')
@@ -231,10 +241,9 @@ def test_ui():
         <body>
             <div class="container">
                 <h1>SMS Control Dashboard</h1>
-                <button class="setup-btn" onclick="testSetup()">1. INITIALIZE DATABASE (Click First)</button>
+                <button class="setup-btn" onclick="testSetup()">1. INITIALIZE DATABASE (Only if needed)</button>
                 
                 <div class="grid">
-                    <!-- Auth Section -->
                     <div class="card">
                         <h3>Authentication</h3>
                         <input type="email" id="email" placeholder="Email (admin or teacher)">
@@ -246,7 +255,6 @@ def test_ui():
                         <button onclick="sendPost('/api/register_teacher', {email: document.getElementById('tEmail').value, password: document.getElementById('tPass').value})">Register Teacher (Admin Only)</button>
                     </div>
 
-                    <!-- Academic Section -->
                     <div class="card">
                         <h3>Academic Structure</h3>
                         <input type="text" id="className" placeholder="Class Name (e.g., JHS 1)">
@@ -257,9 +265,11 @@ def test_ui():
                         <input type="number" id="a_cId" placeholder="Class ID">
                         <input type="text" id="a_year" placeholder="Academic Year (e.g. 2026/2027)">
                         <button onclick="sendPost('/api/assign_class', {student_id: document.getElementById('a_sId').value, class_id: document.getElementById('a_cId').value, academic_year: document.getElementById('a_year').value})">Assign Student to Class</button>
+                        <hr>
+                        <input type="number" id="v_cId" placeholder="Class ID to View Roster">
+                        <button style="background: #28a745;" onclick="fetchData('/api/roster/' + document.getElementById('v_cId').value)">View Class Roster (SQL JOIN)</button>
                     </div>
 
-                    <!-- Student Section -->
                     <div class="card">
                         <h3>Student Operations</h3>
                         <button onclick="fetchData('/api/students')">View Student Roster</button>
