@@ -46,7 +46,6 @@ def register_admin():
     data = request.get_json()
     email = data.get('email')
     password = data.get('password')
-
     if not email or not password:
         return jsonify({"error": "Email and password required"}), 400
 
@@ -85,32 +84,28 @@ def login():
         user = User(user_data['user_id'], user_data['email'], user_data['role'])
         login_user(user)
         return jsonify({"message": "Logged in successfully!", "role": user.role})
-    
     return jsonify({"error": "Invalid email or password"}), 401
 
 @app.route('/api/dashboard', methods=['GET'])
 @login_required
 def dashboard():
-    return jsonify({
-        "message": f"Welcome to the secure control panel, {current_user.email}!",
-        "role": current_user.role
-    })
+    return jsonify({"message": f"Welcome to the secure control panel, {current_user.email}!", "role": current_user.role})
 
-# --- STUDENT MANAGEMENT ROUTES ---
+# --- STUDENT MANAGEMENT ROUTES (CRUD) ---
+
+# 1. CREATE (Enroll)
 @app.route('/api/enroll_student', methods=['POST'])
 @login_required
 def enroll_student():
     if current_user.role != 'admin':
-        return jsonify({"error": "Unauthorized. Only administrators can enroll students."}), 403
+        return jsonify({"error": "Unauthorized"}), 403
         
     data = request.get_json()
-    first = data.get('first_name')
-    last = data.get('last_name')
-    guardian = data.get('guardian_name')
-    contact = data.get('guardian_contact')
+    first, last = data.get('first_name'), data.get('last_name')
+    guardian, contact = data.get('guardian_name'), data.get('guardian_contact')
 
     if not all([first, last, guardian, contact]):
-        return jsonify({"error": "Missing student details! All fields are required."}), 400
+        return jsonify({"error": "Missing student details!"}), 400
 
     conn = get_db_connection()
     cur = conn.cursor()
@@ -122,24 +117,70 @@ def enroll_student():
     conn.commit()
     cur.close()
     conn.close()
-    
     return jsonify({"message": f"Student {first} {last} successfully enrolled with ID: {new_id}"}), 201
 
+# 2. READ (View Roster)
 @app.route('/api/students', methods=['GET'])
 @login_required
 def get_students():
     if current_user.role != 'admin':
-        return jsonify({"error": "Unauthorized. Only administrators can view the roster."}), 403
+        return jsonify({"error": "Unauthorized"}), 403
         
     conn = get_db_connection()
     cur = conn.cursor()
-    # We cast enrollment_date to text (::text) so the JSON serializer processes it smoothly
     cur.execute("SELECT student_id, first_name, last_name, guardian_name, guardian_contact, enrollment_date::text FROM students ORDER BY student_id DESC")
     students = cur.fetchall()
     cur.close()
     conn.close()
-    
     return jsonify({"status": "success", "total_students": len(students), "data": students}), 200
+
+# 3. UPDATE (Edit Guardian Contact)
+@app.route('/api/students/<int:student_id>', methods=['PUT'])
+@login_required
+def update_student(student_id):
+    if current_user.role != 'admin':
+        return jsonify({"error": "Unauthorized"}), 403
+
+    data = request.get_json()
+    new_contact = data.get('guardian_contact')
+
+    if not new_contact:
+        return jsonify({"error": "Please provide a new contact number."}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE students SET guardian_contact = %s WHERE student_id = %s RETURNING student_id",
+        (new_contact, student_id)
+    )
+    updated = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    if updated:
+        return jsonify({"message": f"Student ID {student_id} contact updated successfully!"}), 200
+    return jsonify({"error": "Student not found!"}), 404
+
+# 4. DELETE (Remove Student)
+@app.route('/api/students/<int:student_id>', methods=['DELETE'])
+@login_required
+def delete_student(student_id):
+    if current_user.role != 'admin':
+        return jsonify({"error": "Unauthorized"}), 403
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM students WHERE student_id = %s RETURNING student_id", (student_id,))
+    deleted = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    if deleted:
+        return jsonify({"message": f"Student ID {student_id} has been permanently deleted."}), 200
+    return jsonify({"error": "Student not found!"}), 404
+
 
 # --- TEMPORARY BROWSER TESTING UI ---
 @app.route('/test_ui')
@@ -148,11 +189,6 @@ def test_ui():
     <html>
         <body style="font-family: Arial; padding: 20px; max-width: 600px;">
             <h2>SMS Testing Interface</h2>
-            
-            <div style="background: #ffeeba; padding: 15px; margin-bottom: 10px;">
-                <h3>0. Setup Database</h3>
-                <button onclick="testSetup()" style="padding: 5px;">Build Tables in Neon</button>
-            </div>
             
             <div style="background: #f4f4f4; padding: 15px; margin-bottom: 10px;">
                 <h3>1. Admin Auth</h3>
@@ -171,17 +207,23 @@ def test_ui():
             </div>
 
             <div style="background: #d4edda; padding: 15px; margin-bottom: 10px;">
-                <h3>3. View Roster (Requires Admin Login)</h3>
+                <h3>3. View Roster</h3>
                 <button onclick="fetchStudents()" style="padding: 5px;">Get All Students</button>
+            </div>
+            
+            <div style="background: #ffeeba; padding: 15px; margin-bottom: 10px;">
+                <h3>4. Update & Delete (Needs Student ID)</h3>
+                <input type="number" id="sId" placeholder="Student ID (e.g., 1)" style="padding: 5px; margin-bottom: 10px;"><br>
+                
+                <input type="text" id="newContact" placeholder="New Phone Number" style="padding: 5px;">
+                <button onclick="updateStudent()" style="padding: 5px;">Update Phone</button><br><br>
+                
+                <button onclick="deleteStudent()" style="padding: 5px; background: #ffcccc;">Delete Student</button>
             </div>
 
             <pre id="output" style="background: #333; color: #0f0; padding: 15px; margin-top: 20px; white-space: pre-wrap;"></pre>
 
             <script>
-                async function testSetup() {
-                    const res = await fetch('/api/setup_db');
-                    document.getElementById('output').innerText = await res.text();
-                }
                 async function sendAuth(endpoint) {
                     const email = document.getElementById('email').value;
                     const password = document.getElementById('pass').value;
@@ -208,11 +250,25 @@ def test_ui():
                     const res = await fetch('/api/students');
                     try {
                         const data = await res.json();
-                        // This prints the raw data clearly in a structured tree
                         document.getElementById('output').innerText = JSON.stringify(data, null, 4); 
                     } catch (e) {
                         document.getElementById('output').innerText = await res.text();
                     }
+                }
+                async function updateStudent() {
+                    const id = document.getElementById('sId').value;
+                    const contact = document.getElementById('newContact').value;
+                    const res = await fetch('/api/students/' + id, {
+                        method: 'PUT',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({guardian_contact: contact})
+                    });
+                    document.getElementById('output').innerText = await res.text();
+                }
+                async function deleteStudent() {
+                    const id = document.getElementById('sId').value;
+                    const res = await fetch('/api/students/' + id, { method: 'DELETE' });
+                    document.getElementById('output').innerText = await res.text();
                 }
             </script>
         </body>
