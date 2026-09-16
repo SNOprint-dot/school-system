@@ -25,7 +25,6 @@ def home():
 def setup_db():
     conn = get_db_connection()
     cur = conn.cursor()
-    # Safely construct the students table in your PostgreSQL database
     cur.execute("""
         CREATE TABLE IF NOT EXISTS students (
             student_id SERIAL PRIMARY KEY,
@@ -97,11 +96,10 @@ def dashboard():
         "role": current_user.role
     })
 
-# --- STUDENT ENROLLMENT ROUTE ---
+# --- STUDENT MANAGEMENT ROUTES ---
 @app.route('/api/enroll_student', methods=['POST'])
 @login_required
 def enroll_student():
-    # Security check: Bounce the request if the user is not an admin
     if current_user.role != 'admin':
         return jsonify({"error": "Unauthorized. Only administrators can enroll students."}), 403
         
@@ -127,6 +125,22 @@ def enroll_student():
     
     return jsonify({"message": f"Student {first} {last} successfully enrolled with ID: {new_id}"}), 201
 
+@app.route('/api/students', methods=['GET'])
+@login_required
+def get_students():
+    if current_user.role != 'admin':
+        return jsonify({"error": "Unauthorized. Only administrators can view the roster."}), 403
+        
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # We cast enrollment_date to text (::text) so the JSON serializer processes it smoothly
+    cur.execute("SELECT student_id, first_name, last_name, guardian_name, guardian_contact, enrollment_date::text FROM students ORDER BY student_id DESC")
+    students = cur.fetchall()
+    cur.close()
+    conn.close()
+    
+    return jsonify({"status": "success", "total_students": len(students), "data": students}), 200
+
 # --- TEMPORARY BROWSER TESTING UI ---
 @app.route('/test_ui')
 def test_ui():
@@ -148,12 +162,17 @@ def test_ui():
             </div>
             
             <div style="background: #e2e3e5; padding: 15px; margin-bottom: 10px;">
-                <h3>2. Enroll Student (Requires Admin Login)</h3>
+                <h3>2. Enroll Student</h3>
                 <input type="text" id="fName" placeholder="First Name" style="padding: 5px;">
                 <input type="text" id="lName" placeholder="Last Name" style="padding: 5px;"><br><br>
                 <input type="text" id="gName" placeholder="Guardian Name" style="padding: 5px;">
-                <input type="text" id="gContact" placeholder="Guardian Contact (e.g., 024...)" style="padding: 5px;"><br><br>
+                <input type="text" id="gContact" placeholder="Guardian Contact" style="padding: 5px;"><br><br>
                 <button onclick="enrollStudent()" style="padding: 5px;">Enroll Student</button>
+            </div>
+
+            <div style="background: #d4edda; padding: 15px; margin-bottom: 10px;">
+                <h3>3. View Roster (Requires Admin Login)</h3>
+                <button onclick="fetchStudents()" style="padding: 5px;">Get All Students</button>
             </div>
 
             <pre id="output" style="background: #333; color: #0f0; padding: 15px; margin-top: 20px; white-space: pre-wrap;"></pre>
@@ -184,6 +203,16 @@ def test_ui():
                         body: JSON.stringify({first_name, last_name, guardian_name, guardian_contact})
                     });
                     document.getElementById('output').innerText = await res.text();
+                }
+                async function fetchStudents() {
+                    const res = await fetch('/api/students');
+                    try {
+                        const data = await res.json();
+                        // This prints the raw data clearly in a structured tree
+                        document.getElementById('output').innerText = JSON.stringify(data, null, 4); 
+                    } catch (e) {
+                        document.getElementById('output').innerText = await res.text();
+                    }
                 }
             </script>
         </body>
