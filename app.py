@@ -20,11 +20,13 @@ def load_user(user_id):
 def home():
     return jsonify({"message": "Ghana School Management System API is Live!"})
 
-# --- SYSTEM SETUP ---
+# --- 1. SYSTEM & DATABASE SETUP ---
 @app.route('/api/setup_db')
 def setup_db():
     conn = get_db_connection()
     cur = conn.cursor()
+    
+    # 1. Students Table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS students (
             student_id SERIAL PRIMARY KEY,
@@ -35,240 +37,269 @@ def setup_db():
             enrollment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    
+    # 2. Classes Table (e.g., JHS 1, JHS 2)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS classes (
+            class_id SERIAL PRIMARY KEY,
+            class_name VARCHAR(50) NOT NULL UNIQUE
+        )
+    """)
+    
+    # 3. Enrollments Table (Links Students to Classes)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS class_enrollments (
+            enrollment_id SERIAL PRIMARY KEY,
+            student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE,
+            class_id INTEGER REFERENCES classes(class_id) ON DELETE CASCADE,
+            academic_year VARCHAR(9) NOT NULL
+        )
+    """)
+    
     conn.commit()
     cur.close()
     conn.close()
-    return jsonify({"message": "Student table successfully verified/created in Neon!"})
+    return jsonify({"message": "Relational database tables successfully built in Neon!"})
 
-# --- SECURITY & AUTHENTICATION ROUTES ---
+# --- 2. AUTHENTICATION & ROLES ---
 @app.route('/api/register_admin', methods=['POST'])
 def register_admin():
     data = request.get_json()
-    email = data.get('email')
-    password = data.get('password')
-    if not email or not password:
-        return jsonify({"error": "Email and password required"}), 400
+    email, password = data.get('email'), data.get('password')
+    if not email or not password: return jsonify({"error": "Missing data"}), 400
 
-    hashed_password = generate_password_hash(password)
+    hashed = generate_password_hash(password)
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        cur.execute(
-            "INSERT INTO system_users (email, password_hash, role) VALUES (%s, %s, %s) RETURNING user_id",
-            (email, hashed_password, 'admin')
-        )
-        new_user_id = cur.fetchone()['user_id']
+        cur.execute("INSERT INTO system_users (email, password_hash, role) VALUES (%s, %s, %s) RETURNING user_id", (email, hashed, 'admin'))
+        uid = cur.fetchone()['user_id']
         conn.commit()
-        return jsonify({"message": f"Admin registered successfully! User ID: {new_user_id}"}), 201
+        return jsonify({"message": f"Admin created! ID: {uid}"}), 201
     except psycopg2.IntegrityError:
         conn.rollback()
-        return jsonify({"error": "An account with this email already exists."}), 409
+        return jsonify({"error": "Email exists."}), 409
     finally:
-        cur.close()
-        conn.close()
+        cur.close(); conn.close()
+
+@app.route('/api/register_teacher', methods=['POST'])
+@login_required
+def register_teacher():
+    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
+    
+    data = request.get_json()
+    email, password = data.get('email'), data.get('password')
+    hashed = generate_password_hash(password)
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO system_users (email, password_hash, role) VALUES (%s, %s, %s) RETURNING user_id", (email, hashed, 'teacher'))
+        uid = cur.fetchone()['user_id']
+        conn.commit()
+        return jsonify({"message": f"Teacher account created! ID: {uid}"}), 201
+    except psycopg2.IntegrityError:
+        conn.rollback()
+        return jsonify({"error": "Email exists."}), 409
+    finally:
+        cur.close(); conn.close()
 
 @app.route('/api/login', methods=['POST'])
 def login():
     data = request.get_json()
-    email = data.get('email')
-    password = data.get('password')
-
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT user_id, email, password_hash, role FROM system_users WHERE email = %s", (email,))
+    cur.execute("SELECT user_id, email, password_hash, role FROM system_users WHERE email = %s", (data.get('email'),))
     user_data = cur.fetchone()
-    cur.close()
-    conn.close()
+    cur.close(); conn.close()
 
-    if user_data and check_password_hash(user_data['password_hash'], password):
+    if user_data and check_password_hash(user_data['password_hash'], data.get('password')):
         user = User(user_data['user_id'], user_data['email'], user_data['role'])
         login_user(user)
-        return jsonify({"message": "Logged in successfully!", "role": user.role})
-    return jsonify({"error": "Invalid email or password"}), 401
+        return jsonify({"message": f"Logged in as {user.role}!", "role": user.role})
+    return jsonify({"error": "Invalid credentials"}), 401
 
-@app.route('/api/dashboard', methods=['GET'])
-@login_required
-def dashboard():
-    return jsonify({"message": f"Welcome to the secure control panel, {current_user.email}!", "role": current_user.role})
-
-# --- STUDENT MANAGEMENT ROUTES (CRUD) ---
-
-# 1. CREATE (Enroll)
+# --- 3. STUDENT MANAGEMENT (CRUD) ---
 @app.route('/api/enroll_student', methods=['POST'])
 @login_required
 def enroll_student():
-    if current_user.role != 'admin':
-        return jsonify({"error": "Unauthorized"}), 403
-        
+    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
     data = request.get_json()
-    first, last = data.get('first_name'), data.get('last_name')
-    guardian, contact = data.get('guardian_name'), data.get('guardian_contact')
-
-    if not all([first, last, guardian, contact]):
-        return jsonify({"error": "Missing student details!"}), 400
-
+    
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO students (first_name, last_name, guardian_name, guardian_contact) VALUES (%s, %s, %s, %s) RETURNING student_id",
-        (first, last, guardian, contact)
+        (data.get('first_name'), data.get('last_name'), data.get('guardian_name'), data.get('guardian_contact'))
     )
     new_id = cur.fetchone()['student_id']
     conn.commit()
-    cur.close()
-    conn.close()
-    return jsonify({"message": f"Student {first} {last} successfully enrolled with ID: {new_id}"}), 201
+    cur.close(); conn.close()
+    return jsonify({"message": f"Student enrolled. ID: {new_id}"}), 201
 
-# 2. READ (View Roster)
 @app.route('/api/students', methods=['GET'])
 @login_required
 def get_students():
-    if current_user.role != 'admin':
-        return jsonify({"error": "Unauthorized"}), 403
-        
+    # Both Admins and Teachers can view the roster
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT student_id, first_name, last_name, guardian_name, guardian_contact, enrollment_date::text FROM students ORDER BY student_id DESC")
     students = cur.fetchall()
-    cur.close()
-    conn.close()
-    return jsonify({"status": "success", "total_students": len(students), "data": students}), 200
+    cur.close(); conn.close()
+    return jsonify({"status": "success", "data": students}), 200
 
-# 3. UPDATE (Edit Guardian Contact)
-@app.route('/api/students/<int:student_id>', methods=['PUT'])
-@login_required
-def update_student(student_id):
-    if current_user.role != 'admin':
-        return jsonify({"error": "Unauthorized"}), 403
-
-    data = request.get_json()
-    new_contact = data.get('guardian_contact')
-
-    if not new_contact:
-        return jsonify({"error": "Please provide a new contact number."}), 400
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE students SET guardian_contact = %s WHERE student_id = %s RETURNING student_id",
-        (new_contact, student_id)
-    )
-    updated = cur.fetchone()
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    if updated:
-        return jsonify({"message": f"Student ID {student_id} contact updated successfully!"}), 200
-    return jsonify({"error": "Student not found!"}), 404
-
-# 4. DELETE (Remove Student)
 @app.route('/api/students/<int:student_id>', methods=['DELETE'])
 @login_required
 def delete_student(student_id):
-    if current_user.role != 'admin':
-        return jsonify({"error": "Unauthorized"}), 403
-
+    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("DELETE FROM students WHERE student_id = %s RETURNING student_id", (student_id,))
     deleted = cur.fetchone()
     conn.commit()
-    cur.close()
-    conn.close()
+    cur.close(); conn.close()
+    if deleted: return jsonify({"message": f"Student {student_id} deleted."}), 200
+    return jsonify({"error": "Not found"}), 404
 
-    if deleted:
-        return jsonify({"message": f"Student ID {student_id} has been permanently deleted."}), 200
-    return jsonify({"error": "Student not found!"}), 404
+# --- 4. ACADEMIC STRUCTURE ---
+@app.route('/api/classes', methods=['POST', 'GET'])
+@login_required
+def manage_classes():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    if request.method == 'POST':
+        if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
+        class_name = request.get_json().get('class_name')
+        try:
+            cur.execute("INSERT INTO classes (class_name) VALUES (%s) RETURNING class_id", (class_name,))
+            cid = cur.fetchone()['class_id']
+            conn.commit()
+            return jsonify({"message": f"Class '{class_name}' created! ID: {cid}"}), 201
+        except:
+            return jsonify({"error": "Class already exists or error occurred."}), 400
+        finally:
+            cur.close(); conn.close()
+            
+    elif request.method == 'GET':
+        cur.execute("SELECT * FROM classes")
+        classes = cur.fetchall()
+        cur.close(); conn.close()
+        return jsonify({"classes": classes}), 200
+
+@app.route('/api/assign_class', methods=['POST'])
+@login_required
+def assign_class():
+    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
+    data = request.get_json()
+    student_id, class_id, year = data.get('student_id'), data.get('class_id'), data.get('academic_year')
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO class_enrollments (student_id, class_id, academic_year) VALUES (%s, %s, %s) RETURNING enrollment_id",
+        (student_id, class_id, year)
+    )
+    eid = cur.fetchone()['enrollment_id']
+    conn.commit()
+    cur.close(); conn.close()
+    return jsonify({"message": f"Student {student_id} assigned to Class {class_id} for {year}!"}), 201
 
 
-# --- TEMPORARY BROWSER TESTING UI ---
+# --- 5. ENHANCED DASHBOARD FRONTEND ---
 @app.route('/test_ui')
 def test_ui():
     return """
     <html>
-        <body style="font-family: Arial; padding: 20px; max-width: 600px;">
-            <h2>SMS Testing Interface</h2>
-            
-            <div style="background: #f4f4f4; padding: 15px; margin-bottom: 10px;">
-                <h3>1. Admin Auth</h3>
-                <input type="email" id="email" placeholder="admin@school.com" style="padding: 5px;">
-                <input type="password" id="pass" placeholder="Password" style="padding: 5px;"><br><br>
-                <button onclick="sendAuth('/api/login')" style="padding: 5px;">Login as Admin</button>
-            </div>
-            
-            <div style="background: #e2e3e5; padding: 15px; margin-bottom: 10px;">
-                <h3>2. Enroll Student</h3>
-                <input type="text" id="fName" placeholder="First Name" style="padding: 5px;">
-                <input type="text" id="lName" placeholder="Last Name" style="padding: 5px;"><br><br>
-                <input type="text" id="gName" placeholder="Guardian Name" style="padding: 5px;">
-                <input type="text" id="gContact" placeholder="Guardian Contact" style="padding: 5px;"><br><br>
-                <button onclick="enrollStudent()" style="padding: 5px;">Enroll Student</button>
-            </div>
-
-            <div style="background: #d4edda; padding: 15px; margin-bottom: 10px;">
-                <h3>3. View Roster</h3>
-                <button onclick="fetchStudents()" style="padding: 5px;">Get All Students</button>
-            </div>
-            
-            <div style="background: #ffeeba; padding: 15px; margin-bottom: 10px;">
-                <h3>4. Update & Delete (Needs Student ID)</h3>
-                <input type="number" id="sId" placeholder="Student ID (e.g., 1)" style="padding: 5px; margin-bottom: 10px;"><br>
+        <head>
+            <style>
+                body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f0f2f5; margin: 0; padding: 20px; }
+                .container { max-width: 900px; margin: auto; }
+                h1 { color: #1a73e8; text-align: center; }
+                .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+                .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+                .card h3 { margin-top: 0; color: #333; border-bottom: 2px solid #eee; padding-bottom: 5px; }
+                input, button { width: 100%; padding: 10px; margin: 5px 0; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+                button { background: #1a73e8; color: white; border: none; cursor: pointer; font-weight: bold; }
+                button:hover { background: #1557b0; }
+                button.danger { background: #dc3545; }
+                button.danger:hover { background: #c82333; }
+                pre { background: #282c34; color: #61dafb; padding: 15px; border-radius: 8px; overflow-x: auto; font-size: 14px; }
+                .setup-btn { background: #ff9800; margin-bottom: 20px;}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>SMS Control Dashboard</h1>
+                <button class="setup-btn" onclick="testSetup()">1. INITIALIZE DATABASE (Click First)</button>
                 
-                <input type="text" id="newContact" placeholder="New Phone Number" style="padding: 5px;">
-                <button onclick="updateStudent()" style="padding: 5px;">Update Phone</button><br><br>
-                
-                <button onclick="deleteStudent()" style="padding: 5px; background: #ffcccc;">Delete Student</button>
-            </div>
+                <div class="grid">
+                    <!-- Auth Section -->
+                    <div class="card">
+                        <h3>Authentication</h3>
+                        <input type="email" id="email" placeholder="Email (admin or teacher)">
+                        <input type="password" id="pass" placeholder="Password">
+                        <button onclick="sendPost('/api/login', {email: document.getElementById('email').value, password: document.getElementById('pass').value})">Login</button>
+                        <hr>
+                        <input type="email" id="tEmail" placeholder="Teacher Email">
+                        <input type="password" id="tPass" placeholder="Teacher Password">
+                        <button onclick="sendPost('/api/register_teacher', {email: document.getElementById('tEmail').value, password: document.getElementById('tPass').value})">Register Teacher (Admin Only)</button>
+                    </div>
 
-            <pre id="output" style="background: #333; color: #0f0; padding: 15px; margin-top: 20px; white-space: pre-wrap;"></pre>
+                    <!-- Academic Section -->
+                    <div class="card">
+                        <h3>Academic Structure</h3>
+                        <input type="text" id="className" placeholder="Class Name (e.g., JHS 1)">
+                        <button onclick="sendPost('/api/classes', {class_name: document.getElementById('className').value})">Create Class</button>
+                        <button onclick="fetchData('/api/classes')">View All Classes</button>
+                        <hr>
+                        <input type="number" id="a_sId" placeholder="Student ID">
+                        <input type="number" id="a_cId" placeholder="Class ID">
+                        <input type="text" id="a_year" placeholder="Academic Year (e.g. 2026/2027)">
+                        <button onclick="sendPost('/api/assign_class', {student_id: document.getElementById('a_sId').value, class_id: document.getElementById('a_cId').value, academic_year: document.getElementById('a_year').value})">Assign Student to Class</button>
+                    </div>
+
+                    <!-- Student Section -->
+                    <div class="card">
+                        <h3>Student Operations</h3>
+                        <button onclick="fetchData('/api/students')">View Student Roster</button>
+                        <hr>
+                        <input type="number" id="delId" placeholder="Student ID to Delete">
+                        <button class="danger" onclick="sendDel('/api/students/' + document.getElementById('delId').value)">Delete Student (Admin Only)</button>
+                    </div>
+                </div>
+
+                <pre id="output">System output will appear here...</pre>
+            </div>
 
             <script>
-                async function sendAuth(endpoint) {
-                    const email = document.getElementById('email').value;
-                    const password = document.getElementById('pass').value;
+                async function testSetup() {
+                    const res = await fetch('/api/setup_db');
+                    document.getElementById('output').innerText = await res.text();
+                }
+                async function sendPost(endpoint, payload) {
                     const res = await fetch(endpoint, {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({email, password})
+                        body: JSON.stringify(payload)
                     });
-                    document.getElementById('output').innerText = await res.text();
+                    handleResponse(res);
                 }
-                async function enrollStudent() {
-                    const first_name = document.getElementById('fName').value;
-                    const last_name = document.getElementById('lName').value;
-                    const guardian_name = document.getElementById('gName').value;
-                    const guardian_contact = document.getElementById('gContact').value;
-                    const res = await fetch('/api/enroll_student', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({first_name, last_name, guardian_name, guardian_contact})
-                    });
-                    document.getElementById('output').innerText = await res.text();
+                async function sendDel(endpoint) {
+                    const res = await fetch(endpoint, { method: 'DELETE' });
+                    handleResponse(res);
                 }
-                async function fetchStudents() {
-                    const res = await fetch('/api/students');
+                async function fetchData(endpoint) {
+                    const res = await fetch(endpoint);
+                    handleResponse(res);
+                }
+                async function handleResponse(res) {
                     try {
                         const data = await res.json();
-                        document.getElementById('output').innerText = JSON.stringify(data, null, 4); 
+                        document.getElementById('output').innerText = JSON.stringify(data, null, 4);
                     } catch (e) {
                         document.getElementById('output').innerText = await res.text();
                     }
-                }
-                async function updateStudent() {
-                    const id = document.getElementById('sId').value;
-                    const contact = document.getElementById('newContact').value;
-                    const res = await fetch('/api/students/' + id, {
-                        method: 'PUT',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({guardian_contact: contact})
-                    });
-                    document.getElementById('output').innerText = await res.text();
-                }
-                async function deleteStudent() {
-                    const id = document.getElementById('sId').value;
-                    const res = await fetch('/api/students/' + id, { method: 'DELETE' });
-                    document.getElementById('output').innerText = await res.text();
                 }
             </script>
         </body>
