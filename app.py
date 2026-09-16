@@ -45,9 +45,9 @@ def setup_db():
     cur.execute("CREATE TABLE IF NOT EXISTS payments (payment_id SERIAL PRIMARY KEY, fee_id INTEGER REFERENCES fees(fee_id) ON DELETE CASCADE, amount_paid DECIMAL(10, 2) NOT NULL, payment_method VARCHAR(50) NOT NULL, payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     conn.commit()
     cur.close(); conn.close()
-    return jsonify({"message": "Full Enterprise Database Initialized!"})
+    return jsonify({"message": "Database synchronized perfectly!"})
 
-# --- 2. AUTHENTICATION & ROLES ---
+# --- 2. AUTHENTICATION ---
 @app.route('/api/login', methods=['POST'])
 def login():
     data = request.get_json()
@@ -59,8 +59,8 @@ def login():
     if user_data and check_password_hash(user_data['password_hash'], data.get('password')):
         user = User(user_data['user_id'], user_data['email'], user_data['role'])
         login_user(user)
-        return jsonify({"message": f"Welcome back, {user.role}!"})
-    return jsonify({"error": "Invalid credentials"}), 401
+        return jsonify({"message": f"Welcome back! Logged in as {user.role}."})
+    return jsonify({"error": "Invalid credentials!"}), 401
 
 @app.route('/api/register_teacher', methods=['POST'])
 @login_required
@@ -72,12 +72,11 @@ def register_teacher():
     cur = conn.cursor()
     try:
         cur.execute("INSERT INTO system_users (email, password_hash, role) VALUES (%s, %s, %s) RETURNING user_id", (data.get('email'), hashed, 'teacher'))
-        uid = cur.fetchone()['user_id']
         conn.commit()
-        return jsonify({"message": f"Teacher account created! ID: {uid}"}), 201
+        return jsonify({"message": "Teacher account successfully created!"}), 201
     except psycopg2.IntegrityError:
         conn.rollback()
-        return jsonify({"error": "Email exists."}), 409
+        return jsonify({"error": "Email already registered."}), 409
     finally:
         cur.close(); conn.close()
 
@@ -85,7 +84,7 @@ def register_teacher():
 @login_required
 def logout():
     logout_user()
-    return jsonify({"message": "Logged out successfully"})
+    return jsonify({"message": "Logged out safely."})
 
 # --- 3. ACADEMICS & FINANCIALS ---
 @app.route('/api/students', methods=['GET'])
@@ -120,7 +119,7 @@ def get_report_card(student_id):
     cur.execute("SELECT sub.subject_name, g.score, g.waec_grade, g.term FROM grades g JOIN subjects sub ON g.subject_id = sub.subject_id WHERE g.student_id = %s", (student_id,))
     grades = cur.fetchall()
     cur.close(); conn.close()
-    return jsonify({"student_id": student_id, "grades": grades})
+    return jsonify({"grades": grades})
 
 @app.route('/api/fees/bill', methods=['POST'])
 @login_required
@@ -133,7 +132,7 @@ def bill_student():
     new_id = cur.fetchone()['fee_id']
     conn.commit()
     cur.close(); conn.close()
-    return jsonify({"message": f"Bill issued! Fee ID: {new_id}"}), 201
+    return jsonify({"message": f"Bill issued successfully! Reference Fee ID: {new_id}"}), 201
 
 @app.route('/api/fees/pay', methods=['POST'])
 @login_required
@@ -143,10 +142,9 @@ def log_payment():
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("INSERT INTO payments (fee_id, amount_paid, payment_method) VALUES (%s, %s, %s) RETURNING payment_id", (data.get('fee_id'), data.get('amount_paid'), data.get('payment_method')))
-    pid = cur.fetchone()['payment_id']
     conn.commit()
     cur.close(); conn.close()
-    return jsonify({"message": f"Payment logged! Receipt ID: {pid}"}), 201
+    return jsonify({"message": f"Payment securely logged to ledger!"}), 201
 
 @app.route('/api/statement/<int:student_id>', methods=['GET'])
 @login_required
@@ -158,7 +156,7 @@ def get_statement(student_id):
     cur.execute(query, (student_id,))
     statement = cur.fetchall()
     cur.close(); conn.close()
-    return jsonify({"student_id": student_id, "statement": statement}), 200
+    return jsonify({"statement": statement}), 200
 
 @app.route('/api/export/grades')
 @login_required
@@ -174,7 +172,7 @@ def export_grades():
     for row in data: cw.writerow([row['first_name'], row['last_name'], row['subject_name'], row['score'], row['waec_grade'], row['term'], row['academic_year']])
     return Response(si.getvalue(), mimetype='text/csv', headers={"Content-Disposition": "attachment;filename=academic_data.csv"})
 
-# --- 4. THE DYNAMIC FRONTEND (JINJA2 TEMPLATING) ---
+# --- 4. THE COMMERCIAL FRONTEND ---
 @app.route('/dashboard')
 def dashboard():
     html_template = """
@@ -187,12 +185,15 @@ def dashboard():
         <style>
             :root { --primary: #0f4c81; --secondary: #f4f7f6; --accent: #28a745; --text: #333; }
             body { font-family: 'Segoe UI', system-ui, sans-serif; background-color: var(--secondary); margin: 0; display: flex; color: var(--text); }
+            
+            /* Sidebar */
             .sidebar { width: 250px; background: var(--primary); color: white; min-height: 100vh; padding: 20px; box-sizing: border-box; position: fixed; }
             .sidebar h2 { margin-top: 0; border-bottom: 1px solid rgba(255,255,255,0.2); padding-bottom: 10px; font-size: 1.2rem; }
             .sidebar button { background: rgba(255,255,255,0.1); color: white; border: none; padding: 12px; width: 100%; text-align: left; margin-bottom: 5px; border-radius: 4px; cursor: pointer; transition: 0.3s; }
             .sidebar button:hover { background: rgba(255,255,255,0.2); }
             .user-info { font-size: 0.85rem; color: #a5c3e0; margin-bottom: 20px; word-wrap: break-word;}
             
+            /* Main Content & Cards */
             .main-content { margin-left: 250px; flex: 1; padding: 40px; box-sizing: border-box; min-height: 100vh; }
             .card { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 20px; }
             h3 { margin-top: 0; color: var(--primary); border-bottom: 2px solid #eee; padding-bottom: 8px;}
@@ -203,32 +204,37 @@ def dashboard():
             .btn-success:hover { background: #218838; }
             .btn-warning { background: #ffc107; color: #333; }
             .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-            pre { background: #1e1e1e; color: #00ff00; padding: 15px; border-radius: 5px; overflow-x: auto; white-space: pre-wrap; }
+            
+            /* The Toast Notification */
+            #toast { display: none; position: fixed; bottom: 30px; right: 30px; padding: 15px 25px; color: white; background: var(--accent); border-radius: 5px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); z-index: 1000; font-weight: bold; transition: opacity 0.3s; }
+            
+            /* Dynamic Tables */
+            .table-container { overflow-x: auto; margin-top: 15px; border: 1px solid #ddd; border-radius: 5px; }
+            table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.95rem; }
+            th { background: var(--primary); color: white; padding: 12px; }
+            td { padding: 12px; border-bottom: 1px solid #eee; }
+            tr:nth-child(even) td { background: #f8f9fa; }
         </style>
     </head>
     <body>
+        <!-- The Toast Popup Notification -->
+        <div id="toast">Message goes here</div>
+
         <div class="sidebar">
             <h2>School Engine</h2>
             
             {% if current_user.is_authenticated %}
                 <div class="user-info">
-                    Logged in as:<br>
-                    <b>{{ current_user.email }}</b><br>
+                    Logged in as:<br><b>{{ current_user.email }}</b><br>
                     Role: <span style="color: #fff; text-transform: uppercase;">{{ current_user.role }}</span>
                 </div>
-                
                 <button onclick="document.getElementById('academics-section').scrollIntoView()">Academics & Data</button>
-                
                 {% if current_user.role == 'admin' %}
                     <button onclick="document.getElementById('finance-section').scrollIntoView()">Financial Desk</button>
                     <button onclick="document.getElementById('admin-section').scrollIntoView()">Admin Tools</button>
-                    <br><br>
-                    <button class="btn-warning" onclick="testSetup()">Initialize Database</button>
+                    <br><br><button class="btn-warning" onclick="sendAction('/api/setup_db', {}, true)">Sync Database</button>
                 {% endif %}
-                
-                <br><br>
-                <button style="background: #dc3545;" onclick="logout()">Secure Logout</button>
-            
+                <br><br><button style="background: #dc3545;" onclick="logout()">Secure Logout</button>
             {% else %}
                 <div class="user-info">Please log in to access the secure portal.</div>
             {% endif %}
@@ -237,18 +243,22 @@ def dashboard():
         <div class="main-content">
             <h1>Administration Dashboard</h1>
 
-            <!-- IF NOT LOGGED IN: Show only the Login Box -->
             {% if not current_user.is_authenticated %}
             <div class="card" style="max-width: 400px; margin: 0 auto;">
                 <h3>System Login</h3>
-                <input type="email" id="email" placeholder="Email">
+                <input type="email" id="email" placeholder="Email Address">
                 <input type="password" id="pass" placeholder="Password">
                 <button class="btn" onclick="login()">Login to Portal</button>
             </div>
             
-            <!-- IF LOGGED IN: Show the system tools -->
             {% else %}
             
+            <!-- THE DATA VIEWER (Replaces the black console box) -->
+            <div class="card" id="data-viewer" style="display: none; border: 2px solid var(--primary);">
+                <h3 id="viewer-title">Data Explorer</h3>
+                <div id="table-container" class="table-container"></div>
+            </div>
+
             <div id="academics-section" class="card grid-2">
                 <div>
                     <h3>Record Exam Grade</h3>
@@ -257,19 +267,19 @@ def dashboard():
                     <input type="number" id="gScore" placeholder="Score (0-100)">
                     <input type="text" id="gTerm" placeholder="Term (e.g. Term 1)">
                     <input type="text" id="gYear" placeholder="Year (e.g. 2026)">
-                    <button class="btn" onclick="sendPost('/api/grades', {student_id: document.getElementById('gStuId').value, subject_id: document.getElementById('gSubId').value, score: document.getElementById('gScore').value, term: document.getElementById('gTerm').value, academic_year: document.getElementById('gYear').value})">Save Score & Calc WAEC</button>
+                    <button class="btn" onclick="sendAction('/api/grades', {student_id: document.getElementById('gStuId').value, subject_id: document.getElementById('gSubId').value, score: document.getElementById('gScore').value, term: document.getElementById('gTerm').value, academic_year: document.getElementById('gYear').value})">Save Score</button>
                 </div>
                 <div>
                     <h3>Academic Reports & Data</h3>
-                    <button class="btn" onclick="fetchData('/api/students')">Load All Enrolled Students</button>
-                    <input type="number" id="repId" placeholder="Student ID">
-                    <button class="btn" onclick="fetchData('/api/report_card/' + document.getElementById('repId').value)">Generate Term Report</button>
+                    <button class="btn" onclick="loadRoster()">Load Enrolled Roster</button>
                     <hr>
-                    <button class="btn btn-warning" onclick="window.location.href='/api/export/grades'">Download CSV Dataset for Analysis</button>
+                    <input type="number" id="repId" placeholder="Student ID">
+                    <button class="btn" onclick="loadReport()">Generate Term Report</button>
+                    <hr>
+                    <button class="btn btn-warning" onclick="window.location.href='/api/export/grades'">Download CSV Dataset</button>
                 </div>
             </div>
 
-            <!-- IF ADMIN: Unlock Finance and Admin Tools -->
             {% if current_user.role == 'admin' %}
             <div id="finance-section" class="card grid-2">
                 <div>
@@ -277,7 +287,7 @@ def dashboard():
                     <input type="number" id="bStuId" placeholder="Student ID">
                     <input type="number" id="bAmount" placeholder="Amount Due (GHS)">
                     <input type="text" id="bDesc" placeholder="Description (e.g. Term 1 Fees)">
-                    <button class="btn btn-success" onclick="sendPost('/api/fees/bill', {student_id: document.getElementById('bStuId').value, amount_due: document.getElementById('bAmount').value, description: document.getElementById('bDesc').value})">Issue Bill</button>
+                    <button class="btn btn-success" onclick="sendAction('/api/fees/bill', {student_id: document.getElementById('bStuId').value, amount_due: document.getElementById('bAmount').value, description: document.getElementById('bDesc').value})">Issue Bill</button>
                 </div>
                 <div>
                     <h3>2. Record Payment</h3>
@@ -288,10 +298,10 @@ def dashboard():
                         <option value="Mobile Money (MoMo)">Mobile Money (MoMo)</option>
                         <option value="Bank Transfer">Bank Transfer</option>
                     </select>
-                    <button class="btn btn-success" onclick="sendPost('/api/fees/pay', {fee_id: document.getElementById('pFeeId').value, amount_paid: document.getElementById('pAmount').value, payment_method: document.getElementById('pMethod').value})">Log Payment</button>
+                    <button class="btn btn-success" onclick="sendAction('/api/fees/pay', {fee_id: document.getElementById('pFeeId').value, amount_paid: document.getElementById('pAmount').value, payment_method: document.getElementById('pMethod').value})">Log Payment</button>
                     <hr>
                     <input type="number" id="statStuId" placeholder="Student ID">
-                    <button class="btn" onclick="fetchData('/api/statement/' + document.getElementById('statStuId').value)">Calculate Outstanding Balance</button>
+                    <button class="btn" onclick="loadStatement()">Calculate Outstanding Balance</button>
                 </div>
             </div>
 
@@ -299,63 +309,102 @@ def dashboard():
                 <h3>Register New Staff (Teacher)</h3>
                 <input type="email" id="tEmail" placeholder="Teacher Email">
                 <input type="password" id="tPass" placeholder="Teacher Password">
-                <button class="btn" onclick="sendPost('/api/register_teacher', {email: document.getElementById('tEmail').value, password: document.getElementById('tPass').value})">Create Teacher Account</button>
+                <button class="btn" onclick="sendAction('/api/register_teacher', {email: document.getElementById('tEmail').value, password: document.getElementById('tPass').value})">Create Account</button>
             </div>
             {% endif %}
             
             {% endif %}
-
-            <div class="card">
-                <h3>System Console Output</h3>
-                <pre id="output">Waiting for data...</pre>
-            </div>
         </div>
 
+        <!-- THE COMMERCIAL JAVASCRIPT ENGINE -->
         <script>
-            // This new login function forces the page to refresh upon success
-            // so the Jinja2 template can instantly read the new user's role and unlock the UI!
+            // 1. Toast Notification Logic
+            function showToast(message, isError=false) {
+                const toast = document.getElementById('toast');
+                toast.innerText = message;
+                toast.style.background = isError ? '#dc3545' : '#28a745';
+                toast.style.display = 'block';
+                setTimeout(() => { toast.style.display = 'none'; }, 4000);
+            }
+
+            // 2. Action Logic (Saves, Logins, Registrations)
             async function login() {
-                const email = document.getElementById('email').value;
-                const pass = document.getElementById('pass').value;
                 const res = await fetch('/api/login', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({email: email, password: pass})
+                    body: JSON.stringify({email: document.getElementById('email').value, password: document.getElementById('pass').value})
                 });
+                const data = await res.json();
                 if (res.ok) {
-                    window.location.reload(); 
+                    showToast(data.message);
+                    setTimeout(() => window.location.reload(), 1000); 
                 } else {
-                    const data = await res.json();
-                    document.getElementById('output').innerText = JSON.stringify(data, null, 4);
+                    showToast(data.error, true);
                 }
             }
+
             async function logout() {
                 await fetch('/api/logout', { method: 'POST' });
                 window.location.reload();
             }
-            async function testSetup() {
-                const res = await fetch('/api/setup_db');
-                document.getElementById('output').innerText = await res.text();
-            }
-            async function sendPost(endpoint, payload) {
-                const res = await fetch(endpoint, {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(payload)
-                });
-                handleResponse(res);
-            }
-            async function fetchData(endpoint) {
-                const res = await fetch(endpoint);
-                handleResponse(res);
-            }
-            async function handleResponse(res) {
+
+            async function sendAction(endpoint, payload, isGet=false) {
                 try {
+                    const options = isGet ? {} : { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) };
+                    const res = await fetch(endpoint, options);
                     const data = await res.json();
-                    document.getElementById('output').innerText = JSON.stringify(data, null, 4);
-                } catch (e) {
-                    document.getElementById('output').innerText = await res.text();
+                    if (res.ok) showToast(data.message);
+                    else showToast(data.error || "An error occurred", true);
+                } catch(e) { showToast("Connection failed", true); }
+            }
+
+            // 3. Dynamic Rendering Logic (Tables)
+            function renderTable(title, headers, rows, keys) {
+                const viewer = document.getElementById('data-viewer');
+                document.getElementById('viewer-title').innerText = title;
+                const container = document.getElementById('table-container');
+                
+                if (!rows || rows.length === 0) {
+                    container.innerHTML = '<div style="padding: 20px; color: #666;">No records found in the database.</div>';
+                    viewer.style.display = 'block';
+                    viewer.scrollIntoView({behavior: "smooth"});
+                    return;
                 }
+                
+                let html = '<table><tr>';
+                headers.forEach(h => html += `<th>${h}</th>`);
+                html += '</tr>';
+                
+                rows.forEach(row => {
+                    html += '<tr>';
+                    keys.forEach(k => html += `<td>${row[k]}</td>`);
+                    html += '</tr>';
+                });
+                html += '</table>';
+                
+                container.innerHTML = html;
+                viewer.style.display = 'block';
+                viewer.scrollIntoView({behavior: "smooth"});
+            }
+
+            async function loadRoster() {
+                const res = await fetch('/api/students');
+                const data = await res.json();
+                renderTable("Enrolled Student Roster", ['ID', 'First Name', 'Last Name', 'Contact'], data.data, ['student_id', 'first_name', 'last_name', 'guardian_contact']);
+            }
+
+            async function loadReport() {
+                const id = document.getElementById('repId').value;
+                const res = await fetch('/api/report_card/' + id);
+                const data = await res.json();
+                renderTable("Academic Report Card", ['Subject', 'Score', 'WAEC Grade', 'Term'], data.grades, ['subject_name', 'score', 'waec_grade', 'term']);
+            }
+
+            async function loadStatement() {
+                const id = document.getElementById('statStuId').value;
+                const res = await fetch('/api/statement/' + id);
+                const data = await res.json();
+                renderTable("Financial Statement", ['Fee Description', 'Amount Due (GHS)', 'Total Paid (GHS)', 'Remaining Balance (GHS)'], data.statement, ['description', 'amount_due', 'total_paid', 'remaining_balance']);
             }
         </script>
     </body>
