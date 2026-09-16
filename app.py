@@ -20,8 +20,28 @@ def load_user(user_id):
 def home():
     return jsonify({"message": "Ghana School Management System API is Live!"})
 
-# --- SECURITY & AUTHENTICATION ROUTES ---
+# --- SYSTEM SETUP ---
+@app.route('/api/setup_db')
+def setup_db():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Safely construct the students table in your PostgreSQL database
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS students (
+            student_id SERIAL PRIMARY KEY,
+            first_name VARCHAR(100) NOT NULL,
+            last_name VARCHAR(100) NOT NULL,
+            guardian_name VARCHAR(100) NOT NULL,
+            guardian_contact VARCHAR(20) NOT NULL,
+            enrollment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({"message": "Student table successfully verified/created in Neon!"})
 
+# --- SECURITY & AUTHENTICATION ROUTES ---
 @app.route('/api/register_admin', methods=['POST'])
 def register_admin():
     data = request.get_json()
@@ -31,13 +51,10 @@ def register_admin():
     if not email or not password:
         return jsonify({"error": "Email and password required"}), 400
 
-    # Scramble the password securely
     hashed_password = generate_password_hash(password)
-    
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        # Save to the database with the 'admin' role
         cur.execute(
             "INSERT INTO system_users (email, password_hash, role) VALUES (%s, %s, %s) RETURNING user_id",
             (email, hashed_password, 'admin')
@@ -65,10 +82,9 @@ def login():
     cur.close()
     conn.close()
 
-    # Verify user exists and the password matches the database hash
     if user_data and check_password_hash(user_data['password_hash'], password):
         user = User(user_data['user_id'], user_data['email'], user_data['role'])
-        login_user(user) # This creates the secure session cookie
+        login_user(user)
         return jsonify({"message": "Logged in successfully!", "role": user.role})
     
     return jsonify({"error": "Invalid email or password"}), 401
@@ -76,47 +92,80 @@ def login():
 @app.route('/api/dashboard', methods=['GET'])
 @login_required
 def dashboard():
-    # This route is locked! You can only see it if logged in.
     return jsonify({
         "message": f"Welcome to the secure control panel, {current_user.email}!",
         "role": current_user.role
     })
 
-# --- TEMPORARY BROWSER TESTING UI ---
+# --- STUDENT ENROLLMENT ROUTE ---
+@app.route('/api/enroll_student', methods=['POST'])
+@login_required
+def enroll_student():
+    # Security check: Bounce the request if the user is not an admin
+    if current_user.role != 'admin':
+        return jsonify({"error": "Unauthorized. Only administrators can enroll students."}), 403
+        
+    data = request.get_json()
+    first = data.get('first_name')
+    last = data.get('last_name')
+    guardian = data.get('guardian_name')
+    contact = data.get('guardian_contact')
 
+    if not all([first, last, guardian, contact]):
+        return jsonify({"error": "Missing student details! All fields are required."}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO students (first_name, last_name, guardian_name, guardian_contact) VALUES (%s, %s, %s, %s) RETURNING student_id",
+        (first, last, guardian, contact)
+    )
+    new_id = cur.fetchone()['student_id']
+    conn.commit()
+    cur.close()
+    conn.close()
+    
+    return jsonify({"message": f"Student {first} {last} successfully enrolled with ID: {new_id}"}), 201
+
+# --- TEMPORARY BROWSER TESTING UI ---
 @app.route('/test_ui')
 def test_ui():
     return """
     <html>
         <body style="font-family: Arial; padding: 20px; max-width: 600px;">
-            <h2>SMS Security Testing Interface</h2>
-            <p>Use this panel to test the API routes we just built.</p>
+            <h2>SMS Testing Interface</h2>
+            
+            <div style="background: #ffeeba; padding: 15px; margin-bottom: 10px;">
+                <h3>0. Setup Database</h3>
+                <button onclick="testSetup()" style="padding: 5px;">Build Tables in Neon</button>
+            </div>
             
             <div style="background: #f4f4f4; padding: 15px; margin-bottom: 10px;">
-                <h3>1. Register Admin</h3>
-                <input type="email" id="regEmail" placeholder="admin@school.com" style="padding: 5px;">
-                <input type="password" id="regPass" placeholder="Password" style="padding: 5px;">
-                <button onclick="sendReq('/api/register_admin', 'regEmail', 'regPass')" style="padding: 5px;">Register</button>
+                <h3>1. Admin Auth</h3>
+                <input type="email" id="email" placeholder="admin@school.com" style="padding: 5px;">
+                <input type="password" id="pass" placeholder="Password" style="padding: 5px;"><br><br>
+                <button onclick="sendAuth('/api/login')" style="padding: 5px;">Login as Admin</button>
             </div>
             
-            <div style="background: #e9ecef; padding: 15px; margin-bottom: 10px;">
-                <h3>2. Login</h3>
-                <input type="email" id="logEmail" placeholder="admin@school.com" style="padding: 5px;">
-                <input type="password" id="logPass" placeholder="Password" style="padding: 5px;">
-                <button onclick="sendReq('/api/login', 'logEmail', 'logPass')" style="padding: 5px;">Login</button>
-            </div>
-            
-            <div style="background: #d4edda; padding: 15px; margin-bottom: 10px;">
-                <h3>3. Access Secure Dashboard</h3>
-                <button onclick="testDashboard()" style="padding: 5px;">Check if I am logged in</button>
+            <div style="background: #e2e3e5; padding: 15px; margin-bottom: 10px;">
+                <h3>2. Enroll Student (Requires Admin Login)</h3>
+                <input type="text" id="fName" placeholder="First Name" style="padding: 5px;">
+                <input type="text" id="lName" placeholder="Last Name" style="padding: 5px;"><br><br>
+                <input type="text" id="gName" placeholder="Guardian Name" style="padding: 5px;">
+                <input type="text" id="gContact" placeholder="Guardian Contact (e.g., 024...)" style="padding: 5px;"><br><br>
+                <button onclick="enrollStudent()" style="padding: 5px;">Enroll Student</button>
             </div>
 
             <pre id="output" style="background: #333; color: #0f0; padding: 15px; margin-top: 20px; white-space: pre-wrap;"></pre>
 
             <script>
-                async function sendReq(endpoint, emailId, passId) {
-                    const email = document.getElementById(emailId).value;
-                    const password = document.getElementById(passId).value;
+                async function testSetup() {
+                    const res = await fetch('/api/setup_db');
+                    document.getElementById('output').innerText = await res.text();
+                }
+                async function sendAuth(endpoint) {
+                    const email = document.getElementById('email').value;
+                    const password = document.getElementById('pass').value;
                     const res = await fetch(endpoint, {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
@@ -124,8 +173,16 @@ def test_ui():
                     });
                     document.getElementById('output').innerText = await res.text();
                 }
-                async function testDashboard() {
-                    const res = await fetch('/api/dashboard');
+                async function enrollStudent() {
+                    const first_name = document.getElementById('fName').value;
+                    const last_name = document.getElementById('lName').value;
+                    const guardian_name = document.getElementById('gName').value;
+                    const guardian_contact = document.getElementById('gContact').value;
+                    const res = await fetch('/api/enroll_student', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({first_name, last_name, guardian_name, guardian_contact})
+                    });
                     document.getElementById('output').innerText = await res.text();
                 }
             </script>
