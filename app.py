@@ -29,7 +29,7 @@ def get_waec_grade(score):
     elif score >= 40: return 'E8'
     else: return 'F9'
 
-# --- 1. SYSTEM SETUP ---
+# --- 1. SYSTEM SETUP (WITH AUTO-ADMIN) ---
 @app.route('/api/setup_db')
 def setup_db():
     conn = get_db_connection()
@@ -39,7 +39,7 @@ def setup_db():
     cur.execute("CREATE TABLE IF NOT EXISTS classes (class_id SERIAL PRIMARY KEY, class_name VARCHAR(50) NOT NULL UNIQUE)")
     cur.execute("CREATE TABLE IF NOT EXISTS class_enrollments (enrollment_id SERIAL PRIMARY KEY, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, class_id INTEGER REFERENCES classes(class_id) ON DELETE CASCADE, academic_year VARCHAR(9) NOT NULL)")
     
-    # System Users (Now with Guardian Linking)
+    # System Users (With Guardian Linking)
     cur.execute("CREATE TABLE IF NOT EXISTS system_users (user_id SERIAL PRIMARY KEY, email VARCHAR(100) UNIQUE NOT NULL, password_hash VARCHAR(255) NOT NULL, role VARCHAR(20) NOT NULL, linked_student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE)")
     
     # Academics & Finance
@@ -48,9 +48,17 @@ def setup_db():
     cur.execute("CREATE TABLE IF NOT EXISTS attendance (attendance_id SERIAL PRIMARY KEY, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, record_date DATE NOT NULL, status VARCHAR(10) NOT NULL, UNIQUE(student_id, record_date))")
     cur.execute("CREATE TABLE IF NOT EXISTS fees (fee_id SERIAL PRIMARY KEY, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, description VARCHAR(255) NOT NULL, amount_due DECIMAL(10, 2) NOT NULL, date_issued TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cur.execute("CREATE TABLE IF NOT EXISTS payments (payment_id SERIAL PRIMARY KEY, fee_id INTEGER REFERENCES fees(fee_id) ON DELETE CASCADE, amount_paid DECIMAL(10, 2) NOT NULL, payment_method VARCHAR(50) NOT NULL, payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    
+    # Auto-Create Admin Cheat Code
+    cur.execute("SELECT * FROM system_users WHERE role = 'admin'")
+    if not cur.fetchone():
+        hashed = generate_password_hash('admin123')
+        cur.execute("INSERT INTO system_users (email, password_hash, role) VALUES (%s, %s, %s)", 
+                    ('admin@school.com', hashed, 'admin'))
+        
     conn.commit()
     cur.close(); conn.close()
-    return jsonify({"message": "Enterprise Database Synchronized!"})
+    return jsonify({"message": "Enterprise Database Synchronized & Admin Account Restored!"})
 
 # --- 2. AUTHENTICATION & ROLES ---
 @app.route('/api/login', methods=['POST'])
@@ -76,9 +84,8 @@ def register_staff():
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        # If it's a guardian, it includes a linked_student_id
         cur.execute("INSERT INTO system_users (email, password_hash, role, linked_student_id) VALUES (%s, %s, %s, %s)", 
-                    (data.get('email'), hashed, data.get('role'), data.get('linked_student_id')))
+                    (data.get('email'), hashed, data.get('role'), data.get('linked_student_id') or None))
         conn.commit()
         return jsonify({"message": f"{data.get('role').capitalize()} account created successfully!"}), 201
     except psycopg2.IntegrityError:
@@ -100,7 +107,6 @@ def get_analytics():
     if current_user.role != 'admin': return jsonify({"error": "Unauthorized"}), 403
     conn = get_db_connection()
     cur = conn.cursor()
-    # Get total fees vs paid
     cur.execute("SELECT COALESCE(SUM(amount_due), 0) as total_due FROM fees")
     total_due = cur.fetchone()['total_due']
     cur.execute("SELECT COALESCE(SUM(amount_paid), 0) as total_paid FROM payments")
@@ -135,7 +141,6 @@ def add_grade():
 @app.route('/api/report_card/<int:student_id>', methods=['GET'])
 @login_required
 def get_report_card(student_id):
-    # Guardian Security Check
     if current_user.role == 'guardian' and current_user.linked_student_id != student_id:
         return jsonify({"error": "Access Denied. You can only view your own child's report."}), 403
     conn = get_db_connection()
@@ -145,10 +150,34 @@ def get_report_card(student_id):
     cur.close(); conn.close()
     return jsonify({"grades": grades})
 
+@app.route('/api/fees/bill', methods=['POST'])
+@login_required
+def bill_student():
+    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
+    data = request.get_json()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO fees (student_id, description, amount_due) VALUES (%s, %s, %s) RETURNING fee_id", (data.get('student_id'), data.get('description'), data.get('amount_due')))
+    new_id = cur.fetchone()['fee_id']
+    conn.commit()
+    cur.close(); conn.close()
+    return jsonify({"message": f"Bill issued successfully! Reference Fee ID: {new_id}"}), 201
+
+@app.route('/api/fees/pay', methods=['POST'])
+@login_required
+def log_payment():
+    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
+    data = request.get_json()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO payments (fee_id, amount_paid, payment_method) VALUES (%s, %s, %s) RETURNING payment_id", (data.get('fee_id'), data.get('amount_paid'), data.get('payment_method')))
+    conn.commit()
+    cur.close(); conn.close()
+    return jsonify({"message": f"Payment securely logged to ledger!"}), 201
+
 @app.route('/api/statement/<int:student_id>', methods=['GET'])
 @login_required
 def get_statement(student_id):
-    # Guardian Security Check
     if current_user.role == 'guardian' and current_user.linked_student_id != student_id:
         return jsonify({"error": "Access Denied."}), 403
     conn = get_db_connection()
@@ -159,7 +188,21 @@ def get_statement(student_id):
     cur.close(); conn.close()
     return jsonify({"statement": statement}), 200
 
-# --- 4. THE COMMERCIAL FRONTEND (WITH CHART.JS & LIVE SEARCH) ---
+@app.route('/api/export/grades')
+@login_required
+def export_grades():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT s.first_name, s.last_name, sub.subject_name, g.score, g.waec_grade, g.term, g.academic_year FROM grades g JOIN students s ON g.student_id = s.student_id JOIN subjects sub ON g.subject_id = sub.subject_id")
+    data = cur.fetchall()
+    cur.close(); conn.close()
+    si = StringIO()
+    cw = csv.writer(si)
+    cw.writerow(['First Name', 'Last Name', 'Subject', 'Score', 'WAEC Grade', 'Term', 'Academic Year'])
+    for row in data: cw.writerow([row['first_name'], row['last_name'], row['subject_name'], row['score'], row['waec_grade'], row['term'], row['academic_year']])
+    return Response(si.getvalue(), mimetype='text/csv', headers={"Content-Disposition": "attachment;filename=academic_data.csv"})
+
+# --- 4. THE COMMERCIAL FRONTEND ---
 @app.route('/dashboard')
 def dashboard():
     html_template = """
@@ -219,6 +262,7 @@ def dashboard():
                 <br><br><button style="background: #dc3545;" onclick="logout()">Secure Logout</button>
             {% else %}
                 <div class="user-info">Please log in to access the secure portal.</div>
+                <button class="btn-warning" onclick="sendAction('/api/setup_db', {}, true)" style="background: #ffc107; color: black;">1. Sync Database</button>
             {% endif %}
         </div>
 
@@ -335,7 +379,6 @@ def dashboard():
                 } catch(e) { showToast("Connection failed", true); }
             }
 
-            // Live Table Rendering & Search
             function renderTable(title, headers, rows, keys) {
                 const viewer = document.getElementById('data-viewer');
                 document.getElementById('viewer-title').innerText = title;
@@ -350,7 +393,7 @@ def dashboard():
                 }
                 
                 searchInput.style.display = 'block';
-                searchInput.value = ''; // Reset search
+                searchInput.value = '';
                 
                 let html = '<table id="dataTable"><tr>';
                 headers.forEach(h => html += `<th>${h}</th>`);
@@ -400,24 +443,25 @@ def dashboard():
                 renderTable("Financial Statement", ['Desc', 'Due (GHS)', 'Paid (GHS)', 'Remaining (GHS)'], data.statement, ['description', 'amount_due', 'total_paid', 'remaining_balance']);
             }
 
-            // Load Chart.js for Admin
             window.onload = async function() {
                 if (document.getElementById('financeChart')) {
-                    const res = await fetch('/api/analytics');
-                    const data = await res.json();
-                    const ctx = document.getElementById('financeChart').getContext('2d');
-                    new Chart(ctx, {
-                        type: 'doughnut',
-                        data: {
-                            labels: ['Total Collected (GHS)', 'Outstanding Balances (GHS)'],
-                            datasets: [{
-                                data: [data.financials.paid, data.financials.outstanding],
-                                backgroundColor: ['#28a745', '#dc3545'],
-                                borderWidth: 0
-                            }]
-                        },
-                        options: { responsive: true, maintainAspectRatio: false, cutout: '70%' }
-                    });
+                    try {
+                        const res = await fetch('/api/analytics');
+                        const data = await res.json();
+                        const ctx = document.getElementById('financeChart').getContext('2d');
+                        new Chart(ctx, {
+                            type: 'doughnut',
+                            data: {
+                                labels: ['Total Collected (GHS)', 'Outstanding Balances (GHS)'],
+                                datasets: [{
+                                    data: [data.financials.paid, data.financials.outstanding],
+                                    backgroundColor: ['#28a745', '#dc3545'],
+                                    borderWidth: 0
+                                }]
+                            },
+                            options: { responsive: true, maintainAspectRatio: false, cutout: '70%' }
+                        });
+                    } catch(e) { console.log("Analytics loading error", e) }
                 }
             }
         </script>
@@ -426,6 +470,6 @@ def dashboard():
     """
     return render_template_string(html_template, current_user=current_user)
 
-# SECURITY: Turning off Debug mode for Production!
+# SECURITY: Production-ready setup
 if __name__ == '__main__':
     app.run(debug=False, host='0.0.0.0', port=5000)
