@@ -17,7 +17,7 @@ app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'super-secure-enterprise
 login_manager = LoginManager()
 login_manager.init_app(app)
 
-# --- JSON ENCODER FOR DATABASE TYPES ---
+# --- JSON SERIALIZER ---
 def custom_json_serializer(obj):
     if isinstance(obj, (datetime, date)):
         return obj.isoformat()
@@ -87,7 +87,7 @@ def setup_db():
         hashed_sa = generate_password_hash('ceo123')
         cur.execute("INSERT INTO system_users (email, password_hash, role) VALUES (%s, %s, %s)", ('superadmin@engine.com', hashed_sa, 'superadmin'))
         
-        cur.execute("INSERT INTO institutions (school_name, subscription_expiry_date) VALUES (%s, CURRENT_DATE + INTERVAL '30 days') RETURNING school_id", ('Winneba High School',))
+        cur.execute("INSERT INTO institutions (school_name, subscription_expiry_date) VALUES (%s, CURRENT_DATE + INTERVAL '1 year') RETURNING school_id", ('Winneba High School',))
         new_school_id = cur.fetchone()['school_id']
         
         hashed_admin = generate_password_hash('admin123')
@@ -118,7 +118,7 @@ def logout():
     logout_user()
     return jsonify({"message": "Logged out safely."})
 
-# --- 5. SUPER ADMIN CONTROL ROOM & BACKUP ENGINE ---
+# --- 5. SUPER ADMIN CONTROL ROOM & ONBOARDING ---
 @app.route('/api/superadmin/schools', methods=['GET'])
 @login_required
 def get_schools():
@@ -142,7 +142,39 @@ def renew_school(school_id):
     cur.close(); conn.close()
     return jsonify({"message": f"Contract Renewed! {updated['school_name']} active until {updated['subscription_expiry_date']}"})
 
-# THE NEW VAULT: Data Extraction Engine
+# THE NEW ONBOARDING ENGINE
+@app.route('/api/superadmin/onboard', methods=['POST'])
+@login_required
+def onboard_school():
+    if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
+    data = request.get_json()
+    school_name = data.get('school_name')
+    admin_email = data.get('admin_email')
+    admin_pass = data.get('admin_password')
+    
+    if not school_name or not admin_email or not admin_pass:
+        return jsonify({"error": "All fields are required!"}), 400
+        
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        # 1. Create Institution with 1 year subscription
+        cur.execute("INSERT INTO institutions (school_name, subscription_expiry_date) VALUES (%s, CURRENT_DATE + INTERVAL '1 year') RETURNING school_id", (school_name,))
+        new_school_id = cur.fetchone()['school_id']
+        
+        # 2. Create Admin Account linked to this new school
+        hashed = generate_password_hash(admin_pass)
+        cur.execute("INSERT INTO system_users (school_id, email, password_hash, role) VALUES (%s, %s, %s, 'admin')", 
+                    (new_school_id, admin_email, hashed))
+                    
+        conn.commit()
+        return jsonify({"message": f"Successfully Onboarded {school_name}! Initial Admin: {admin_email}"}), 201
+    except psycopg2.IntegrityError:
+        conn.rollback()
+        return jsonify({"error": "School name or Admin email already exists!"}), 409
+    finally:
+        cur.close(); conn.close()
+
 @app.route('/api/superadmin/backup/<int:school_id>', methods=['GET'])
 @login_required
 def download_backup(school_id):
@@ -152,30 +184,23 @@ def download_backup(school_id):
     
     cur.execute("SELECT school_name FROM institutions WHERE school_id = %s", (school_id,))
     school = cur.fetchone()
-    if not school:
-        return jsonify({"error": "School not found"}), 404
+    if not school: return jsonify({"error": "School not found"}), 404
         
     backup = {"school_name": school['school_name'], "export_date": datetime.now().isoformat(), "data": {}}
     
-    # Extract strictly isolated tenant data
     cur.execute("SELECT * FROM students WHERE school_id = %s", (school_id,))
     backup['data']['students'] = cur.fetchall()
-    
     cur.execute("SELECT * FROM fees WHERE school_id = %s", (school_id,))
     backup['data']['fees'] = cur.fetchall()
-    
     cur.execute("SELECT p.* FROM payments p JOIN fees f ON p.fee_id = f.fee_id WHERE f.school_id = %s", (school_id,))
     backup['data']['payments'] = cur.fetchall()
-    
     cur.execute("SELECT * FROM grades WHERE school_id = %s", (school_id,))
     backup['data']['grades'] = cur.fetchall()
     
     cur.close(); conn.close()
     
-    # Package into JSON format
     json_data = json.dumps(backup, default=custom_json_serializer, indent=4)
     filename = f"Backup_{school['school_name'].replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.json"
-    
     return Response(json_data, mimetype="application/json", headers={"Content-Disposition": f"attachment;filename={filename}"})
 
 # --- 6. MULTI-TENANT ACADEMICS & FINANCE ---
@@ -266,7 +291,7 @@ def dashboard():
             {% endif %}
         </div>
 
-        <div class="main-content">
+        <main class="main-content">
             <h1>Platform Dashboard</h1>
 
             {% if not current_user.is_authenticated %}
@@ -278,6 +303,21 @@ def dashboard():
             </div>
             
             {% elif current_user.role == 'superadmin' %}
+            <!-- ONBOARDING FORM FOR NEW SCHOOLS -->
+            <div class="card" style="border: 2px solid var(--accent);">
+                <h3>🚀 Onboard New School Tenant</h3>
+                <div class="grid-2">
+                    <div>
+                        <input type="text" id="onboardSchool" placeholder="School Name (e.g. Accra Academy)">
+                        <input type="email" id="onboardEmail" placeholder="Initial Admin Email">
+                    </div>
+                    <div>
+                        <input type="password" id="onboardPass" placeholder="Initial Admin Password">
+                        <button class="btn btn-success" onclick="onboardNewSchool()">Provision New Tenant</button>
+                    </div>
+                </div>
+            </div>
+
             <div class="card">
                 <h3>Global Tenant Control Room</h3>
                 <p>Monitor school subscriptions, process contract renewals, and generate data backups.</p>
@@ -309,7 +349,7 @@ def dashboard():
                 <button class="btn btn-success" onclick="sendAction('/api/fees/bill', {student_id: document.getElementById('bStuId').value, amount_due: document.getElementById('bAmount').value, description: document.getElementById('bDesc').value})">Issue Bill</button>
             </div>
             {% endif %}
-        </div>
+        </main>
 
         <script>
             function showToast(message, isError=false) {
@@ -344,6 +384,28 @@ def dashboard():
                 } catch(e) { showToast("Connection failed", true); }
             }
 
+            async function onboardNewSchool() {
+                const payload = {
+                    school_name: document.getElementById('onboardSchool').value,
+                    admin_email: document.getElementById('onboardEmail').value,
+                    admin_password: document.getElementById('onboardPass').value
+                };
+                const res = await fetch('/api/superadmin/onboard', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    showToast(data.message);
+                    document.getElementById('onboardSchool').value = '';
+                    document.getElementById('onboardEmail').value = '';
+                    document.getElementById('onboardPass').value = '';
+                    loadSchools();
+                } else {
+                    showToast(data.error, true);
+                }
+            }
+
             async function loadRoster() {
                 const res = await fetch('/api/students');
                 const data = await res.json();
@@ -366,7 +428,7 @@ def dashboard():
                         <td style="color:${statusColor}; font-weight:bold;">${s.status}</td>
                         <td>
                             <button class="btn btn-success" style="width: auto; padding: 6px 12px; margin-right: 5px; margin-bottom: 0;" onclick="sendAction('/api/superadmin/renew/${s.school_id}', {})">Renew 1 Year</button>
-                            <button class="btn btn-info" style="width: auto; padding: 6px 12px; margin-bottom: 0;" onclick="window.location.href='/api/superadmin/backup/${s.school_id}'">⬇️ Backup Data</button>
+                            <button class="btn btn-info" style="width: auto; padding: 6px 12px; margin-bottom: 0;" onclick="window.location.href='/api/superadmin/backup/${s.school_id}'">⬇️ Backup</button>
                         </td>
                     </tr>`;
                 });
