@@ -107,15 +107,29 @@ def get_analytics():
     cur.close(); conn.close()
     return jsonify({"financials": {"due": float(total_due), "paid": float(total_paid), "outstanding": float(total_due - total_paid)}})
 
-@app.route('/api/students', methods=['GET'])
+# THE NEW ADMISSIONS ROUTE
+@app.route('/api/students', methods=['GET', 'POST'])
 @login_required
-def get_students():
+def manage_students():
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT student_id, first_name, last_name, guardian_contact FROM students ORDER BY student_id DESC")
-    students = cur.fetchall()
-    cur.close(); conn.close()
-    return jsonify({"data": students})
+    
+    if request.method == 'POST':
+        if current_user.role not in ['admin', 'teacher']: 
+            return jsonify({"error": "Unauthorized"}), 403
+        data = request.get_json()
+        cur.execute("INSERT INTO students (first_name, last_name, guardian_name, guardian_contact) VALUES (%s, %s, %s, %s) RETURNING student_id", 
+                    (data.get('first_name'), data.get('last_name'), data.get('guardian_name'), data.get('guardian_contact')))
+        new_id = cur.fetchone()['student_id']
+        conn.commit()
+        cur.close(); conn.close()
+        return jsonify({"message": f"Student Enrolled Successfully! New Student ID: {new_id}"}), 201
+        
+    elif request.method == 'GET':
+        cur.execute("SELECT student_id, first_name, last_name, guardian_contact FROM students ORDER BY student_id DESC")
+        students = cur.fetchall()
+        cur.close(); conn.close()
+        return jsonify({"data": students})
 
 @app.route('/api/grades', methods=['POST'])
 @login_required
@@ -247,16 +261,15 @@ def dashboard():
                 
                 {% if current_user.role == 'admin' %}
                     <button onclick="document.getElementById('analytics-section').scrollIntoView()">Live Analytics</button>
+                    <button onclick="document.getElementById('admissions-section').scrollIntoView()">Admissions Desk</button>
                     <button onclick="document.getElementById('finance-section').scrollIntoView()">Financial Desk</button>
                     <button onclick="document.getElementById('admin-section').scrollIntoView()">Admin Tools</button>
-                    <button class="btn-warning" onclick="sendAction('/api/setup_db', {}, true)" style="background: #ffc107; color: black;">Sync Database</button>
                 {% endif %}
                 
                 <button onclick="document.getElementById('academics-section').scrollIntoView()">My Portal</button>
                 <br><br><button style="background: #dc3545;" onclick="logout()">Secure Logout</button>
             {% else %}
                 <div class="user-info">Please log in to access the secure portal.</div>
-                <button class="btn-warning" onclick="sendAction('/api/setup_db', {}, true)" style="background: #ffc107; color: black;">1. Sync Database</button>
             {% endif %}
         </div>
 
@@ -273,7 +286,7 @@ def dashboard():
             
             {% else %}
             
-            <!-- ADMIN ANALYTICS & FINANCE DESK -->
+            <!-- ADMIN ANALYTICS -->
             {% if current_user.role == 'admin' %}
             <div id="analytics-section" class="card">
                 <h3>Live Financial Analytics</h3>
@@ -282,7 +295,24 @@ def dashboard():
                 </div>
             </div>
 
-            <!-- RESTORED: THE FINANCIAL DESK -->
+            <!-- THE MISSING ADMISSIONS DESK -->
+            <div id="admissions-section" class="card grid-2">
+                <div>
+                    <h3>Enroll New Student</h3>
+                    <input type="text" id="sFirst" placeholder="First Name">
+                    <input type="text" id="sLast" placeholder="Last Name">
+                    <input type="text" id="sGName" placeholder="Guardian Name">
+                    <input type="text" id="sGContact" placeholder="Guardian Contact (e.g. 024...)">
+                    <button class="btn btn-success" onclick="sendAction('/api/students', {first_name: document.getElementById('sFirst').value, last_name: document.getElementById('sLast').value, guardian_name: document.getElementById('sGName').value, guardian_contact: document.getElementById('sGContact').value})">Register Student</button>
+                </div>
+                <div>
+                    <h3>Student Directory</h3>
+                    <button class="btn" onclick="loadRoster()">Load Enrolled Roster</button>
+                    <p style="color: #666; font-size: 0.9rem; margin-top: 10px;">Use the directory to search and instantly locate Student IDs for billing, grading, and parent portals.</p>
+                </div>
+            </div>
+
+            <!-- FINANCIAL DESK -->
             <div id="finance-section" class="card grid-2">
                 <div>
                     <h3>1. Issue Bill</h3>
@@ -332,7 +362,6 @@ def dashboard():
                         <p style="color: #666; font-size: 0.9rem;">You are securely viewing records for Student ID: {{ current_user.linked_student_id }}</p>
                         <input type="hidden" id="repId" value="{{ current_user.linked_student_id }}">
                     {% else %}
-                        <button class="btn" onclick="loadRoster()">Load Enrolled Roster</button>
                         <input type="number" id="repId" placeholder="Student ID">
                     {% endif %}
                     
