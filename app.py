@@ -3,6 +3,7 @@ import psycopg2
 import csv
 import json
 import decimal
+import boto3
 from io import StringIO
 from functools import wraps
 from datetime import datetime, date
@@ -10,12 +11,22 @@ from flask import Flask, jsonify, request, render_template_string, Response
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user, UserMixin
 from werkzeug.security import generate_password_hash, check_password_hash
 from db_config import get_db_connection
+from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'super-secure-enterprise-key')
 
 login_manager = LoginManager()
 login_manager.init_app(app)
+
+# --- CLOUD STORAGE SETTINGS ---
+AWS_BUCKET_NAME = os.environ.get('AWS_BUCKET_NAME')
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
+    aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
+    region_name=os.environ.get('AWS_REGION', 'us-east-1')
+)
 
 # --- HELPER FUNCTIONS ---
 def custom_json_serializer(obj):
@@ -95,7 +106,54 @@ def setup_db():
     cur.close(); conn.close()
     return jsonify({"message": "Multi-Tenant SaaS Engine Ready!"})
 
-# --- 4. AUTHENTICATION ---
+# --- 4. THE AUTOMATED CLOUD BACKUP ROBOT ---
+def automated_weekly_backup():
+    print("--- INITIATING AUTOMATED WEEKLY CLOUD BACKUP ---")
+    if not AWS_BUCKET_NAME:
+        print("WARNING: AWS_BUCKET_NAME not set. Skipping cloud upload. Keys are required to push to the cloud.")
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT school_id, school_name FROM institutions")
+    schools = cur.fetchall()
+    
+    for school in schools:
+        school_id = school['school_id']
+        school_name = school['school_name']
+        
+        backup = {"school_name": school_name, "export_date": datetime.now().isoformat(), "data": {}}
+        
+        cur.execute("SELECT * FROM subjects WHERE school_id = %s", (school_id,))
+        backup['data']['subjects'] = cur.fetchall()
+        cur.execute("SELECT * FROM students WHERE school_id = %s", (school_id,))
+        backup['data']['students'] = cur.fetchall()
+        cur.execute("SELECT * FROM fees WHERE school_id = %s", (school_id,))
+        backup['data']['fees'] = cur.fetchall()
+        cur.execute("SELECT p.* FROM payments p JOIN fees f ON p.fee_id = f.fee_id WHERE f.school_id = %s", (school_id,))
+        backup['data']['payments'] = cur.fetchall()
+        cur.execute("SELECT * FROM grades WHERE school_id = %s", (school_id,))
+        backup['data']['grades'] = cur.fetchall()
+        
+        json_data = json.dumps(backup, default=custom_json_serializer)
+        filename = f"Automated_Backups/{school_name.replace(' ', '_')}/Backup_{datetime.now().strftime('%Y%m%d')}.json"
+        
+        try:
+            s3_client.put_object(Bucket=AWS_BUCKET_NAME, Key=filename, Body=json_data)
+            print(f"SUCCESS: Uploaded {filename} to Cloud Storage.")
+        except Exception as e:
+            print(f"ERROR uploading {school_name} backup: {e}")
+            
+    cur.close(); conn.close()
+    print("--- AUTOMATED BACKUP SEQUENCE COMPLETE ---")
+
+# Start the background robot when the server boots
+scheduler = BackgroundScheduler()
+# Run every Sunday at 11:59 PM
+scheduler.add_job(func=automated_weekly_backup, trigger="cron", day_of_week='sun', hour=23, minute=59)
+scheduler.start()
+
+# --- 5. AUTHENTICATION ---
 @app.route('/api/login', methods=['POST'])
 def login():
     data = request.get_json()
@@ -116,7 +174,7 @@ def logout():
     logout_user()
     return jsonify({"message": "Logged out safely."})
 
-# --- 5. SUPER ADMIN & THE VAULT ENDPOINTS ---
+# --- 6. SUPER ADMIN & MANUAL VAULT ENDPOINTS ---
 @app.route('/api/superadmin/schools', methods=['GET'])
 @login_required
 def get_schools():
@@ -160,7 +218,6 @@ def onboard_school():
     finally:
         cur.close(); conn.close()
 
-# ⬇️ THE BACKUP GENERATOR
 @app.route('/api/superadmin/backup/<int:school_id>', methods=['GET'])
 @login_required
 def download_backup(school_id):
@@ -173,7 +230,6 @@ def download_backup(school_id):
     
     backup = {"school_name": school['school_name'], "export_date": datetime.now().isoformat(), "data": {}}
     
-    # Extract complete tenant footprint
     cur.execute("SELECT * FROM subjects WHERE school_id = %s", (school_id,))
     backup['data']['subjects'] = cur.fetchall()
     cur.execute("SELECT * FROM students WHERE school_id = %s", (school_id,))
@@ -189,7 +245,6 @@ def download_backup(school_id):
     json_data = json.dumps(backup, default=custom_json_serializer, indent=4)
     return Response(json_data, mimetype="application/json", headers={"Content-Disposition": f"attachment;filename=Backup_{school['school_name'].replace(' ', '_')}.json"})
 
-# ⬆️ THE RESTORE INJECTOR
 @app.route('/api/superadmin/restore/<int:school_id>', methods=['POST'])
 @login_required
 def restore_backup(school_id):
@@ -202,23 +257,18 @@ def restore_backup(school_id):
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # Safely inject missing records (ON CONFLICT DO NOTHING prevents duplicates)
         if 'subjects' in data['data']:
             for r in data['data']['subjects']:
                 cur.execute("INSERT INTO subjects (subject_id, school_id, subject_name) VALUES (%s, %s, %s) ON CONFLICT (subject_id) DO NOTHING", (r['subject_id'], school_id, r['subject_name']))
-        
         if 'students' in data['data']:
             for r in data['data']['students']:
                 cur.execute("INSERT INTO students (student_id, school_id, first_name, last_name, guardian_name, guardian_contact, enrollment_date) VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (student_id) DO NOTHING", (r['student_id'], school_id, r['first_name'], r['last_name'], r['guardian_name'], r['guardian_contact'], r['enrollment_date']))
-                
         if 'fees' in data['data']:
             for r in data['data']['fees']:
                 cur.execute("INSERT INTO fees (fee_id, school_id, student_id, description, amount_due, date_issued) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (fee_id) DO NOTHING", (r['fee_id'], school_id, r['student_id'], r['description'], r['amount_due'], r['date_issued']))
-                
         if 'payments' in data['data']:
             for r in data['data']['payments']:
                 cur.execute("INSERT INTO payments (payment_id, fee_id, amount_paid, payment_method, payment_date) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (payment_id) DO NOTHING", (r['payment_id'], r['fee_id'], r['amount_paid'], r['payment_method'], r['payment_date']))
-                
         if 'grades' in data['data']:
             for r in data['data']['grades']:
                 cur.execute("INSERT INTO grades (grade_id, school_id, student_id, subject_id, score, waec_grade, academic_year, term) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (grade_id) DO NOTHING", (r['grade_id'], school_id, r['student_id'], r['subject_id'], r['score'], r['waec_grade'], r['academic_year'], r['term']))
@@ -229,7 +279,7 @@ def restore_backup(school_id):
     except Exception as e:
         return jsonify({"error": f"Restoration failed: {str(e)}"}), 500
 
-# --- 6. TENANT (SCHOOL) ENDPOINTS ---
+# --- 7. TENANT (SCHOOL) ENDPOINTS ---
 @app.route('/api/analytics', methods=['GET'])
 @login_required
 @require_active_subscription
@@ -358,7 +408,7 @@ def register_staff():
     finally:
         cur.close(); conn.close()
 
-# --- 7. THE COMPLETE SAAS FRONTEND ---
+# --- 8. THE FRONTEND DASHBOARD ---
 @app.route('/dashboard')
 def dashboard():
     html_template = """
@@ -388,7 +438,6 @@ def dashboard():
             .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
             #toast { display: none; position: fixed; bottom: 30px; right: 30px; padding: 15px 25px; color: white; background: var(--accent); border-radius: 5px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); z-index: 1000; font-weight: bold; }
             
-            /* Data Viewer Styles */
             .table-container { overflow-x: auto; margin-top: 15px; border: 1px solid #ddd; border-radius: 5px; max-height: 400px; }
             table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.95rem; }
             th { background: var(--primary); color: white; padding: 12px; position: sticky; top: 0; }
@@ -427,7 +476,6 @@ def dashboard():
             <h1>Platform Dashboard</h1>
 
             {% if not current_user.is_authenticated %}
-            <!-- LOGIN SCREEN -->
             <div class="card" style="max-width: 400px; margin: 0 auto;">
                 <h3>System Login</h3>
                 <input type="email" id="email" placeholder="Email Address">
@@ -436,7 +484,6 @@ def dashboard():
             </div>
             
             {% elif current_user.role == 'superadmin' %}
-            <!-- SUPER ADMIN DASHBOARD -->
             <div class="card" style="border: 2px solid var(--accent);">
                 <h3>🚀 Onboard New School Tenant</h3>
                 <div class="grid-2">
@@ -457,7 +504,6 @@ def dashboard():
             </div>
 
             {% else %}
-            <!-- SCHOOL DASHBOARD (ADMIN, TEACHER, GUARDIAN) -->
             
             {% if current_user.role == 'admin' %}
             <div id="analytics-section" class="card">
@@ -506,7 +552,6 @@ def dashboard():
             </div>
             {% endif %}
 
-            <!-- UNIVERSAL DATA VIEWER -->
             <div class="card" id="data-viewer" style="display: none; border: 2px solid var(--primary);">
                 <h3 id="viewer-title">Data Explorer</h3>
                 <input type="text" id="searchInput" onkeyup="filterTable()" placeholder="🔍 Search records instantly...">
@@ -593,7 +638,6 @@ def dashboard():
                 } catch(e) { showToast("Connection failed", true); }
             }
 
-            // --- DATA RENDERER FOR TENANTS ---
             function renderTable(title, headers, rows, keys) {
                 const viewer = document.getElementById('data-viewer');
                 document.getElementById('viewer-title').innerText = title;
@@ -661,7 +705,6 @@ def dashboard():
                 renderTable("Financial Statement", ['Fee ID', 'Desc', 'Due (GHS)', 'Paid (GHS)', 'Remaining (GHS)'], data.statement, ['fee_id', 'description', 'amount_due', 'total_paid', 'remaining_balance']);
             }
 
-            // --- SUPER ADMIN FUNCTIONS ---
             async function onboardNewSchool() {
                 const payload = {
                     school_name: document.getElementById('onboardSchool').value,
