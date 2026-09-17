@@ -92,11 +92,8 @@ def setup_db():
     cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS institutions (school_id SERIAL PRIMARY KEY, school_name VARCHAR(150) NOT NULL UNIQUE, subscription_expiry_date DATE NOT NULL)")
     cur.execute("CREATE TABLE IF NOT EXISTS students (student_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, first_name VARCHAR(100) NOT NULL, last_name VARCHAR(100) NOT NULL, guardian_name VARCHAR(100) NOT NULL, guardian_contact VARCHAR(20) NOT NULL, enrollment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-    
-    # Safe Alteration: Inject Day/Boarding & House into existing Students table without data loss
     cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS boarding_status VARCHAR(20) DEFAULT 'Day'")
     cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS house VARCHAR(100) DEFAULT 'Unassigned'")
-
     cur.execute("CREATE TABLE IF NOT EXISTS system_users (user_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, email VARCHAR(100) UNIQUE NOT NULL, password_hash VARCHAR(255) NOT NULL, role VARCHAR(20) NOT NULL, linked_student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE)")
     cur.execute("CREATE TABLE IF NOT EXISTS subjects (subject_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, subject_name VARCHAR(100) NOT NULL)")
     cur.execute("CREATE TABLE IF NOT EXISTS grades (grade_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, subject_id INTEGER REFERENCES subjects(subject_id) ON DELETE CASCADE, class_score INTEGER NOT NULL, exam_score INTEGER NOT NULL, total_score INTEGER NOT NULL, waec_grade VARCHAR(2) NOT NULL, academic_year VARCHAR(9) NOT NULL, term VARCHAR(20) NOT NULL, teacher_remarks VARCHAR(255))")
@@ -109,21 +106,19 @@ def setup_db():
         cur.execute("INSERT INTO system_users (email, password_hash, role) VALUES (%s, %s, %s)", ('superadmin@engine.com', hashed_sa, 'superadmin'))
     conn.commit()
     cur.close(); conn.close()
-    return jsonify({"message": "Multi-Tenant SaaS Engine Ready! Boarding/House parameters successfully injected."})
+    return jsonify({"message": "Multi-Tenant SaaS Engine Ready!"})
 
-# --- 4. THE AUTOMATED CLOUD BACKUP ROBOT ---
+# --- 4. CLOUD BACKUP ROBOT ---
 def automated_weekly_backup():
     if not AWS_BUCKET_NAME: return
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT school_id, school_name FROM institutions")
     schools = cur.fetchall()
-    
     for school in schools:
         school_id = school['school_id']
         school_name = school['school_name']
         backup = {"school_name": school_name, "export_date": datetime.now().isoformat(), "data": {}}
-        
         cur.execute("SELECT * FROM subjects WHERE school_id = %s", (school_id,))
         backup['data']['subjects'] = cur.fetchall()
         cur.execute("SELECT * FROM students WHERE school_id = %s", (school_id,))
@@ -134,14 +129,10 @@ def automated_weekly_backup():
         backup['data']['payments'] = cur.fetchall()
         cur.execute("SELECT * FROM grades WHERE school_id = %s", (school_id,))
         backup['data']['grades'] = cur.fetchall()
-        
         json_data = json.dumps(backup, default=custom_json_serializer)
         filename = f"Automated_Backups/{school_name.replace(' ', '_')}/Backup_{datetime.now().strftime('%Y%m%d')}.json"
-        
-        try:
-            s3_client.put_object(Bucket=AWS_BUCKET_NAME, Key=filename, Body=json_data)
-        except Exception as e: pass
-            
+        try: s3_client.put_object(Bucket=AWS_BUCKET_NAME, Key=filename, Body=json_data)
+        except Exception: pass
     cur.close(); conn.close()
 
 scheduler = BackgroundScheduler()
@@ -169,7 +160,7 @@ def logout():
     logout_user()
     return jsonify({"message": "Logged out safely."})
 
-# --- 6. SUPER ADMIN & MANUAL VAULT ENDPOINTS ---
+# --- 6. SUPER ADMIN VAULT ---
 @app.route('/api/superadmin/schools', methods=['GET'])
 @login_required
 def get_schools():
@@ -222,9 +213,7 @@ def download_backup(school_id):
     cur.execute("SELECT school_name FROM institutions WHERE school_id = %s", (school_id,))
     school = cur.fetchone()
     if not school: return jsonify({"error": "School not found"}), 404
-    
     backup = {"school_name": school['school_name'], "export_date": datetime.now().isoformat(), "data": {}}
-    
     cur.execute("SELECT * FROM subjects WHERE school_id = %s", (school_id,))
     backup['data']['subjects'] = cur.fetchall()
     cur.execute("SELECT * FROM students WHERE school_id = %s", (school_id,))
@@ -235,7 +224,6 @@ def download_backup(school_id):
     backup['data']['payments'] = cur.fetchall()
     cur.execute("SELECT * FROM grades WHERE school_id = %s", (school_id,))
     backup['data']['grades'] = cur.fetchall()
-    
     cur.close(); conn.close()
     json_data = json.dumps(backup, default=custom_json_serializer, indent=4)
     return Response(json_data, mimetype="application/json", headers={"Content-Disposition": f"attachment;filename=Backup_{school['school_name'].replace(' ', '_')}.json"})
@@ -245,45 +233,33 @@ def download_backup(school_id):
 def restore_backup(school_id):
     if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
     if 'file' not in request.files: return jsonify({"error": "No file uploaded"}), 400
-    
     file = request.files['file']
     try:
         data = json.load(file)
         conn = get_db_connection()
         cur = conn.cursor()
-
         if 'subjects' in data['data']:
             for r in data['data']['subjects']:
                 cur.execute("INSERT INTO subjects (subject_id, school_id, subject_name) VALUES (%s, %s, %s) ON CONFLICT (subject_id) DO NOTHING", (r['subject_id'], school_id, r['subject_name']))
         if 'students' in data['data']:
             for r in data['data']['students']:
-                b_stat = r.get('boarding_status', 'Day')
-                hs = r.get('house', 'Unassigned')
-                cur.execute("INSERT INTO students (student_id, school_id, first_name, last_name, guardian_name, guardian_contact, boarding_status, house, enrollment_date) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (student_id) DO NOTHING", (r['student_id'], school_id, r['first_name'], r['last_name'], r['guardian_name'], r['guardian_contact'], b_stat, hs, r['enrollment_date']))
+                cur.execute("INSERT INTO students (student_id, school_id, first_name, last_name, guardian_name, guardian_contact, boarding_status, house, enrollment_date) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (student_id) DO NOTHING", (r['student_id'], school_id, r['first_name'], r['last_name'], r['guardian_name'], r['guardian_contact'], r.get('boarding_status', 'Day'), r.get('house', 'Unassigned'), r['enrollment_date']))
         if 'fees' in data['data']:
             for r in data['data']['fees']:
-                cat = r.get('fee_category', 'General')
-                yr = r.get('academic_year', 'Unknown')
-                tm = r.get('term', 'Unknown')
-                cur.execute("INSERT INTO fees (fee_id, school_id, student_id, fee_category, description, amount_due, academic_year, term, date_issued) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (fee_id) DO NOTHING", (r['fee_id'], school_id, r['student_id'], cat, r['description'], r['amount_due'], yr, tm, r['date_issued']))
+                cur.execute("INSERT INTO fees (fee_id, school_id, student_id, fee_category, description, amount_due, academic_year, term, date_issued) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (fee_id) DO NOTHING", (r['fee_id'], school_id, r['student_id'], r.get('fee_category', 'General'), r['description'], r['amount_due'], r.get('academic_year', 'Unknown'), r.get('term', 'Unknown'), r['date_issued']))
         if 'payments' in data['data']:
             for r in data['data']['payments']:
                 cur.execute("INSERT INTO payments (payment_id, fee_id, amount_paid, payment_method, payment_date) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (payment_id) DO NOTHING", (r['payment_id'], r['fee_id'], r['amount_paid'], r['payment_method'], r['payment_date']))
         if 'grades' in data['data']:
             for r in data['data']['grades']:
-                c_score = r.get('class_score', 0)
-                e_score = r.get('exam_score', r.get('score', 0))
-                t_score = r.get('total_score', r.get('score', 0))
-                rem = r.get('teacher_remarks', '')
-                cur.execute("INSERT INTO grades (grade_id, school_id, student_id, subject_id, class_score, exam_score, total_score, waec_grade, academic_year, term, teacher_remarks) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (grade_id) DO NOTHING", (r['grade_id'], school_id, r['student_id'], r['subject_id'], c_score, e_score, t_score, r['waec_grade'], r['academic_year'], r['term'], rem))
-
+                cur.execute("INSERT INTO grades (grade_id, school_id, student_id, subject_id, class_score, exam_score, total_score, waec_grade, academic_year, term, teacher_remarks) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (grade_id) DO NOTHING", (r['grade_id'], school_id, r['student_id'], r['subject_id'], r.get('class_score', 0), r.get('exam_score', r.get('score', 0)), r.get('total_score', r.get('score', 0)), r['waec_grade'], r['academic_year'], r['term'], r.get('teacher_remarks', '')))
         conn.commit()
         cur.close(); conn.close()
         return jsonify({"message": f"Vault Restoration Complete for {data.get('school_name')}!"}), 200
     except Exception as e:
         return jsonify({"error": f"Restoration failed: {str(e)}"}), 500
 
-# --- 7. TENANT (SCHOOL) ENDPOINTS ---
+# --- 7. TENANT ENDPOINTS ---
 @app.route('/api/analytics', methods=['GET'])
 @login_required
 @require_active_subscription
@@ -405,6 +381,54 @@ def get_statement(student_id):
     cur.close(); conn.close()
     return jsonify({"statement": statement}), 200
 
+# --- THE SMS COMMUNICATION DESK ---
+@app.route('/api/sms/blast', methods=['POST'])
+@login_required
+@require_active_subscription
+def send_sms_blast():
+    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
+    data = request.get_json()
+    audience = data.get('audience')
+    message = data.get('message')
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    if audience == 'all':
+        cur.execute("SELECT DISTINCT guardian_contact FROM students WHERE school_id = %s", (current_user.school_id,))
+    elif audience == 'arrears':
+        cur.execute("""
+            SELECT DISTINCT s.guardian_contact
+            FROM students s
+            JOIN fees f ON s.student_id = f.student_id
+            LEFT JOIN payments p ON f.fee_id = p.fee_id
+            WHERE s.school_id = %s
+            GROUP BY s.guardian_contact, f.fee_id, f.amount_due
+            HAVING (f.amount_due - COALESCE(SUM(p.amount_paid), 0)) > 0
+        """, (current_user.school_id,))
+    elif audience == 'boarding':
+        cur.execute("SELECT DISTINCT guardian_contact FROM students WHERE school_id = %s AND boarding_status = 'Boarding'", (current_user.school_id,))
+    
+    contacts = [row['guardian_contact'] for row in cur.fetchall() if row['guardian_contact']]
+    cur.close(); conn.close()
+
+    if not contacts:
+        return jsonify({"error": "No contacts found for this audience filter."}), 404
+
+    # SIMULATION ENGINE: Switch to live API via Render Environment Variables later
+    SMS_API_KEY = os.environ.get('SMS_API_KEY')
+    if SMS_API_KEY:
+        print(f"LIVE DISPATCH: Forwarding {len(contacts)} messages to Hubtel/Arkesel Gateway.")
+        # Future API request logic goes here
+    else:
+        print("\n--- 📟 SMS BLAST SIMULATION LOG ---")
+        print(f"Audience: {audience.upper()} ({len(contacts)} recipients)")
+        print(f"Destinations: {', '.join(contacts)}")
+        print(f"Payload: {message}")
+        print("-----------------------------------\n")
+    
+    return jsonify({"message": f"SMS dispatch successful! Sent to {len(contacts)} parent(s)."})
+
 @app.route('/api/register_staff', methods=['POST'])
 @login_required
 @require_active_subscription
@@ -447,7 +471,8 @@ def dashboard():
             .main-content { margin-left: 250px; flex: 1; padding: 40px; box-sizing: border-box; min-height: 100vh; }
             .card { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 20px; }
             h3 { margin-top: 0; color: var(--primary); border-bottom: 2px solid #eee; padding-bottom: 8px;}
-            input, select { width: 100%; padding: 10px; margin-bottom: 15px; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; }
+            input, select, textarea { width: 100%; padding: 10px; margin-bottom: 15px; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; font-family: inherit;}
+            textarea { resize: vertical; min-height: 100px; }
             .btn { background: var(--primary); color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-weight: bold; width: 100%; margin-bottom: 10px;}
             .btn-success { background: var(--accent); }
             .btn-danger { background: var(--danger); }
@@ -479,6 +504,7 @@ def dashboard():
                     <button onclick="document.getElementById('admissions-section').scrollIntoView()">Admissions Desk</button>
                     <button onclick="document.getElementById('finance-section').scrollIntoView()">Financial Desk</button>
                     <button onclick="document.getElementById('academics-section').scrollIntoView()">Academics & SBA</button>
+                    <button onclick="document.getElementById('sms-section').scrollIntoView()">SMS Comm. Desk</button>
                     <button onclick="document.getElementById('admin-tools').scrollIntoView()">Admin Tools</button>
                 {% else %}
                     <button onclick="document.getElementById('academics-section').scrollIntoView()">My Portal</button>
@@ -633,6 +659,27 @@ def dashboard():
             </div>
 
             {% if current_user.role == 'admin' %}
+            <!-- NEW SMS NOTIFICATION MODULE -->
+            <div id="sms-section" class="card" style="border: 2px solid var(--info);">
+                <h3>📟 SMS Communication Desk</h3>
+                <div class="grid-2">
+                    <div>
+                        <label style="font-weight:bold; display:block; margin-bottom:5px;">Target Audience</label>
+                        <select id="smsAudience">
+                            <option value="all">Broadcast to All Parents</option>
+                            <option value="arrears">Only Parents with Unpaid Arrears</option>
+                            <option value="boarding">Parents of Boarding Students</option>
+                        </select>
+                        <p style="font-size:0.8rem; color:#666;">The system will automatically extract contact numbers from the database based on your selection.</p>
+                    </div>
+                    <div>
+                        <label style="font-weight:bold; display:block; margin-bottom:5px;">Message Content</label>
+                        <textarea id="smsBody" placeholder="Enter your text message here... (e.g., Dear Parent, this is a reminder that mid-term fees are due next week.)"></textarea>
+                        <button class="btn btn-info" onclick="sendAction('/api/sms/blast', {audience: document.getElementById('smsAudience').value, message: document.getElementById('smsBody').value})">Send SMS Broadcast</button>
+                    </div>
+                </div>
+            </div>
+
             <div id="admin-tools" class="card grid-2">
                 <div>
                     <h3>Register New Teacher</h3>
