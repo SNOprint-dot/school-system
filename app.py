@@ -112,7 +112,7 @@ def setup_db():
     cur.close(); conn.close()
     return jsonify({"message": "Multi-Tenant SaaS Engine Ready! ERP modules successfully injected."})
 
-# --- 4. CLOUD BACKUP ROBOT (UPDATED FOR ERP) ---
+# --- 4. CLOUD BACKUP ROBOT ---
 def automated_weekly_backup():
     if not AWS_BUCKET_NAME: return
     conn = get_db_connection()
@@ -166,7 +166,7 @@ def logout():
     logout_user()
     return jsonify({"message": "Logged out safely."})
 
-# --- 6. SUPER ADMIN VAULT (OMITTED REDUNDANT BACKUP ROUTES FOR BREVITY, ASSUME EXISTING) ---
+# --- 6. SUPER ADMIN VAULT ---
 @app.route('/api/superadmin/schools', methods=['GET'])
 @login_required
 def get_schools():
@@ -177,6 +177,18 @@ def get_schools():
     schools = cur.fetchall()
     cur.close(); conn.close()
     return jsonify({"data": schools})
+
+@app.route('/api/superadmin/renew/<int:school_id>', methods=['POST'])
+@login_required
+def renew_school(school_id):
+    if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE institutions SET subscription_expiry_date = CURRENT_DATE + INTERVAL '1 year' WHERE school_id = %s RETURNING school_name, subscription_expiry_date", (school_id,))
+    updated = cur.fetchone()
+    conn.commit()
+    cur.close(); conn.close()
+    return jsonify({"message": f"Contract Renewed! {updated['school_name']} active until {updated['subscription_expiry_date']}"})
 
 @app.route('/api/superadmin/onboard', methods=['POST'])
 @login_required
@@ -198,7 +210,62 @@ def onboard_school():
     finally:
         cur.close(); conn.close()
 
-# --- 7. TENANT ENDPOINTS (WITH NEW ERP MODULES) ---
+@app.route('/api/superadmin/backup/<int:school_id>', methods=['GET'])
+@login_required
+def download_backup(school_id):
+    if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT school_name FROM institutions WHERE school_id = %s", (school_id,))
+    school = cur.fetchone()
+    if not school: return jsonify({"error": "School not found"}), 404
+    backup = {"school_name": school['school_name'], "export_date": datetime.now().isoformat(), "data": {}}
+    cur.execute("SELECT * FROM subjects WHERE school_id = %s", (school_id,))
+    backup['data']['subjects'] = cur.fetchall()
+    cur.execute("SELECT * FROM students WHERE school_id = %s", (school_id,))
+    backup['data']['students'] = cur.fetchall()
+    cur.execute("SELECT * FROM fees WHERE school_id = %s", (school_id,))
+    backup['data']['fees'] = cur.fetchall()
+    cur.execute("SELECT p.* FROM payments p JOIN fees f ON p.fee_id = f.fee_id WHERE f.school_id = %s", (school_id,))
+    backup['data']['payments'] = cur.fetchall()
+    cur.execute("SELECT * FROM grades WHERE school_id = %s", (school_id,))
+    backup['data']['grades'] = cur.fetchall()
+    cur.close(); conn.close()
+    json_data = json.dumps(backup, default=custom_json_serializer, indent=4)
+    return Response(json_data, mimetype="application/json", headers={"Content-Disposition": f"attachment;filename=Backup_{school['school_name'].replace(' ', '_')}.json"})
+
+@app.route('/api/superadmin/restore/<int:school_id>', methods=['POST'])
+@login_required
+def restore_backup(school_id):
+    if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
+    if 'file' not in request.files: return jsonify({"error": "No file uploaded"}), 400
+    file = request.files['file']
+    try:
+        data = json.load(file)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        if 'subjects' in data['data']:
+            for r in data['data']['subjects']:
+                cur.execute("INSERT INTO subjects (subject_id, school_id, subject_name) VALUES (%s, %s, %s) ON CONFLICT (subject_id) DO NOTHING", (r['subject_id'], school_id, r['subject_name']))
+        if 'students' in data['data']:
+            for r in data['data']['students']:
+                cur.execute("INSERT INTO students (student_id, school_id, first_name, last_name, guardian_name, guardian_contact, boarding_status, house, enrollment_date) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (student_id) DO NOTHING", (r['student_id'], school_id, r['first_name'], r['last_name'], r['guardian_name'], r['guardian_contact'], r.get('boarding_status', 'Day'), r.get('house', 'Unassigned'), r['enrollment_date']))
+        if 'fees' in data['data']:
+            for r in data['data']['fees']:
+                cur.execute("INSERT INTO fees (fee_id, school_id, student_id, fee_category, description, amount_due, academic_year, term, date_issued) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (fee_id) DO NOTHING", (r['fee_id'], school_id, r['student_id'], r.get('fee_category', 'General'), r['description'], r['amount_due'], r.get('academic_year', 'Unknown'), r.get('term', 'Unknown'), r['date_issued']))
+        if 'payments' in data['data']:
+            for r in data['data']['payments']:
+                cur.execute("INSERT INTO payments (payment_id, fee_id, amount_paid, payment_method, payment_date) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (payment_id) DO NOTHING", (r['payment_id'], r['fee_id'], r['amount_paid'], r['payment_method'], r['payment_date']))
+        if 'grades' in data['data']:
+            for r in data['data']['grades']:
+                cur.execute("INSERT INTO grades (grade_id, school_id, student_id, subject_id, class_score, exam_score, total_score, waec_grade, academic_year, term, teacher_remarks) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (grade_id) DO NOTHING", (r['grade_id'], school_id, r['student_id'], r['subject_id'], r.get('class_score', 0), r.get('exam_score', r.get('score', 0)), r.get('total_score', r.get('score', 0)), r['waec_grade'], r['academic_year'], r['term'], r.get('teacher_remarks', '')))
+        conn.commit()
+        cur.close(); conn.close()
+        return jsonify({"message": f"Vault Restoration Complete for {data.get('school_name')}!"}), 200
+    except Exception as e:
+        return jsonify({"error": f"Restoration failed: {str(e)}"}), 500
+
+# --- 7. TENANT ENDPOINTS (ERP MODULES) ---
 @app.route('/api/analytics', methods=['GET'])
 @login_required
 @require_active_subscription
@@ -206,20 +273,15 @@ def get_analytics():
     if current_user.role != 'admin': return jsonify({"error": "Unauthorized"}), 403
     conn = get_db_connection()
     cur = conn.cursor()
-    # Financials
     cur.execute("SELECT COALESCE(SUM(amount_due), 0) as total_due FROM fees WHERE school_id = %s", (current_user.school_id,))
     total_due = float(cur.fetchone()['total_due'])
     cur.execute("SELECT COALESCE(SUM(p.amount_paid), 0) as total_paid FROM payments p JOIN fees f ON p.fee_id = f.fee_id WHERE f.school_id = %s", (current_user.school_id,))
     total_paid = float(cur.fetchone()['total_paid'])
     cur.execute("SELECT COALESCE(SUM(amount), 0) as total_expenses FROM expenses WHERE school_id = %s", (current_user.school_id,))
     total_exp = float(cur.fetchone()['total_expenses'])
-    
-    # WAEC Performance Metrics
     cur.execute("SELECT waec_grade, COUNT(*) as count FROM grades WHERE school_id = %s GROUP BY waec_grade ORDER BY waec_grade", (current_user.school_id,))
     performance = cur.fetchall()
-    
     cur.close(); conn.close()
-    
     return jsonify({
         "financials": {
             "due": total_due, 
@@ -231,7 +293,6 @@ def get_analytics():
         "performance": performance
     })
 
-# M2: EXPENSE LEDGER
 @app.route('/api/expenses', methods=['POST', 'GET'])
 @login_required
 @require_active_subscription
@@ -252,7 +313,6 @@ def manage_expenses():
         cur.close(); conn.close()
         return jsonify({"data": expenses})
 
-# M4: DIGITAL ATTENDANCE
 @app.route('/api/attendance', methods=['POST'])
 @login_required
 @require_active_subscription
@@ -272,7 +332,6 @@ def log_attendance():
     finally:
         cur.close(); conn.close()
 
-# M1: PRINT-READY ID GENERATOR (HTML RENDER)
 @app.route('/print_ids', methods=['GET'])
 @login_required
 @require_active_subscription
@@ -319,7 +378,6 @@ def print_ids():
     html += "</div></body></html>"
     return html
 
-# Existing Student, Finance, SMS, and Grade Endpoints...
 @app.route('/api/students', methods=['GET', 'POST'])
 @login_required
 def manage_students():
@@ -367,6 +425,27 @@ def add_grade():
     conn.commit(); cur.close(); conn.close()
     return jsonify({"message": f"SBA Recorded! Total: {t_score}% ({waec})"})
 
+@app.route('/api/report_card/<int:student_id>', methods=['GET'])
+@login_required
+def get_report_card(student_id):
+    if current_user.role == 'guardian' and current_user.linked_student_id != student_id: return jsonify({"error": "Access Denied."}), 403
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT sub.subject_name, g.class_score, g.exam_score, g.total_score, g.waec_grade, g.teacher_remarks, g.term FROM grades g JOIN subjects sub ON g.subject_id = sub.subject_id WHERE g.student_id = %s AND g.school_id = %s", (student_id, current_user.school_id))
+    grades = cur.fetchall()
+    cur.close(); conn.close()
+    return jsonify({"grades": grades})
+
+@app.route('/api/statement/<int:student_id>', methods=['GET'])
+@login_required
+def get_statement(student_id):
+    if current_user.role == 'guardian' and current_user.linked_student_id != student_id: return jsonify({"error": "Access Denied."}), 403
+    conn = get_db_connection(); cur = conn.cursor()
+    query = "SELECT f.fee_id, f.fee_category, f.academic_year, f.term, f.description, f.amount_due, COALESCE(SUM(p.amount_paid), 0) as total_paid, (f.amount_due - COALESCE(SUM(p.amount_paid), 0)) as remaining_balance FROM fees f LEFT JOIN payments p ON f.fee_id = p.fee_id WHERE f.student_id = %s AND f.school_id = %s GROUP BY f.fee_id, f.fee_category, f.academic_year, f.term, f.description, f.amount_due ORDER BY f.date_issued DESC"
+    cur.execute(query, (student_id, current_user.school_id))
+    statement = cur.fetchall()
+    cur.close(); conn.close()
+    return jsonify({"statement": statement}), 200
+
 @app.route('/api/sms/blast', methods=['POST'])
 @login_required
 def send_sms_blast():
@@ -384,7 +463,7 @@ def register_staff():
     except: return jsonify({"error": "Email exists."}), 409
     finally: cur.close(); conn.close()
 
-# --- 8. THE FRONTEND DASHBOARD (ERP EDITION) ---
+# --- 8. THE FRONTEND DASHBOARD ---
 @app.route('/dashboard')
 def dashboard():
     html_template = """
@@ -447,9 +526,27 @@ def dashboard():
                 <button class="btn" onclick="login()">Login</button>
             </div>
             
+            {% elif current_user.role == 'superadmin' %}
+            <div class="card" style="border: 2px solid var(--accent);">
+                <h3>🚀 Onboard New School Tenant</h3>
+                <div class="grid-2">
+                    <div>
+                        <input type="text" id="onboardSchool" placeholder="School Name (e.g. Accra Academy)">
+                        <input type="email" id="onboardEmail" placeholder="Initial Admin Email">
+                    </div>
+                    <div>
+                        <input type="password" id="onboardPass" placeholder="Initial Admin Password">
+                        <button class="btn btn-success" onclick="onboardNewSchool()">Provision New Tenant</button>
+                    </div>
+                </div>
+            </div>
+            <div class="card">
+                <h3>Global Tenant Control Room</h3>
+                <button class="btn" onclick="loadSchools()">Refresh Tenant List</button>
+                <div id="school-container"></div>
+            </div>
+
             {% elif current_user.role == 'admin' %}
-            
-            <!-- M2 & M3: EXECUTIVE ANALYTICS -->
             <div id="analytics-section" class="card">
                 <h3>Corporate Analytics (Live Net Margin & WAEC Stats)</h3>
                 <div class="grid-2" style="margin-bottom: 20px;">
@@ -463,7 +560,6 @@ def dashboard():
                 </div>
             </div>
 
-            <!-- M2: EXPENSE LEDGER -->
             <div id="finance-section" class="card grid-2" style="border: 2px solid var(--danger);">
                 <div>
                     <h3>Log Operational Expense</h3>
@@ -480,12 +576,11 @@ def dashboard():
                 </div>
                 <div>
                     <h3>Financial Operations</h3>
-                    <button class="btn" onclick="document.getElementById('bCat').focus()">Issue Student Bill (Standard Form)</button>
+                    <button class="btn" onclick="loadRoster()">Issue Student Bill (Standard Form)</button>
                     <button class="btn btn-info" onclick="loadExpenses()">View Expense Ledger</button>
                 </div>
             </div>
 
-            <!-- M1: ADMISSIONS & PRINT IDs -->
             <div id="admissions-section" class="card grid-2">
                 <div>
                     <h3>Enroll New Student</h3>
@@ -503,12 +598,11 @@ def dashboard():
                 </div>
             </div>
 
-            <!-- M4: DIGITAL ATTENDANCE & FEEDING ROSTER -->
             <div id="attendance-section" class="card" style="border: 2px solid var(--info);">
                 <h3>Daily Roll Call & Feeding Optimization</h3>
                 <div class="grid-2">
                     <div>
-                        <input type="date" id="attDate" value="{% raw %}{{new Date().toISOString().split('T')[0]}}{% endraw %}">
+                        <input type="date" id="attDate" value="">
                         <input type="number" id="attStuId" placeholder="Student ID">
                     </div>
                     <div>
@@ -521,7 +615,6 @@ def dashboard():
                 </div>
             </div>
 
-            <!-- EXISTING SBA SECTION -->
             <div id="academics-section" class="card grid-2">
                 <div>
                     <h3>Record SBA Grade (30/70)</h3>
@@ -535,7 +628,6 @@ def dashboard():
                 </div>
             </div>
 
-            <!-- M5: STAFF HR & COMPLIANCE VAULT -->
             <div id="hr-section" class="card grid-2">
                 <div>
                     <h3>Register Staff Profile</h3>
@@ -549,7 +641,6 @@ def dashboard():
                 </div>
             </div>
             
-            <!-- DATA VIEWER CONTAINER -->
             <div class="card" id="data-viewer" style="display: none; border: 2px solid var(--primary);">
                 <h3 id="viewer-title">Data Explorer</h3>
                 <div id="table-container"></div>
@@ -558,64 +649,190 @@ def dashboard():
         </main>
 
         <script>
-            function showToast(m, e=false) { const t = document.getElementById('toast'); t.innerText = m; t.style.background = e ? '#dc3545' : '#28a745'; t.style.display = 'block'; setTimeout(() => t.style.display = 'none', 3000); }
-            async function login() {
-                const res = await fetch('/api/login', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({email: document.getElementById('email').value, password: document.getElementById('pass').value}) });
-                const data = await res.json();
-                if(res.ok) { showToast(data.message); setTimeout(()=>window.location.reload(),1000); } else showToast(data.error, true);
+            function showToast(message, isError=false) {
+                const toast = document.getElementById('toast');
+                toast.innerText = message;
+                toast.style.background = isError ? '#dc3545' : '#28a745';
+                toast.style.display = 'block';
+                setTimeout(() => { toast.style.display = 'none'; }, 5000);
             }
+
+            async function login() {
+                const res = await fetch('/api/login', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({email: document.getElementById('email').value, password: document.getElementById('pass').value})
+                });
+                const data = await res.json();
+                if (res.ok) { showToast(data.message); setTimeout(() => window.location.reload(), 1000); } 
+                else { showToast(data.error, true); }
+            }
+
             async function logout() { await fetch('/api/logout', { method: 'POST' }); window.location.reload(); }
+
             async function sendAction(endpoint, payload, isGet=false) {
                 try {
-                    const res = await fetch(endpoint, isGet ? {} : { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+                    const options = isGet ? {} : { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) };
+                    const res = await fetch(endpoint, options);
                     const data = await res.json();
-                    if(res.ok) { showToast(data.message || data.message); if(endpoint==='/api/expenses') loadDashboardData(); } 
-                    else showToast(data.error, true);
+                    if (res.ok) { 
+                        showToast(data.message || "Success"); 
+                        if (endpoint === '/api/setup_db') loadSchools(); 
+                        if (endpoint === '/api/expenses') loadDashboardData();
+                    }
+                    else if (res.status === 402) showToast(data.error, true); 
+                    else showToast(data.error || "Error", true);
                 } catch(e) { showToast("Connection failed", true); }
             }
-            
+
+            async function loadSchools() {
+                const res = await fetch('/api/superadmin/schools');
+                if(!res.ok) return;
+                const data = await res.json();
+                let html = '<table style="width:100%; border-collapse: collapse; text-align: left;"><tr><th style="padding:10px; background:#0f4c81; color:white;">ID</th><th style="padding:10px; background:#0f4c81; color:white;">School Name</th><th style="padding:10px; background:#0f4c81; color:white;">Expiry Date</th><th style="padding:10px; background:#0f4c81; color:white;">Status</th><th style="padding:10px; background:#0f4c81; color:white;">Actions</th></tr>';
+                data.data.forEach(s => {
+                    const statusColor = s.status === 'Active' ? 'green' : 'red';
+                    html += `<tr>
+                        <td style="padding:10px; border-bottom:1px solid #ddd;">${s.school_id}</td>
+                        <td style="padding:10px; border-bottom:1px solid #ddd;">${s.school_name}</td>
+                        <td style="padding:10px; border-bottom:1px solid #ddd;">${s.expiry_date}</td>
+                        <td style="color:${statusColor}; font-weight:bold; padding:10px; border-bottom:1px solid #ddd;">${s.status}</td>
+                        <td style="padding:10px; border-bottom:1px solid #ddd;">
+                            <button class="btn btn-success" style="width: auto; padding: 6px 12px; margin: 2px;" onclick="sendAction('/api/superadmin/renew/${s.school_id}', {})">Renew</button>
+                            <button class="btn btn-info" style="width: auto; padding: 6px 12px; margin: 2px;" onclick="window.location.href='/api/superadmin/backup/${s.school_id}'">⬇️ Backup</button>
+                            <input type="file" id="file_${s.school_id}" accept=".json" style="display:none;" onchange="uploadRestore(${s.school_id})">
+                            <button class="btn btn-danger" style="width: auto; padding: 6px 12px; margin: 2px;" onclick="document.getElementById('file_${s.school_id}').click()">⬆️ Restore</button>
+                        </td>
+                    </tr>`;
+                });
+                html += '</table>';
+                document.getElementById('school-container').innerHTML = html;
+            }
+
+            async function onboardNewSchool() {
+                const payload = {
+                    school_name: document.getElementById('onboardSchool').value,
+                    admin_email: document.getElementById('onboardEmail').value,
+                    admin_password: document.getElementById('onboardPass').value
+                };
+                const res = await fetch('/api/superadmin/onboard', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    showToast(data.message);
+                    document.getElementById('onboardSchool').value = '';
+                    document.getElementById('onboardEmail').value = '';
+                    document.getElementById('onboardPass').value = '';
+                    loadSchools();
+                } else { showToast(data.error, true); }
+            }
+
+            async function uploadRestore(schoolId) {
+                const fileInput = document.getElementById('file_' + schoolId);
+                if (!fileInput.files.length) return;
+                const formData = new FormData();
+                formData.append('file', fileInput.files[0]);
+                showToast("Restoring data, please wait...", false);
+                try {
+                    const res = await fetch('/api/superadmin/restore/' + schoolId, { method: 'POST', body: formData });
+                    const data = await res.json();
+                    if (res.ok) showToast(data.message);
+                    else showToast(data.error, true);
+                } catch(e) { showToast("Upload failed", true); }
+                fileInput.value = ''; 
+            }
+
+            function renderTable(title, headers, rows, keys) {
+                const viewer = document.getElementById('data-viewer');
+                document.getElementById('viewer-title').innerText = title;
+                const container = document.getElementById('table-container');
+                
+                if (!rows || rows.length === 0) {
+                    container.innerHTML = '<div style="padding: 20px;">No records found.</div>';
+                    viewer.style.display = 'block';
+                    return;
+                }
+                
+                let html = '<table style="width:100%; border-collapse: collapse;"><tr>';
+                headers.forEach(h => html += `<th style="background:#0f4c81;color:white;padding:10px;text-align:left;">${h}</th>`);
+                html += '</tr>';
+                
+                rows.forEach(row => {
+                    html += '<tr>';
+                    keys.forEach(k => {
+                        let val = row[k];
+                        if (k === 'remaining_balance' && val > 0) {
+                            html += `<td style="color:#dc3545; font-weight:bold; padding:10px; border-bottom:1px solid #ddd;">${val}</td>`;
+                        } else if (k === 'boarding_status') {
+                            let badge = val === 'Boarding' ? 'background:#0f4c81;color:white;' : 'background:#eee;color:black;';
+                            html += `<td style="padding:10px; border-bottom:1px solid #ddd;"><span style="${badge}padding:3px 8px;border-radius:12px;font-size:0.8rem;">${val}</span></td>`;
+                        } else {
+                            html += `<td style="padding:10px; border-bottom:1px solid #ddd;">${val}</td>`;
+                        }
+                    });
+                    html += '</tr>';
+                });
+                html += '</table>';
+                container.innerHTML = html;
+                viewer.style.display = 'block';
+                viewer.scrollIntoView({behavior: "smooth"});
+            }
+
+            async function loadRoster() {
+                const res = await fetch('/api/students');
+                const data = await res.json();
+                renderTable("Student Roster", ['ID', 'First Name', 'Last Name', 'Status', 'House', 'Guardian Contact'], data.data, ['student_id', 'first_name', 'last_name', 'boarding_status', 'house', 'guardian_contact']);
+            }
+
             async function loadExpenses() {
                 const res = await fetch('/api/expenses'); const data = await res.json();
-                const container = document.getElementById('table-container');
-                let html = '<table style="width:100%; border-collapse: collapse;"><tr><th style="background:#0f4c81;color:white;padding:10px;">Date</th><th style="background:#0f4c81;color:white;padding:10px;">Category</th><th style="background:#0f4c81;color:white;padding:10px;">Amount (GHS)</th></tr>';
-                data.data.forEach(r => html += `<tr><td style="padding:10px; border-bottom:1px solid #ddd;">${r.date}</td><td style="padding:10px; border-bottom:1px solid #ddd;">${r.category}</td><td style="padding:10px; border-bottom:1px solid #ddd;">${r.amount}</td></tr>`);
-                container.innerHTML = html + '</table>';
-                document.getElementById('data-viewer').style.display = 'block';
-                document.getElementById('viewer-title').innerText = 'Expense Ledger';
+                renderTable("Expense Ledger", ['Date', 'Category', 'Description', 'Amount (GHS)'], data.data, ['date', 'category', 'description', 'amount']);
             }
 
             async function loadDashboardData() {
-                if(!document.getElementById('financeChart')) return;
-                const res = await fetch('/api/analytics'); const data = await res.json();
-                
-                // M2: Net Margin Calculations
-                document.getElementById('metricRevenue').innerText = `Gross Revenue: GHS ${data.financials.paid.toLocaleString()}`;
-                document.getElementById('metricExpenses').innerText = `Total Expenses: GHS ${data.financials.expenses.toLocaleString()}`;
-                document.getElementById('metricMargin').innerText = `Net Operational Margin: GHS ${data.financials.net_margin.toLocaleString()}`;
-                
-                new Chart(document.getElementById('financeChart').getContext('2d'), {
-                    type: 'doughnut', data: {
-                        labels: ['Collected Revenue', 'Outstanding Arrears', 'Operational Expenses'],
-                        datasets: [{ data: [data.financials.paid, data.financials.outstanding, data.financials.expenses], backgroundColor: ['#28a745', '#ffc107', '#dc3545'], borderWidth: 0 }]
-                    }, options: { responsive: true, maintainAspectRatio: false }
-                });
+                if (document.getElementById('attDate')) {
+                    document.getElementById('attDate').value = new Date().toISOString().split('T')[0];
+                }
 
-                // M3: WAEC Performance Chart
-                const labels = data.performance.map(p => p.waec_grade);
-                const counts = data.performance.map(p => p.count);
-                new Chart(document.getElementById('waecChart').getContext('2d'), {
-                    type: 'bar', data: {
-                        labels: labels, datasets: [{ label: 'Number of Students', data: counts, backgroundColor: '#0f4c81' }]
-                    }, options: { responsive: true, maintainAspectRatio: false, plugins: { title: { display: true, text: 'Overall WAEC Grade Distribution' } } }
-                });
+                // If on Super Admin view, load schools.
+                if (document.getElementById('school-container')) {
+                    loadSchools();
+                }
+                
+                // If on Tenant Admin view, load charts.
+                if (document.getElementById('financeChart')) {
+                    try {
+                        const res = await fetch('/api/analytics'); 
+                        const data = await res.json();
+                        
+                        document.getElementById('metricRevenue').innerText = `Gross Revenue: GHS ${data.financials.paid.toLocaleString()}`;
+                        document.getElementById('metricExpenses').innerText = `Total Expenses: GHS ${data.financials.expenses.toLocaleString()}`;
+                        document.getElementById('metricMargin').innerText = `Net Operational Margin: GHS ${data.financials.net_margin.toLocaleString()}`;
+                        
+                        new Chart(document.getElementById('financeChart').getContext('2d'), {
+                            type: 'doughnut', data: {
+                                labels: ['Collected Revenue', 'Outstanding Arrears', 'Operational Expenses'],
+                                datasets: [{ data: [data.financials.paid, data.financials.outstanding, data.financials.expenses], backgroundColor: ['#28a745', '#ffc107', '#dc3545'], borderWidth: 0 }]
+                            }, options: { responsive: true, maintainAspectRatio: false }
+                        });
+
+                        const labels = data.performance.map(p => p.waec_grade);
+                        const counts = data.performance.map(p => p.count);
+                        new Chart(document.getElementById('waecChart').getContext('2d'), {
+                            type: 'bar', data: {
+                                labels: labels, datasets: [{ label: 'Number of Students', data: counts, backgroundColor: '#0f4c81' }]
+                            }, options: { responsive: true, maintainAspectRatio: false, plugins: { title: { display: true, text: 'Overall WAEC Grade Distribution' } } }
+                        });
+                    } catch(e) { console.log(e); }
+                }
             }
+            
             window.onload = loadDashboardData;
         </script>
     </body>
     </html>
     """
-    # Quick fix for dynamic date initialization in raw HTML block
-    html_template = html_template.replace('{% raw %}{{new Date().toISOString().split(\'T\')[0]}}{% endraw %}', '')
     return render_template_string(html_template, current_user=current_user)
 
 if __name__ == '__main__':
