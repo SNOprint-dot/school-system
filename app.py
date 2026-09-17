@@ -116,7 +116,7 @@ def logout():
     logout_user()
     return jsonify({"message": "Logged out safely."})
 
-# --- 5. SUPER ADMIN ENDPOINTS ---
+# --- 5. SUPER ADMIN & THE VAULT ENDPOINTS ---
 @app.route('/api/superadmin/schools', methods=['GET'])
 @login_required
 def get_schools():
@@ -160,6 +160,7 @@ def onboard_school():
     finally:
         cur.close(); conn.close()
 
+# ⬇️ THE BACKUP GENERATOR
 @app.route('/api/superadmin/backup/<int:school_id>', methods=['GET'])
 @login_required
 def download_backup(school_id):
@@ -169,7 +170,12 @@ def download_backup(school_id):
     cur.execute("SELECT school_name FROM institutions WHERE school_id = %s", (school_id,))
     school = cur.fetchone()
     if not school: return jsonify({"error": "School not found"}), 404
+    
     backup = {"school_name": school['school_name'], "export_date": datetime.now().isoformat(), "data": {}}
+    
+    # Extract complete tenant footprint
+    cur.execute("SELECT * FROM subjects WHERE school_id = %s", (school_id,))
+    backup['data']['subjects'] = cur.fetchall()
     cur.execute("SELECT * FROM students WHERE school_id = %s", (school_id,))
     backup['data']['students'] = cur.fetchall()
     cur.execute("SELECT * FROM fees WHERE school_id = %s", (school_id,))
@@ -178,9 +184,50 @@ def download_backup(school_id):
     backup['data']['payments'] = cur.fetchall()
     cur.execute("SELECT * FROM grades WHERE school_id = %s", (school_id,))
     backup['data']['grades'] = cur.fetchall()
+    
     cur.close(); conn.close()
     json_data = json.dumps(backup, default=custom_json_serializer, indent=4)
     return Response(json_data, mimetype="application/json", headers={"Content-Disposition": f"attachment;filename=Backup_{school['school_name'].replace(' ', '_')}.json"})
+
+# ⬆️ THE RESTORE INJECTOR
+@app.route('/api/superadmin/restore/<int:school_id>', methods=['POST'])
+@login_required
+def restore_backup(school_id):
+    if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
+    if 'file' not in request.files: return jsonify({"error": "No file uploaded"}), 400
+    
+    file = request.files['file']
+    try:
+        data = json.load(file)
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Safely inject missing records (ON CONFLICT DO NOTHING prevents duplicates)
+        if 'subjects' in data['data']:
+            for r in data['data']['subjects']:
+                cur.execute("INSERT INTO subjects (subject_id, school_id, subject_name) VALUES (%s, %s, %s) ON CONFLICT (subject_id) DO NOTHING", (r['subject_id'], school_id, r['subject_name']))
+        
+        if 'students' in data['data']:
+            for r in data['data']['students']:
+                cur.execute("INSERT INTO students (student_id, school_id, first_name, last_name, guardian_name, guardian_contact, enrollment_date) VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (student_id) DO NOTHING", (r['student_id'], school_id, r['first_name'], r['last_name'], r['guardian_name'], r['guardian_contact'], r['enrollment_date']))
+                
+        if 'fees' in data['data']:
+            for r in data['data']['fees']:
+                cur.execute("INSERT INTO fees (fee_id, school_id, student_id, description, amount_due, date_issued) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (fee_id) DO NOTHING", (r['fee_id'], school_id, r['student_id'], r['description'], r['amount_due'], r['date_issued']))
+                
+        if 'payments' in data['data']:
+            for r in data['data']['payments']:
+                cur.execute("INSERT INTO payments (payment_id, fee_id, amount_paid, payment_method, payment_date) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (payment_id) DO NOTHING", (r['payment_id'], r['fee_id'], r['amount_paid'], r['payment_method'], r['payment_date']))
+                
+        if 'grades' in data['data']:
+            for r in data['data']['grades']:
+                cur.execute("INSERT INTO grades (grade_id, school_id, student_id, subject_id, score, waec_grade, academic_year, term) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (grade_id) DO NOTHING", (r['grade_id'], school_id, r['student_id'], r['subject_id'], r['score'], r['waec_grade'], r['academic_year'], r['term']))
+
+        conn.commit()
+        cur.close(); conn.close()
+        return jsonify({"message": f"Vault Restoration Complete for {data.get('school_name')}!"}), 200
+    except Exception as e:
+        return jsonify({"error": f"Restoration failed: {str(e)}"}), 500
 
 # --- 6. TENANT (SCHOOL) ENDPOINTS ---
 @app.route('/api/analytics', methods=['GET'])
@@ -252,7 +299,6 @@ def add_grade():
     waec = get_waec_grade(score)
     conn = get_db_connection()
     cur = conn.cursor()
-    # Check if subject exists, create if not
     cur.execute("SELECT subject_id FROM subjects WHERE subject_name = %s AND school_id = %s", (data.get('subject_name'), current_user.school_id))
     sub = cur.fetchone()
     if not sub:
@@ -271,8 +317,7 @@ def add_grade():
 @login_required
 @require_active_subscription
 def get_report_card(student_id):
-    if current_user.role == 'guardian' and current_user.linked_student_id != student_id:
-        return jsonify({"error": "Access Denied."}), 403
+    if current_user.role == 'guardian' and current_user.linked_student_id != student_id: return jsonify({"error": "Access Denied."}), 403
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT sub.subject_name, g.score, g.waec_grade, g.term FROM grades g JOIN subjects sub ON g.subject_id = sub.subject_id WHERE g.student_id = %s AND g.school_id = %s", (student_id, current_user.school_id))
@@ -284,8 +329,7 @@ def get_report_card(student_id):
 @login_required
 @require_active_subscription
 def get_statement(student_id):
-    if current_user.role == 'guardian' and current_user.linked_student_id != student_id:
-        return jsonify({"error": "Access Denied."}), 403
+    if current_user.role == 'guardian' and current_user.linked_student_id != student_id: return jsonify({"error": "Access Denied."}), 403
     conn = get_db_connection()
     cur = conn.cursor()
     query = "SELECT f.fee_id, f.description, f.amount_due, COALESCE(SUM(p.amount_paid), 0) as total_paid, (f.amount_due - COALESCE(SUM(p.amount_paid), 0)) as remaining_balance FROM fees f LEFT JOIN payments p ON f.fee_id = p.fee_id WHERE f.student_id = %s AND f.school_id = %s GROUP BY f.fee_id, f.description, f.amount_due"
@@ -638,6 +682,23 @@ def dashboard():
                 } else { showToast(data.error, true); }
             }
 
+            async function uploadRestore(schoolId) {
+                const fileInput = document.getElementById('file_' + schoolId);
+                if (!fileInput.files.length) return;
+                
+                const formData = new FormData();
+                formData.append('file', fileInput.files[0]);
+                
+                showToast("Restoring data, please wait...", false);
+                try {
+                    const res = await fetch('/api/superadmin/restore/' + schoolId, { method: 'POST', body: formData });
+                    const data = await res.json();
+                    if (res.ok) showToast(data.message);
+                    else showToast(data.error, true);
+                } catch(e) { showToast("Upload failed", true); }
+                fileInput.value = ''; 
+            }
+
             async function loadSchools() {
                 const res = await fetch('/api/superadmin/schools');
                 if(!res.ok) return;
@@ -649,8 +710,10 @@ def dashboard():
                         <td>${s.school_id}</td><td>${s.school_name}</td><td>${s.expiry_date}</td>
                         <td style="color:${statusColor}; font-weight:bold;">${s.status}</td>
                         <td>
-                            <button class="btn btn-success" style="width: auto; padding: 6px 12px; margin-right: 5px; margin-bottom: 0;" onclick="sendAction('/api/superadmin/renew/${s.school_id}', {})">Renew 1 Year</button>
-                            <button class="btn btn-info" style="width: auto; padding: 6px 12px; margin-bottom: 0;" onclick="window.location.href='/api/superadmin/backup/${s.school_id}'">⬇️ Backup</button>
+                            <button class="btn btn-success" style="width: auto; padding: 6px 12px; margin-right: 5px; margin-bottom: 0;" onclick="sendAction('/api/superadmin/renew/${s.school_id}', {})">Renew</button>
+                            <button class="btn btn-info" style="width: auto; padding: 6px 12px; margin-right: 5px; margin-bottom: 0;" onclick="window.location.href='/api/superadmin/backup/${s.school_id}'">⬇️ Backup</button>
+                            <input type="file" id="file_${s.school_id}" accept=".json" style="display:none;" onchange="uploadRestore(${s.school_id})">
+                            <button class="btn btn-danger" style="width: auto; padding: 6px 12px; margin-bottom: 0;" onclick="document.getElementById('file_${s.school_id}').click()">⬆️ Restore</button>
                         </td>
                     </tr>`;
                 });
