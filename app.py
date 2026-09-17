@@ -92,14 +92,16 @@ def setup_db():
     cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS institutions (school_id SERIAL PRIMARY KEY, school_name VARCHAR(150) NOT NULL UNIQUE, subscription_expiry_date DATE NOT NULL)")
     cur.execute("CREATE TABLE IF NOT EXISTS students (student_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, first_name VARCHAR(100) NOT NULL, last_name VARCHAR(100) NOT NULL, guardian_name VARCHAR(100) NOT NULL, guardian_contact VARCHAR(20) NOT NULL, enrollment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    
+    # Safe Alteration: Inject Day/Boarding & House into existing Students table without data loss
+    cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS boarding_status VARCHAR(20) DEFAULT 'Day'")
+    cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS house VARCHAR(100) DEFAULT 'Unassigned'")
+
     cur.execute("CREATE TABLE IF NOT EXISTS system_users (user_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, email VARCHAR(100) UNIQUE NOT NULL, password_hash VARCHAR(255) NOT NULL, role VARCHAR(20) NOT NULL, linked_student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE)")
     cur.execute("CREATE TABLE IF NOT EXISTS subjects (subject_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, subject_name VARCHAR(100) NOT NULL)")
     cur.execute("CREATE TABLE IF NOT EXISTS grades (grade_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, subject_id INTEGER REFERENCES subjects(subject_id) ON DELETE CASCADE, class_score INTEGER NOT NULL, exam_score INTEGER NOT NULL, total_score INTEGER NOT NULL, waec_grade VARCHAR(2) NOT NULL, academic_year VARCHAR(9) NOT NULL, term VARCHAR(20) NOT NULL, teacher_remarks VARCHAR(255))")
-    
-    cur.execute("DROP TABLE IF EXISTS payments CASCADE")
-    cur.execute("DROP TABLE IF EXISTS fees CASCADE")
-    cur.execute("CREATE TABLE fees (fee_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, fee_category VARCHAR(50) NOT NULL, description VARCHAR(255) NOT NULL, amount_due DECIMAL(10, 2) NOT NULL, academic_year VARCHAR(9) NOT NULL, term VARCHAR(20) NOT NULL, date_issued TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-    cur.execute("CREATE TABLE payments (payment_id SERIAL PRIMARY KEY, fee_id INTEGER REFERENCES fees(fee_id) ON DELETE CASCADE, amount_paid DECIMAL(10, 2) NOT NULL, payment_method VARCHAR(50) NOT NULL, payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    cur.execute("CREATE TABLE IF NOT EXISTS fees (fee_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, fee_category VARCHAR(50) NOT NULL, description VARCHAR(255) NOT NULL, amount_due DECIMAL(10, 2) NOT NULL, academic_year VARCHAR(9) NOT NULL, term VARCHAR(20) NOT NULL, date_issued TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    cur.execute("CREATE TABLE IF NOT EXISTS payments (payment_id SERIAL PRIMARY KEY, fee_id INTEGER REFERENCES fees(fee_id) ON DELETE CASCADE, amount_paid DECIMAL(10, 2) NOT NULL, payment_method VARCHAR(50) NOT NULL, payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     
     cur.execute("SELECT * FROM system_users WHERE role = 'superadmin'")
     if not cur.fetchone():
@@ -107,7 +109,7 @@ def setup_db():
         cur.execute("INSERT INTO system_users (email, password_hash, role) VALUES (%s, %s, %s)", ('superadmin@engine.com', hashed_sa, 'superadmin'))
     conn.commit()
     cur.close(); conn.close()
-    return jsonify({"message": "Multi-Tenant SaaS Engine Ready! Arrears schema rebuilt."})
+    return jsonify({"message": "Multi-Tenant SaaS Engine Ready! Boarding/House parameters successfully injected."})
 
 # --- 4. THE AUTOMATED CLOUD BACKUP ROBOT ---
 def automated_weekly_backup():
@@ -255,7 +257,9 @@ def restore_backup(school_id):
                 cur.execute("INSERT INTO subjects (subject_id, school_id, subject_name) VALUES (%s, %s, %s) ON CONFLICT (subject_id) DO NOTHING", (r['subject_id'], school_id, r['subject_name']))
         if 'students' in data['data']:
             for r in data['data']['students']:
-                cur.execute("INSERT INTO students (student_id, school_id, first_name, last_name, guardian_name, guardian_contact, enrollment_date) VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (student_id) DO NOTHING", (r['student_id'], school_id, r['first_name'], r['last_name'], r['guardian_name'], r['guardian_contact'], r['enrollment_date']))
+                b_stat = r.get('boarding_status', 'Day')
+                hs = r.get('house', 'Unassigned')
+                cur.execute("INSERT INTO students (student_id, school_id, first_name, last_name, guardian_name, guardian_contact, boarding_status, house, enrollment_date) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (student_id) DO NOTHING", (r['student_id'], school_id, r['first_name'], r['last_name'], r['guardian_name'], r['guardian_contact'], b_stat, hs, r['enrollment_date']))
         if 'fees' in data['data']:
             for r in data['data']['fees']:
                 cat = r.get('fee_category', 'General')
@@ -302,14 +306,14 @@ def manage_students():
     cur = conn.cursor()
     if request.method == 'POST':
         data = request.get_json()
-        cur.execute("INSERT INTO students (school_id, first_name, last_name, guardian_name, guardian_contact) VALUES (%s, %s, %s, %s, %s) RETURNING student_id", 
-                    (current_user.school_id, data.get('first_name'), data.get('last_name'), data.get('guardian_name'), data.get('guardian_contact')))
+        cur.execute("INSERT INTO students (school_id, first_name, last_name, guardian_name, guardian_contact, boarding_status, house) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING student_id", 
+                    (current_user.school_id, data.get('first_name'), data.get('last_name'), data.get('guardian_name'), data.get('guardian_contact'), data.get('boarding_status', 'Day'), data.get('house', 'Unassigned')))
         new_id = cur.fetchone()['student_id']
         conn.commit()
         cur.close(); conn.close()
         return jsonify({"message": f"Student Enrolled! New ID: {new_id}"}), 201
     elif request.method == 'GET':
-        cur.execute("SELECT student_id, first_name, last_name, guardian_contact FROM students WHERE school_id = %s ORDER BY student_id DESC", (current_user.school_id,))
+        cur.execute("SELECT student_id, first_name, last_name, boarding_status, house, guardian_contact FROM students WHERE school_id = %s ORDER BY student_id DESC", (current_user.school_id,))
         students = cur.fetchall()
         cur.close(); conn.close()
         return jsonify({"data": students})
@@ -529,11 +533,22 @@ def dashboard():
             <div id="admissions-section" class="card grid-2">
                 <div>
                     <h3>Enroll New Student</h3>
-                    <input type="text" id="sFirst" placeholder="First Name">
-                    <input type="text" id="sLast" placeholder="Last Name">
-                    <input type="text" id="sGName" placeholder="Guardian Name">
-                    <input type="text" id="sGContact" placeholder="Guardian Contact">
-                    <button class="btn btn-success" onclick="sendAction('/api/students', {first_name: document.getElementById('sFirst').value, last_name: document.getElementById('sLast').value, guardian_name: document.getElementById('sGName').value, guardian_contact: document.getElementById('sGContact').value})">Register Student</button>
+                    <div class="grid-2">
+                        <input type="text" id="sFirst" placeholder="First Name">
+                        <input type="text" id="sLast" placeholder="Last Name">
+                    </div>
+                    <div class="grid-2">
+                        <select id="sBoarding">
+                            <option value="Day">Day Student</option>
+                            <option value="Boarding">Boarding Student</option>
+                        </select>
+                        <input type="text" id="sHouse" placeholder="House (e.g. Nkrumah House)">
+                    </div>
+                    <div class="grid-2">
+                        <input type="text" id="sGName" placeholder="Guardian Name">
+                        <input type="text" id="sGContact" placeholder="Guardian Contact">
+                    </div>
+                    <button class="btn btn-success" onclick="sendAction('/api/students', {first_name: document.getElementById('sFirst').value, last_name: document.getElementById('sLast').value, guardian_name: document.getElementById('sGName').value, guardian_contact: document.getElementById('sGContact').value, boarding_status: document.getElementById('sBoarding').value, house: document.getElementById('sHouse').value})">Register Student</button>
                 </div>
                 <div>
                     <h3>Student Directory</h3>
@@ -696,6 +711,9 @@ def dashboard():
                         let val = row[k];
                         if (k === 'remaining_balance' && val > 0) {
                             html += `<td style="color:#dc3545; font-weight:bold;">${val}</td>`;
+                        } else if (k === 'boarding_status') {
+                            let badge = val === 'Boarding' ? 'background:#0f4c81;color:white;padding:3px 8px;border-radius:12px;font-size:0.8rem;' : 'background:#eee;padding:3px 8px;border-radius:12px;font-size:0.8rem;';
+                            html += `<td><span style="${badge}">${val}</span></td>`;
                         } else {
                             html += `<td>${val}</td>`;
                         }
@@ -725,7 +743,7 @@ def dashboard():
                 const res = await fetch('/api/students');
                 const data = await res.json();
                 if (res.status === 402) { showToast(data.error, true); return; }
-                renderTable("Student Roster (Live Search)", ['ID', 'First', 'Last', 'Contact'], data.data, ['student_id', 'first_name', 'last_name', 'guardian_contact']);
+                renderTable("Student Roster (Live Search)", ['ID', 'First Name', 'Last Name', 'Status', 'House', 'Guardian Contact'], data.data, ['student_id', 'first_name', 'last_name', 'boarding_status', 'house', 'guardian_contact']);
             }
 
             async function loadReport() {
