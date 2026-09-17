@@ -94,12 +94,13 @@ def setup_db():
     cur.execute("CREATE TABLE IF NOT EXISTS students (student_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, first_name VARCHAR(100) NOT NULL, last_name VARCHAR(100) NOT NULL, guardian_name VARCHAR(100) NOT NULL, guardian_contact VARCHAR(20) NOT NULL, enrollment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cur.execute("CREATE TABLE IF NOT EXISTS system_users (user_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, email VARCHAR(100) UNIQUE NOT NULL, password_hash VARCHAR(255) NOT NULL, role VARCHAR(20) NOT NULL, linked_student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE)")
     cur.execute("CREATE TABLE IF NOT EXISTS subjects (subject_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, subject_name VARCHAR(100) NOT NULL)")
-    cur.execute("CREATE TABLE IF NOT EXISTS fees (fee_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, description VARCHAR(255) NOT NULL, amount_due DECIMAL(10, 2) NOT NULL, date_issued TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-    cur.execute("CREATE TABLE IF NOT EXISTS payments (payment_id SERIAL PRIMARY KEY, fee_id INTEGER REFERENCES fees(fee_id) ON DELETE CASCADE, amount_paid DECIMAL(10, 2) NOT NULL, payment_method VARCHAR(50) NOT NULL, payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    cur.execute("CREATE TABLE IF NOT EXISTS grades (grade_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, subject_id INTEGER REFERENCES subjects(subject_id) ON DELETE CASCADE, class_score INTEGER NOT NULL, exam_score INTEGER NOT NULL, total_score INTEGER NOT NULL, waec_grade VARCHAR(2) NOT NULL, academic_year VARCHAR(9) NOT NULL, term VARCHAR(20) NOT NULL, teacher_remarks VARCHAR(255))")
     
-    # Updated Grades Table with SBA Split
-    cur.execute("DROP TABLE IF EXISTS grades CASCADE")
-    cur.execute("CREATE TABLE grades (grade_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, subject_id INTEGER REFERENCES subjects(subject_id) ON DELETE CASCADE, class_score INTEGER NOT NULL, exam_score INTEGER NOT NULL, total_score INTEGER NOT NULL, waec_grade VARCHAR(2) NOT NULL, academic_year VARCHAR(9) NOT NULL, term VARCHAR(20) NOT NULL, teacher_remarks VARCHAR(255))")
+    # Updated Segmented Billing Tables
+    cur.execute("DROP TABLE IF EXISTS payments CASCADE")
+    cur.execute("DROP TABLE IF EXISTS fees CASCADE")
+    cur.execute("CREATE TABLE fees (fee_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, fee_category VARCHAR(50) NOT NULL, description VARCHAR(255) NOT NULL, amount_due DECIMAL(10, 2) NOT NULL, academic_year VARCHAR(9) NOT NULL, term VARCHAR(20) NOT NULL, date_issued TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    cur.execute("CREATE TABLE payments (payment_id SERIAL PRIMARY KEY, fee_id INTEGER REFERENCES fees(fee_id) ON DELETE CASCADE, amount_paid DECIMAL(10, 2) NOT NULL, payment_method VARCHAR(50) NOT NULL, payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     
     cur.execute("SELECT * FROM system_users WHERE role = 'superadmin'")
     if not cur.fetchone():
@@ -107,15 +108,11 @@ def setup_db():
         cur.execute("INSERT INTO system_users (email, password_hash, role) VALUES (%s, %s, %s)", ('superadmin@engine.com', hashed_sa, 'superadmin'))
     conn.commit()
     cur.close(); conn.close()
-    return jsonify({"message": "Multi-Tenant SaaS Engine Ready! SBA schema rebuilt."})
+    return jsonify({"message": "Multi-Tenant SaaS Engine Ready! Arrears schema rebuilt."})
 
 # --- 4. THE AUTOMATED CLOUD BACKUP ROBOT ---
 def automated_weekly_backup():
-    print("--- INITIATING AUTOMATED WEEKLY CLOUD BACKUP ---")
-    if not AWS_BUCKET_NAME:
-        print("WARNING: AWS_BUCKET_NAME not set. Skipping cloud upload.")
-        return
-
+    if not AWS_BUCKET_NAME: return
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT school_id, school_name FROM institutions")
@@ -124,7 +121,6 @@ def automated_weekly_backup():
     for school in schools:
         school_id = school['school_id']
         school_name = school['school_name']
-        
         backup = {"school_name": school_name, "export_date": datetime.now().isoformat(), "data": {}}
         
         cur.execute("SELECT * FROM subjects WHERE school_id = %s", (school_id,))
@@ -143,12 +139,9 @@ def automated_weekly_backup():
         
         try:
             s3_client.put_object(Bucket=AWS_BUCKET_NAME, Key=filename, Body=json_data)
-            print(f"SUCCESS: Uploaded {filename} to Cloud Storage.")
-        except Exception as e:
-            print(f"ERROR uploading {school_name} backup: {e}")
+        except Exception as e: pass
             
     cur.close(); conn.close()
-    print("--- AUTOMATED BACKUP SEQUENCE COMPLETE ---")
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=automated_weekly_backup, trigger="cron", day_of_week='sun', hour=23, minute=59)
@@ -266,7 +259,11 @@ def restore_backup(school_id):
                 cur.execute("INSERT INTO students (student_id, school_id, first_name, last_name, guardian_name, guardian_contact, enrollment_date) VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (student_id) DO NOTHING", (r['student_id'], school_id, r['first_name'], r['last_name'], r['guardian_name'], r['guardian_contact'], r['enrollment_date']))
         if 'fees' in data['data']:
             for r in data['data']['fees']:
-                cur.execute("INSERT INTO fees (fee_id, school_id, student_id, description, amount_due, date_issued) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (fee_id) DO NOTHING", (r['fee_id'], school_id, r['student_id'], r['description'], r['amount_due'], r['date_issued']))
+                # Handle old schema formats smoothly during restore
+                cat = r.get('fee_category', 'General')
+                yr = r.get('academic_year', 'Unknown')
+                tm = r.get('term', 'Unknown')
+                cur.execute("INSERT INTO fees (fee_id, school_id, student_id, fee_category, description, amount_due, academic_year, term, date_issued) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (fee_id) DO NOTHING", (r['fee_id'], school_id, r['student_id'], cat, r['description'], r['amount_due'], yr, tm, r['date_issued']))
         if 'payments' in data['data']:
             for r in data['data']['payments']:
                 cur.execute("INSERT INTO payments (payment_id, fee_id, amount_paid, payment_method, payment_date) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (payment_id) DO NOTHING", (r['payment_id'], r['fee_id'], r['amount_paid'], r['payment_method'], r['payment_date']))
@@ -326,12 +323,12 @@ def bill_student():
     data = request.get_json()
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("INSERT INTO fees (school_id, student_id, description, amount_due) VALUES (%s, %s, %s, %s) RETURNING fee_id", 
-                (current_user.school_id, data.get('student_id'), data.get('description'), data.get('amount_due')))
+    cur.execute("INSERT INTO fees (school_id, student_id, fee_category, description, amount_due, academic_year, term) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING fee_id", 
+                (current_user.school_id, data.get('student_id'), data.get('fee_category'), data.get('description'), data.get('amount_due'), data.get('academic_year'), data.get('term')))
     new_id = cur.fetchone()['fee_id']
     conn.commit()
     cur.close(); conn.close()
-    return jsonify({"message": f"Bill issued! Reference Fee ID: {new_id}"}), 201
+    return jsonify({"message": f"{data.get('fee_category')} Bill issued! Reference Fee ID: {new_id}"}), 201
 
 @app.route('/api/fees/pay', methods=['POST'])
 @login_required
@@ -391,7 +388,16 @@ def get_statement(student_id):
     if current_user.role == 'guardian' and current_user.linked_student_id != student_id: return jsonify({"error": "Access Denied."}), 403
     conn = get_db_connection()
     cur = conn.cursor()
-    query = "SELECT f.fee_id, f.description, f.amount_due, COALESCE(SUM(p.amount_paid), 0) as total_paid, (f.amount_due - COALESCE(SUM(p.amount_paid), 0)) as remaining_balance FROM fees f LEFT JOIN payments p ON f.fee_id = p.fee_id WHERE f.student_id = %s AND f.school_id = %s GROUP BY f.fee_id, f.description, f.amount_due"
+    query = """
+    SELECT f.fee_id, f.fee_category, f.academic_year, f.term, f.description, f.amount_due, 
+    COALESCE(SUM(p.amount_paid), 0) as total_paid, 
+    (f.amount_due - COALESCE(SUM(p.amount_paid), 0)) as remaining_balance 
+    FROM fees f 
+    LEFT JOIN payments p ON f.fee_id = p.fee_id 
+    WHERE f.student_id = %s AND f.school_id = %s 
+    GROUP BY f.fee_id, f.fee_category, f.academic_year, f.term, f.description, f.amount_due
+    ORDER BY f.date_issued DESC
+    """
     cur.execute(query, (student_id, current_user.school_id))
     statement = cur.fetchall()
     cur.close(); conn.close()
@@ -541,11 +547,23 @@ def dashboard():
             {% if current_user.role == 'admin' %}
             <div id="finance-section" class="card grid-2">
                 <div>
-                    <h3>1. Issue Bill</h3>
+                    <h3>1. Issue Segmented Bill</h3>
                     <input type="number" id="bStuId" placeholder="Student ID">
+                    <select id="bCat">
+                        <option value="Tuition">Tuition Fee</option>
+                        <option value="PTA Dues">PTA Dues</option>
+                        <option value="Feeding Fee">Feeding Fee</option>
+                        <option value="Exams Fee">Exams Fee</option>
+                        <option value="Bus Fee">Bus Fee</option>
+                        <option value="Arrears (Past Term)">Arrears (Past Term)</option>
+                    </select>
+                    <div class="grid-2">
+                        <input type="text" id="bTerm" placeholder="Term (e.g. Term 1)">
+                        <input type="text" id="bYear" placeholder="Year (e.g. 2026)">
+                    </div>
                     <input type="number" id="bAmount" placeholder="Amount Due (GHS)">
-                    <input type="text" id="bDesc" placeholder="Description">
-                    <button class="btn btn-success" onclick="sendAction('/api/fees/bill', {student_id: document.getElementById('bStuId').value, amount_due: document.getElementById('bAmount').value, description: document.getElementById('bDesc').value})">Issue Bill</button>
+                    <input type="text" id="bDesc" placeholder="Description / Memo">
+                    <button class="btn btn-success" onclick="sendAction('/api/fees/bill', {student_id: document.getElementById('bStuId').value, fee_category: document.getElementById('bCat').value, amount_due: document.getElementById('bAmount').value, academic_year: document.getElementById('bYear').value, term: document.getElementById('bTerm').value, description: document.getElementById('bDesc').value})">Issue Bill</button>
                 </div>
                 <div>
                     <h3>2. Record Payment</h3>
@@ -675,7 +693,14 @@ def dashboard():
                 
                 rows.forEach(row => {
                     html += '<tr>';
-                    keys.forEach(k => html += `<td>${row[k]}</td>`);
+                    keys.forEach(k => {
+                        let val = row[k];
+                        if (k === 'remaining_balance' && val > 0) {
+                            html += `<td style="color:#dc3545; font-weight:bold;">${val}</td>`;
+                        } else {
+                            html += `<td>${val}</td>`;
+                        }
+                    });
                     html += '</tr>';
                 });
                 html += '</table>';
@@ -717,7 +742,7 @@ def dashboard():
                 const res = await fetch('/api/statement/' + id);
                 if (!res.ok) { showToast("Access Denied", true); return; }
                 const data = await res.json();
-                renderTable("Financial Statement", ['Fee ID', 'Desc', 'Due (GHS)', 'Paid (GHS)', 'Remaining (GHS)'], data.statement, ['fee_id', 'description', 'amount_due', 'total_paid', 'remaining_balance']);
+                renderTable("Segmented Arrears & Ledger", ['Fee ID', 'Category', 'Year', 'Term', 'Due (GHS)', 'Paid (GHS)', 'Arrears (GHS)'], data.statement, ['fee_id', 'fee_category', 'academic_year', 'term', 'amount_due', 'total_paid', 'remaining_balance']);
             }
 
             async function onboardNewSchool() {
