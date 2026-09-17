@@ -724,16 +724,35 @@ def dashboard():
                 } catch(e) { showToast("Connection failed", true); }
             }
             
-            // Core File Upload & Enrollment Engine
+            // Core File Upload, Client-Side Compression & Enrollment Engine
             async function enrollStudent() {
                 const fileInput = document.getElementById('sPhoto');
                 let photo_b64 = null;
                 
                 if (fileInput.files.length > 0) {
-                    const reader = new FileReader();
-                    reader.readAsDataURL(fileInput.files[0]);
-                    await new Promise(resolve => reader.onload = resolve);
-                    photo_b64 = reader.result; 
+                    const file = fileInput.files[0];
+                    photo_b64 = await new Promise((resolve) => {
+                        const reader = new FileReader();
+                        reader.onload = function(e) {
+                            const img = new Image();
+                            img.onload = function() {
+                                // Shrink image to ID Card proportions (300px wide)
+                                const canvas = document.createElement('canvas');
+                                const MAX_WIDTH = 300; 
+                                const scaleSize = MAX_WIDTH / img.width;
+                                canvas.width = MAX_WIDTH;
+                                canvas.height = img.height * scaleSize;
+                                
+                                const ctx = canvas.getContext('2d');
+                                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                                
+                                // Compress to lightweight 70% JPEG
+                                resolve(canvas.toDataURL('image/jpeg', 0.7)); 
+                            };
+                            img.src = e.target.result;
+                        };
+                        reader.readAsDataURL(file);
+                    });
                 }
                 
                 const payload = {
