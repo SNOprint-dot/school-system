@@ -25,7 +25,7 @@ s3_client = boto3.client(
     's3',
     aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
     aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
-    region_name=os.environ.get('AWS_REGION', 'us-east-1')
+    region_name=os.environ.get('AWS_REGION', 'eu-north-1')
 )
 
 # --- HELPER FUNCTIONS ---
@@ -94,9 +94,12 @@ def setup_db():
     cur.execute("CREATE TABLE IF NOT EXISTS students (student_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, first_name VARCHAR(100) NOT NULL, last_name VARCHAR(100) NOT NULL, guardian_name VARCHAR(100) NOT NULL, guardian_contact VARCHAR(20) NOT NULL, enrollment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cur.execute("CREATE TABLE IF NOT EXISTS system_users (user_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, email VARCHAR(100) UNIQUE NOT NULL, password_hash VARCHAR(255) NOT NULL, role VARCHAR(20) NOT NULL, linked_student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE)")
     cur.execute("CREATE TABLE IF NOT EXISTS subjects (subject_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, subject_name VARCHAR(100) NOT NULL)")
-    cur.execute("CREATE TABLE IF NOT EXISTS grades (grade_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, subject_id INTEGER REFERENCES subjects(subject_id) ON DELETE CASCADE, score INTEGER NOT NULL, waec_grade VARCHAR(2) NOT NULL, academic_year VARCHAR(9) NOT NULL, term VARCHAR(20) NOT NULL)")
     cur.execute("CREATE TABLE IF NOT EXISTS fees (fee_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, description VARCHAR(255) NOT NULL, amount_due DECIMAL(10, 2) NOT NULL, date_issued TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cur.execute("CREATE TABLE IF NOT EXISTS payments (payment_id SERIAL PRIMARY KEY, fee_id INTEGER REFERENCES fees(fee_id) ON DELETE CASCADE, amount_paid DECIMAL(10, 2) NOT NULL, payment_method VARCHAR(50) NOT NULL, payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    
+    # Updated Grades Table with SBA Split
+    cur.execute("DROP TABLE IF EXISTS grades CASCADE")
+    cur.execute("CREATE TABLE grades (grade_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, subject_id INTEGER REFERENCES subjects(subject_id) ON DELETE CASCADE, class_score INTEGER NOT NULL, exam_score INTEGER NOT NULL, total_score INTEGER NOT NULL, waec_grade VARCHAR(2) NOT NULL, academic_year VARCHAR(9) NOT NULL, term VARCHAR(20) NOT NULL, teacher_remarks VARCHAR(255))")
     
     cur.execute("SELECT * FROM system_users WHERE role = 'superadmin'")
     if not cur.fetchone():
@@ -104,13 +107,13 @@ def setup_db():
         cur.execute("INSERT INTO system_users (email, password_hash, role) VALUES (%s, %s, %s)", ('superadmin@engine.com', hashed_sa, 'superadmin'))
     conn.commit()
     cur.close(); conn.close()
-    return jsonify({"message": "Multi-Tenant SaaS Engine Ready!"})
+    return jsonify({"message": "Multi-Tenant SaaS Engine Ready! SBA schema rebuilt."})
 
 # --- 4. THE AUTOMATED CLOUD BACKUP ROBOT ---
 def automated_weekly_backup():
     print("--- INITIATING AUTOMATED WEEKLY CLOUD BACKUP ---")
     if not AWS_BUCKET_NAME:
-        print("WARNING: AWS_BUCKET_NAME not set. Skipping cloud upload. Keys are required to push to the cloud.")
+        print("WARNING: AWS_BUCKET_NAME not set. Skipping cloud upload.")
         return
 
     conn = get_db_connection()
@@ -147,9 +150,7 @@ def automated_weekly_backup():
     cur.close(); conn.close()
     print("--- AUTOMATED BACKUP SEQUENCE COMPLETE ---")
 
-# Start the background robot when the server boots
 scheduler = BackgroundScheduler()
-# Run every Sunday at 11:59 PM
 scheduler.add_job(func=automated_weekly_backup, trigger="cron", day_of_week='sun', hour=23, minute=59)
 scheduler.start()
 
@@ -271,7 +272,11 @@ def restore_backup(school_id):
                 cur.execute("INSERT INTO payments (payment_id, fee_id, amount_paid, payment_method, payment_date) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (payment_id) DO NOTHING", (r['payment_id'], r['fee_id'], r['amount_paid'], r['payment_method'], r['payment_date']))
         if 'grades' in data['data']:
             for r in data['data']['grades']:
-                cur.execute("INSERT INTO grades (grade_id, school_id, student_id, subject_id, score, waec_grade, academic_year, term) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (grade_id) DO NOTHING", (r['grade_id'], school_id, r['student_id'], r['subject_id'], r['score'], r['waec_grade'], r['academic_year'], r['term']))
+                c_score = r.get('class_score', 0)
+                e_score = r.get('exam_score', r.get('score', 0))
+                t_score = r.get('total_score', r.get('score', 0))
+                rem = r.get('teacher_remarks', '')
+                cur.execute("INSERT INTO grades (grade_id, school_id, student_id, subject_id, class_score, exam_score, total_score, waec_grade, academic_year, term, teacher_remarks) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (grade_id) DO NOTHING", (r['grade_id'], school_id, r['student_id'], r['subject_id'], c_score, e_score, t_score, r['waec_grade'], r['academic_year'], r['term'], rem))
 
         conn.commit()
         cur.close(); conn.close()
@@ -345,8 +350,12 @@ def log_payment():
 @require_active_subscription
 def add_grade():
     data = request.get_json()
-    score = int(data.get('score'))
-    waec = get_waec_grade(score)
+    class_score = int(data.get('class_score', 0))
+    exam_score = int(data.get('exam_score', 0))
+    total_score = class_score + exam_score
+    waec = get_waec_grade(total_score)
+    remarks = data.get('remarks', '')
+    
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT subject_id FROM subjects WHERE subject_name = %s AND school_id = %s", (data.get('subject_name'), current_user.school_id))
@@ -357,11 +366,11 @@ def add_grade():
     else:
         sub_id = sub['subject_id']
         
-    cur.execute("INSERT INTO grades (school_id, student_id, subject_id, score, waec_grade, academic_year, term) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-        (current_user.school_id, data.get('student_id'), sub_id, score, waec, data.get('academic_year'), data.get('term')))
+    cur.execute("INSERT INTO grades (school_id, student_id, subject_id, class_score, exam_score, total_score, waec_grade, academic_year, term, teacher_remarks) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (current_user.school_id, data.get('student_id'), sub_id, class_score, exam_score, total_score, waec, data.get('academic_year'), data.get('term'), remarks))
     conn.commit()
     cur.close(); conn.close()
-    return jsonify({"message": f"Score {score} ({waec}) recorded!"})
+    return jsonify({"message": f"SBA Recorded! Total: {total_score}% ({waec})"})
 
 @app.route('/api/report_card/<int:student_id>', methods=['GET'])
 @login_required
@@ -370,7 +379,7 @@ def get_report_card(student_id):
     if current_user.role == 'guardian' and current_user.linked_student_id != student_id: return jsonify({"error": "Access Denied."}), 403
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT sub.subject_name, g.score, g.waec_grade, g.term FROM grades g JOIN subjects sub ON g.subject_id = sub.subject_id WHERE g.student_id = %s AND g.school_id = %s", (student_id, current_user.school_id))
+    cur.execute("SELECT sub.subject_name, g.class_score, g.exam_score, g.total_score, g.waec_grade, g.teacher_remarks, g.term FROM grades g JOIN subjects sub ON g.subject_id = sub.subject_id WHERE g.student_id = %s AND g.school_id = %s", (student_id, current_user.school_id))
     grades = cur.fetchall()
     cur.close(); conn.close()
     return jsonify({"grades": grades})
@@ -461,7 +470,7 @@ def dashboard():
                     <button onclick="document.getElementById('analytics-section').scrollIntoView()">Live Analytics</button>
                     <button onclick="document.getElementById('admissions-section').scrollIntoView()">Admissions Desk</button>
                     <button onclick="document.getElementById('finance-section').scrollIntoView()">Financial Desk</button>
-                    <button onclick="document.getElementById('academics-section').scrollIntoView()">Academics</button>
+                    <button onclick="document.getElementById('academics-section').scrollIntoView()">Academics & SBA</button>
                     <button onclick="document.getElementById('admin-tools').scrollIntoView()">Admin Tools</button>
                 {% else %}
                     <button onclick="document.getElementById('academics-section').scrollIntoView()">My Portal</button>
@@ -561,13 +570,19 @@ def dashboard():
             <div id="academics-section" class="card grid-2">
                 {% if current_user.role in ['admin', 'teacher'] %}
                 <div>
-                    <h3>Record Exam Grade</h3>
+                    <h3>Record SBA & Exam Grades</h3>
                     <input type="number" id="gStuId" placeholder="Student ID">
-                    <input type="text" id="gSub" placeholder="Subject Name (e.g. Math)">
-                    <input type="number" id="gScore" placeholder="Score (0-100)">
-                    <input type="text" id="gTerm" placeholder="Term">
-                    <input type="text" id="gYear" placeholder="Year">
-                    <button class="btn" onclick="sendAction('/api/grades', {student_id: document.getElementById('gStuId').value, subject_name: document.getElementById('gSub').value, score: document.getElementById('gScore').value, term: document.getElementById('gTerm').value, academic_year: document.getElementById('gYear').value})">Save Score</button>
+                    <input type="text" id="gSub" placeholder="Subject Name (e.g. Mathematics)">
+                    <div class="grid-2">
+                        <input type="number" id="gClass" placeholder="Class Score (30%)">
+                        <input type="number" id="gExam" placeholder="Exam Score (70%)">
+                    </div>
+                    <div class="grid-2">
+                        <input type="text" id="gTerm" placeholder="Term (e.g. Term 1)">
+                        <input type="text" id="gYear" placeholder="Year (e.g. 2026)">
+                    </div>
+                    <input type="text" id="gRem" placeholder="Teacher's Remark (e.g. Very impressive)">
+                    <button class="btn" onclick="sendAction('/api/grades', {student_id: document.getElementById('gStuId').value, subject_name: document.getElementById('gSub').value, class_score: document.getElementById('gClass').value, exam_score: document.getElementById('gExam').value, term: document.getElementById('gTerm').value, academic_year: document.getElementById('gYear').value, remarks: document.getElementById('gRem').value})">Save SBA Record</button>
                 </div>
                 {% endif %}
 
@@ -694,7 +709,7 @@ def dashboard():
                 const res = await fetch('/api/report_card/' + id);
                 if (!res.ok) { showToast("Access Denied or Not Found", true); return; }
                 const data = await res.json();
-                renderTable("Report Card", ['Subject', 'Score', 'WAEC', 'Term'], data.grades, ['subject_name', 'score', 'waec_grade', 'term']);
+                renderTable("Terminal Report Card", ['Subject', 'Class (30)', 'Exam (70)', 'Total (100)', 'Grade', 'Remarks', 'Term'], data.grades, ['subject_name', 'class_score', 'exam_score', 'total_score', 'waec_grade', 'teacher_remarks', 'term']);
             }
 
             async function loadStatement() {
