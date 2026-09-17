@@ -29,32 +29,25 @@ def get_waec_grade(score):
     elif score >= 40: return 'E8'
     else: return 'F9'
 
-# --- 1. SYSTEM SETUP (WITH AUTO-ADMIN) ---
+# --- 1. SYSTEM SETUP ---
 @app.route('/api/setup_db')
 def setup_db():
     conn = get_db_connection()
     cur = conn.cursor()
-    # Core Data
     cur.execute("CREATE TABLE IF NOT EXISTS students (student_id SERIAL PRIMARY KEY, first_name VARCHAR(100) NOT NULL, last_name VARCHAR(100) NOT NULL, guardian_name VARCHAR(100) NOT NULL, guardian_contact VARCHAR(20) NOT NULL, enrollment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cur.execute("CREATE TABLE IF NOT EXISTS classes (class_id SERIAL PRIMARY KEY, class_name VARCHAR(50) NOT NULL UNIQUE)")
     cur.execute("CREATE TABLE IF NOT EXISTS class_enrollments (enrollment_id SERIAL PRIMARY KEY, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, class_id INTEGER REFERENCES classes(class_id) ON DELETE CASCADE, academic_year VARCHAR(9) NOT NULL)")
-    
-    # System Users (With Guardian Linking)
     cur.execute("CREATE TABLE IF NOT EXISTS system_users (user_id SERIAL PRIMARY KEY, email VARCHAR(100) UNIQUE NOT NULL, password_hash VARCHAR(255) NOT NULL, role VARCHAR(20) NOT NULL, linked_student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE)")
-    
-    # Academics & Finance
     cur.execute("CREATE TABLE IF NOT EXISTS subjects (subject_id SERIAL PRIMARY KEY, subject_name VARCHAR(100) NOT NULL UNIQUE)")
     cur.execute("CREATE TABLE IF NOT EXISTS grades (grade_id SERIAL PRIMARY KEY, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, subject_id INTEGER REFERENCES subjects(subject_id) ON DELETE CASCADE, score INTEGER NOT NULL, waec_grade VARCHAR(2) NOT NULL, academic_year VARCHAR(9) NOT NULL, term VARCHAR(20) NOT NULL)")
     cur.execute("CREATE TABLE IF NOT EXISTS attendance (attendance_id SERIAL PRIMARY KEY, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, record_date DATE NOT NULL, status VARCHAR(10) NOT NULL, UNIQUE(student_id, record_date))")
     cur.execute("CREATE TABLE IF NOT EXISTS fees (fee_id SERIAL PRIMARY KEY, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, description VARCHAR(255) NOT NULL, amount_due DECIMAL(10, 2) NOT NULL, date_issued TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cur.execute("CREATE TABLE IF NOT EXISTS payments (payment_id SERIAL PRIMARY KEY, fee_id INTEGER REFERENCES fees(fee_id) ON DELETE CASCADE, amount_paid DECIMAL(10, 2) NOT NULL, payment_method VARCHAR(50) NOT NULL, payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     
-    # Auto-Create Admin Cheat Code
     cur.execute("SELECT * FROM system_users WHERE role = 'admin'")
     if not cur.fetchone():
         hashed = generate_password_hash('admin123')
-        cur.execute("INSERT INTO system_users (email, password_hash, role) VALUES (%s, %s, %s)", 
-                    ('admin@school.com', hashed, 'admin'))
+        cur.execute("INSERT INTO system_users (email, password_hash, role) VALUES (%s, %s, %s)", ('admin@school.com', hashed, 'admin'))
         
     conn.commit()
     cur.close(); conn.close()
@@ -254,6 +247,7 @@ def dashboard():
                 
                 {% if current_user.role == 'admin' %}
                     <button onclick="document.getElementById('analytics-section').scrollIntoView()">Live Analytics</button>
+                    <button onclick="document.getElementById('finance-section').scrollIntoView()">Financial Desk</button>
                     <button onclick="document.getElementById('admin-section').scrollIntoView()">Admin Tools</button>
                     <button class="btn-warning" onclick="sendAction('/api/setup_db', {}, true)" style="background: #ffc107; color: black;">Sync Database</button>
                 {% endif %}
@@ -279,12 +273,34 @@ def dashboard():
             
             {% else %}
             
-            <!-- ADMIN ANALYTICS -->
+            <!-- ADMIN ANALYTICS & FINANCE DESK -->
             {% if current_user.role == 'admin' %}
             <div id="analytics-section" class="card">
                 <h3>Live Financial Analytics</h3>
                 <div class="chart-container">
                     <canvas id="financeChart"></canvas>
+                </div>
+            </div>
+
+            <!-- RESTORED: THE FINANCIAL DESK -->
+            <div id="finance-section" class="card grid-2">
+                <div>
+                    <h3>1. Issue Bill</h3>
+                    <input type="number" id="bStuId" placeholder="Student ID">
+                    <input type="number" id="bAmount" placeholder="Amount Due (GHS)">
+                    <input type="text" id="bDesc" placeholder="Description (e.g. Term 1 Fees)">
+                    <button class="btn btn-success" onclick="sendAction('/api/fees/bill', {student_id: document.getElementById('bStuId').value, amount_due: document.getElementById('bAmount').value, description: document.getElementById('bDesc').value})">Issue Bill</button>
+                </div>
+                <div>
+                    <h3>2. Record Payment</h3>
+                    <input type="number" id="pFeeId" placeholder="Fee ID (from Bill)">
+                    <input type="number" id="pAmount" placeholder="Amount Paid (GHS)">
+                    <select id="pMethod">
+                        <option value="Cash">Cash</option>
+                        <option value="Mobile Money (MoMo)">Mobile Money (MoMo)</option>
+                        <option value="Bank Transfer">Bank Transfer</option>
+                    </select>
+                    <button class="btn btn-success" onclick="sendAction('/api/fees/pay', {fee_id: document.getElementById('pFeeId').value, amount_paid: document.getElementById('pAmount').value, payment_method: document.getElementById('pMethod').value})">Log Payment</button>
                 </div>
             </div>
             {% endif %}
@@ -470,6 +486,5 @@ def dashboard():
     """
     return render_template_string(html_template, current_user=current_user)
 
-# SECURITY: Production-ready setup
 if __name__ == '__main__':
     app.run(debug=False, host='0.0.0.0', port=5000)
