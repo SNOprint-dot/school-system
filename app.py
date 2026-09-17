@@ -4,6 +4,8 @@ import csv
 import json
 import decimal
 import boto3
+import base64
+import uuid
 from io import StringIO
 from functools import wraps
 from datetime import datetime, date
@@ -81,7 +83,7 @@ def require_active_subscription(f):
         school = cur.fetchone()
         cur.close(); conn.close()
         if not school or school['subscription_expiry_date'] < datetime.now().date():
-            return jsonify({"error": "ACCESS LOCKED: Your annual subscription has expired. Please remit payment to restore your database access."}), 402 
+            return jsonify({"error": "ACCESS LOCKED: Your annual subscription has expired."}), 402 
         return f(*args, **kwargs)
     return decorated_function
 
@@ -92,15 +94,17 @@ def setup_db():
     cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS institutions (school_id SERIAL PRIMARY KEY, school_name VARCHAR(150) NOT NULL UNIQUE, subscription_expiry_date DATE NOT NULL)")
     cur.execute("CREATE TABLE IF NOT EXISTS students (student_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, first_name VARCHAR(100) NOT NULL, last_name VARCHAR(100) NOT NULL, guardian_name VARCHAR(100) NOT NULL, guardian_contact VARCHAR(20) NOT NULL, enrollment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    
+    # Injecting parameters and the new AWS Photo Key
     cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS boarding_status VARCHAR(20) DEFAULT 'Day'")
     cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS house VARCHAR(100) DEFAULT 'Unassigned'")
+    cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS photo_key VARCHAR(255)")
+
     cur.execute("CREATE TABLE IF NOT EXISTS system_users (user_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, email VARCHAR(100) UNIQUE NOT NULL, password_hash VARCHAR(255) NOT NULL, role VARCHAR(20) NOT NULL, linked_student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE)")
     cur.execute("CREATE TABLE IF NOT EXISTS subjects (subject_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, subject_name VARCHAR(100) NOT NULL)")
     cur.execute("CREATE TABLE IF NOT EXISTS grades (grade_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, subject_id INTEGER REFERENCES subjects(subject_id) ON DELETE CASCADE, class_score INTEGER NOT NULL, exam_score INTEGER NOT NULL, total_score INTEGER NOT NULL, waec_grade VARCHAR(2) NOT NULL, academic_year VARCHAR(9) NOT NULL, term VARCHAR(20) NOT NULL, teacher_remarks VARCHAR(255))")
     cur.execute("CREATE TABLE IF NOT EXISTS fees (fee_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, fee_category VARCHAR(50) NOT NULL, description VARCHAR(255) NOT NULL, amount_due DECIMAL(10, 2) NOT NULL, academic_year VARCHAR(9) NOT NULL, term VARCHAR(20) NOT NULL, date_issued TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cur.execute("CREATE TABLE IF NOT EXISTS payments (payment_id SERIAL PRIMARY KEY, fee_id INTEGER REFERENCES fees(fee_id) ON DELETE CASCADE, amount_paid DECIMAL(10, 2) NOT NULL, payment_method VARCHAR(50) NOT NULL, payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-    
-    # NEW ERP TABLES: Expenses & Attendance
     cur.execute("CREATE TABLE IF NOT EXISTS expenses (expense_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, category VARCHAR(50) NOT NULL, description VARCHAR(255) NOT NULL, amount DECIMAL(10, 2) NOT NULL, date_incurred TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cur.execute("CREATE TABLE IF NOT EXISTS attendance (attendance_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, record_date DATE NOT NULL, status VARCHAR(20) NOT NULL, UNIQUE(student_id, record_date))")
     
@@ -110,7 +114,7 @@ def setup_db():
         cur.execute("INSERT INTO system_users (email, password_hash, role) VALUES (%s, %s, %s)", ('superadmin@engine.com', hashed_sa, 'superadmin'))
     conn.commit()
     cur.close(); conn.close()
-    return jsonify({"message": "Multi-Tenant SaaS Engine Ready! ERP modules successfully injected."})
+    return jsonify({"message": "Multi-Tenant SaaS Engine Ready! Photo Vault activated."})
 
 # --- 4. CLOUD BACKUP ROBOT ---
 def automated_weekly_backup():
@@ -249,7 +253,7 @@ def restore_backup(school_id):
                 cur.execute("INSERT INTO subjects (subject_id, school_id, subject_name) VALUES (%s, %s, %s) ON CONFLICT (subject_id) DO NOTHING", (r['subject_id'], school_id, r['subject_name']))
         if 'students' in data['data']:
             for r in data['data']['students']:
-                cur.execute("INSERT INTO students (student_id, school_id, first_name, last_name, guardian_name, guardian_contact, boarding_status, house, enrollment_date) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (student_id) DO NOTHING", (r['student_id'], school_id, r['first_name'], r['last_name'], r['guardian_name'], r['guardian_contact'], r.get('boarding_status', 'Day'), r.get('house', 'Unassigned'), r['enrollment_date']))
+                cur.execute("INSERT INTO students (student_id, school_id, first_name, last_name, guardian_name, guardian_contact, boarding_status, house, photo_key, enrollment_date) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (student_id) DO NOTHING", (r['student_id'], school_id, r['first_name'], r['last_name'], r['guardian_name'], r['guardian_contact'], r.get('boarding_status', 'Day'), r.get('house', 'Unassigned'), r.get('photo_key'), r['enrollment_date']))
         if 'fees' in data['data']:
             for r in data['data']['fees']:
                 cur.execute("INSERT INTO fees (fee_id, school_id, student_id, fee_category, description, amount_due, academic_year, term, date_issued) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (fee_id) DO NOTHING", (r['fee_id'], school_id, r['student_id'], r.get('fee_category', 'General'), r['description'], r['amount_due'], r.get('academic_year', 'Unknown'), r.get('term', 'Unknown'), r['date_issued']))
@@ -266,71 +270,56 @@ def restore_backup(school_id):
         return jsonify({"error": f"Restoration failed: {str(e)}"}), 500
 
 # --- 7. TENANT ENDPOINTS (ERP MODULES) ---
-@app.route('/api/analytics', methods=['GET'])
+@app.route('/api/students', methods=['GET', 'POST'])
 @login_required
 @require_active_subscription
-def get_analytics():
-    if current_user.role != 'admin': return jsonify({"error": "Unauthorized"}), 403
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT COALESCE(SUM(amount_due), 0) as total_due FROM fees WHERE school_id = %s", (current_user.school_id,))
-    total_due = float(cur.fetchone()['total_due'])
-    cur.execute("SELECT COALESCE(SUM(p.amount_paid), 0) as total_paid FROM payments p JOIN fees f ON p.fee_id = f.fee_id WHERE f.school_id = %s", (current_user.school_id,))
-    total_paid = float(cur.fetchone()['total_paid'])
-    cur.execute("SELECT COALESCE(SUM(amount), 0) as total_expenses FROM expenses WHERE school_id = %s", (current_user.school_id,))
-    total_exp = float(cur.fetchone()['total_expenses'])
-    cur.execute("SELECT waec_grade, COUNT(*) as count FROM grades WHERE school_id = %s GROUP BY waec_grade ORDER BY waec_grade", (current_user.school_id,))
-    performance = cur.fetchall()
-    cur.close(); conn.close()
-    return jsonify({
-        "financials": {
-            "due": total_due, 
-            "paid": total_paid, 
-            "outstanding": total_due - total_paid,
-            "expenses": total_exp,
-            "net_margin": total_paid - total_exp
-        },
-        "performance": performance
-    })
-
-@app.route('/api/expenses', methods=['POST', 'GET'])
-@login_required
-@require_active_subscription
-def manage_expenses():
-    if current_user.role != 'admin': return jsonify({"error": "Unauthorized"}), 403
+def manage_students():
     conn = get_db_connection()
     cur = conn.cursor()
     if request.method == 'POST':
         data = request.get_json()
-        cur.execute("INSERT INTO expenses (school_id, category, description, amount) VALUES (%s, %s, %s, %s)", 
-                    (current_user.school_id, data.get('category'), data.get('description'), data.get('amount')))
+        photo_b64 = data.get('photo_b64')
+        photo_key = None
+        
+        # Safe S3 Image Upload Engine
+        if photo_b64 and AWS_BUCKET_NAME:
+            try:
+                if ',' in photo_b64: photo_b64 = photo_b64.split(',')[1]
+                image_data = base64.b64decode(photo_b64)
+                photo_key = f"student_photos/{current_user.school_id}/{uuid.uuid4().hex}.jpg"
+                s3_client.put_object(Bucket=AWS_BUCKET_NAME, Key=photo_key, Body=image_data, ContentType='image/jpeg')
+            except Exception as e:
+                print(f"Photo Upload Error: {e}")
+                
+        cur.execute("INSERT INTO students (school_id, first_name, last_name, guardian_name, guardian_contact, boarding_status, house, photo_key) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING student_id", 
+                    (current_user.school_id, data.get('first_name'), data.get('last_name'), data.get('guardian_name'), data.get('guardian_contact'), data.get('boarding_status', 'Day'), data.get('house', 'Unassigned'), photo_key))
+        new_id = cur.fetchone()['student_id']
         conn.commit()
         cur.close(); conn.close()
-        return jsonify({"message": "Expense logged securely to the ledger."}), 201
+        return jsonify({"message": f"Student Enrolled successfully! New ID: {new_id}"}), 201
     else:
-        cur.execute("SELECT expense_id, category, description, amount, TO_CHAR(date_incurred, 'YYYY-MM-DD') as date FROM expenses WHERE school_id = %s ORDER BY date_incurred DESC", (current_user.school_id,))
-        expenses = cur.fetchall()
+        cur.execute("SELECT student_id, first_name, last_name, boarding_status, house, guardian_contact FROM students WHERE school_id = %s ORDER BY student_id DESC", (current_user.school_id,))
+        students = cur.fetchall()
         cur.close(); conn.close()
-        return jsonify({"data": expenses})
+        return jsonify({"data": students})
 
-@app.route('/api/attendance', methods=['POST'])
-@login_required
-@require_active_subscription
-def log_attendance():
-    if current_user.role not in ['admin', 'teacher']: return jsonify({"error": "Unauthorized"}), 403
-    data = request.get_json()
+@app.route('/api/photo/<int:student_id>', methods=['GET'])
+def get_photo(student_id):
     conn = get_db_connection()
     cur = conn.cursor()
-    try:
-        cur.execute("INSERT INTO attendance (school_id, student_id, record_date, status) VALUES (%s, %s, %s, %s) ON CONFLICT (student_id, record_date) DO UPDATE SET status = EXCLUDED.status", 
-                    (current_user.school_id, data.get('student_id'), data.get('record_date'), data.get('status')))
-        conn.commit()
-        return jsonify({"message": f"Attendance recorded for {data.get('record_date')}"})
-    except Exception as e:
-        conn.rollback()
-        return jsonify({"error": str(e)}), 500
-    finally:
-        cur.close(); conn.close()
+    cur.execute("SELECT photo_key FROM students WHERE student_id = %s", (student_id,))
+    student = cur.fetchone()
+    cur.close(); conn.close()
+    
+    if student and student['photo_key'] and AWS_BUCKET_NAME:
+        try:
+            file_obj = s3_client.get_object(Bucket=AWS_BUCKET_NAME, Key=student['photo_key'])
+            return Response(file_obj['Body'].read(), mimetype='image/jpeg')
+        except Exception: pass
+        
+    # Return dynamic SVG placeholder if no photo exists
+    svg_placeholder = '<svg xmlns="http://www.w3.org/2000/svg" width="70" height="90"><rect width="70" height="90" fill="#eee"/><text x="15" y="50" font-family="Arial" font-size="12" fill="#999">PHOTO</text></svg>'
+    return Response(svg_placeholder, mimetype='image/svg+xml')
 
 @app.route('/print_ids', methods=['GET'])
 @login_required
@@ -351,9 +340,9 @@ def print_ids():
     <style>
         body {{ font-family: 'Arial', sans-serif; background: #f0f0f0; margin: 0; padding: 20px; }}
         .page {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; max-width: 800px; margin: auto; }}
-        .id-card {{ background: white; border: 2px solid #0f4c81; border-radius: 8px; padding: 15px; width: 350px; height: 200px; box-sizing: border-box; page-break-inside: avoid; position: relative; }}
+        .id-card {{ background: white; border: 2px solid #0f4c81; border-radius: 8px; padding: 15px; width: 350px; height: 200px; box-sizing: border-box; page-break-inside: avoid; position: relative; overflow: hidden; }}
         .header {{ background: #0f4c81; color: white; text-align: center; padding: 5px; margin: -15px -15px 10px -15px; border-radius: 6px 6px 0 0; font-weight: bold; font-size: 14px; text-transform: uppercase; }}
-        .photo-box {{ width: 70px; height: 90px; border: 1px dashed #ccc; float: left; margin-right: 15px; text-align: center; line-height: 90px; color: #999; font-size: 10px; }}
+        .photo-box {{ width: 70px; height: 90px; border: 1px solid #ccc; float: left; margin-right: 15px; overflow: hidden; background: #eee; }}
         .details {{ float: left; font-size: 12px; line-height: 1.6; width: calc(100% - 90px); }}
         .footer {{ position: absolute; bottom: 0; left: 0; width: 100%; background: #eee; text-align: center; font-size: 10px; padding: 5px 0; border-radius: 0 0 6px 6px; font-weight: bold; }}
         @media print {{ body {{ background: white; padding: 0; }} .no-print {{ display: none; }} }}
@@ -365,7 +354,9 @@ def print_ids():
         html += f"""
         <div class="id-card">
             <div class="header">{school_name}</div>
-            <div class="photo-box">PHOTO</div>
+            <div class="photo-box">
+                <img src="/api/photo/{s['student_id']}" style="width:100%; height:100%; object-fit:cover;">
+            </div>
             <div class="details">
                 <strong>Name:</strong> {s['first_name']} {s['last_name']}<br>
                 <strong>ID Number:</strong> {school_name[:3].upper()}-{s['student_id']:04d}<br>
@@ -378,21 +369,57 @@ def print_ids():
     html += "</div></body></html>"
     return html
 
-@app.route('/api/students', methods=['GET', 'POST'])
+@app.route('/api/analytics', methods=['GET'])
 @login_required
-def manage_students():
-    conn = get_db_connection(); cur = conn.cursor()
+@require_active_subscription
+def get_analytics():
+    if current_user.role != 'admin': return jsonify({"error": "Unauthorized"}), 403
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COALESCE(SUM(amount_due), 0) as total_due FROM fees WHERE school_id = %s", (current_user.school_id,))
+    total_due = float(cur.fetchone()['total_due'])
+    cur.execute("SELECT COALESCE(SUM(p.amount_paid), 0) as total_paid FROM payments p JOIN fees f ON p.fee_id = f.fee_id WHERE f.school_id = %s", (current_user.school_id,))
+    total_paid = float(cur.fetchone()['total_paid'])
+    cur.execute("SELECT COALESCE(SUM(amount), 0) as total_expenses FROM expenses WHERE school_id = %s", (current_user.school_id,))
+    total_exp = float(cur.fetchone()['total_expenses'])
+    cur.execute("SELECT waec_grade, COUNT(*) as count FROM grades WHERE school_id = %s GROUP BY waec_grade ORDER BY waec_grade", (current_user.school_id,))
+    performance = cur.fetchall()
+    cur.close(); conn.close()
+    return jsonify({"financials": {"due": total_due, "paid": total_paid, "outstanding": total_due - total_paid, "expenses": total_exp, "net_margin": total_paid - total_exp}, "performance": performance})
+
+@app.route('/api/expenses', methods=['POST', 'GET'])
+@login_required
+@require_active_subscription
+def manage_expenses():
+    if current_user.role != 'admin': return jsonify({"error": "Unauthorized"}), 403
+    conn = get_db_connection()
+    cur = conn.cursor()
     if request.method == 'POST':
-        d = request.get_json()
-        cur.execute("INSERT INTO students (school_id, first_name, last_name, guardian_name, guardian_contact, boarding_status, house) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING student_id", (current_user.school_id, d.get('first_name'), d.get('last_name'), d.get('guardian_name'), d.get('guardian_contact'), d.get('boarding_status', 'Day'), d.get('house', 'Unassigned')))
-        new_id = cur.fetchone()['student_id']
+        data = request.get_json()
+        cur.execute("INSERT INTO expenses (school_id, category, description, amount) VALUES (%s, %s, %s, %s)", (current_user.school_id, data.get('category'), data.get('description'), data.get('amount')))
         conn.commit(); cur.close(); conn.close()
-        return jsonify({"message": f"Student Enrolled! New ID: {new_id}"}), 201
+        return jsonify({"message": "Expense logged securely to the ledger."}), 201
     else:
-        cur.execute("SELECT student_id, first_name, last_name, boarding_status, house, guardian_contact FROM students WHERE school_id = %s ORDER BY student_id DESC", (current_user.school_id,))
-        s = cur.fetchall()
+        cur.execute("SELECT expense_id, category, description, amount, TO_CHAR(date_incurred, 'YYYY-MM-DD') as date FROM expenses WHERE school_id = %s ORDER BY date_incurred DESC", (current_user.school_id,))
+        expenses = cur.fetchall()
         cur.close(); conn.close()
-        return jsonify({"data": s})
+        return jsonify({"data": expenses})
+
+@app.route('/api/attendance', methods=['POST'])
+@login_required
+@require_active_subscription
+def log_attendance():
+    if current_user.role not in ['admin', 'teacher']: return jsonify({"error": "Unauthorized"}), 403
+    data = request.get_json()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO attendance (school_id, student_id, record_date, status) VALUES (%s, %s, %s, %s) ON CONFLICT (student_id, record_date) DO UPDATE SET status = EXCLUDED.status", (current_user.school_id, data.get('student_id'), data.get('record_date'), data.get('status')))
+        conn.commit()
+        return jsonify({"message": f"Attendance recorded for {data.get('record_date')}"})
+    except Exception as e:
+        conn.rollback(); return jsonify({"error": str(e)}), 500
+    finally: cur.close(); conn.close()
 
 @app.route('/api/fees/bill', methods=['POST'])
 @login_required
@@ -431,8 +458,7 @@ def get_report_card(student_id):
     if current_user.role == 'guardian' and current_user.linked_student_id != student_id: return jsonify({"error": "Access Denied."}), 403
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT sub.subject_name, g.class_score, g.exam_score, g.total_score, g.waec_grade, g.teacher_remarks, g.term FROM grades g JOIN subjects sub ON g.subject_id = sub.subject_id WHERE g.student_id = %s AND g.school_id = %s", (student_id, current_user.school_id))
-    grades = cur.fetchall()
-    cur.close(); conn.close()
+    grades = cur.fetchall(); cur.close(); conn.close()
     return jsonify({"grades": grades})
 
 @app.route('/api/statement/<int:student_id>', methods=['GET'])
@@ -442,8 +468,7 @@ def get_statement(student_id):
     conn = get_db_connection(); cur = conn.cursor()
     query = "SELECT f.fee_id, f.fee_category, f.academic_year, f.term, f.description, f.amount_due, COALESCE(SUM(p.amount_paid), 0) as total_paid, (f.amount_due - COALESCE(SUM(p.amount_paid), 0)) as remaining_balance FROM fees f LEFT JOIN payments p ON f.fee_id = p.fee_id WHERE f.student_id = %s AND f.school_id = %s GROUP BY f.fee_id, f.fee_category, f.academic_year, f.term, f.description, f.amount_due ORDER BY f.date_issued DESC"
     cur.execute(query, (student_id, current_user.school_id))
-    statement = cur.fetchall()
-    cur.close(); conn.close()
+    statement = cur.fetchall(); cur.close(); conn.close()
     return jsonify({"statement": statement}), 200
 
 @app.route('/api/sms/blast', methods=['POST'])
@@ -458,12 +483,11 @@ def register_staff():
     conn = get_db_connection(); cur = conn.cursor()
     try:
         cur.execute("INSERT INTO system_users (school_id, email, password_hash, role, linked_student_id) VALUES (%s, %s, %s, %s, %s)", (current_user.school_id, d.get('email'), hashed, d.get('role'), d.get('linked_student_id') or None))
-        conn.commit()
-        return jsonify({"message": "Account created!"}), 201
+        conn.commit(); return jsonify({"message": "Account created!"}), 201
     except: return jsonify({"error": "Email exists."}), 409
     finally: cur.close(); conn.close()
 
-# --- 8. THE FRONTEND DASHBOARD ---
+# --- 8. THE FRONTEND DASHBOARD (ERP EDITION) ---
 @app.route('/dashboard')
 def dashboard():
     html_template = """
@@ -589,12 +613,28 @@ def dashboard():
                         <select id="sBoarding"><option value="Day">Day Student</option><option value="Boarding">Boarding Student</option></select>
                         <input type="text" id="sHouse" placeholder="House (e.g. Aggrey House)">
                     </div>
-                    <button class="btn btn-success" onclick="sendAction('/api/students', {first_name: document.getElementById('sFirst').value, last_name: document.getElementById('sLast').value, boarding_status: document.getElementById('sBoarding').value, house: document.getElementById('sHouse').value, guardian_name: 'Pending', guardian_contact: 'Pending'})">Register Student</button>
+                    <div class="grid-2">
+                        <div>
+                            <label style="font-size:0.8rem; font-weight:bold;">Guardian Name</label>
+                            <input type="text" id="sGName" placeholder="Guardian Name">
+                        </div>
+                        <div>
+                            <label style="font-size:0.8rem; font-weight:bold;">Guardian Contact</label>
+                            <input type="text" id="sGContact" placeholder="Guardian Contact">
+                        </div>
+                    </div>
+                    <div style="margin-bottom: 15px;">
+                        <label style="font-size:0.8rem; font-weight:bold;">Student Passport Photo (Optional)</label>
+                        <input type="file" id="sPhoto" accept="image/*">
+                    </div>
+                    <button class="btn btn-success" onclick="enrollStudent()">Register Student</button>
                 </div>
                 <div>
                     <h3>M1: Print-Ready ID Generator</h3>
-                    <p style="font-size: 0.9rem; color: #666;">Generate a grid of high-resolution PDF/Printable ID cards for the entire student body instantly.</p>
+                    <p style="font-size: 0.9rem; color: #666;">Generate a grid of high-resolution PDF/Printable ID cards, complete with dynamically inserted passport photos stored in your secure AWS Vault.</p>
                     <button class="btn btn-warning" onclick="window.open('/print_ids', '_blank')">🖨️ Generate Batch ID Cards</button>
+                    <hr style="margin:20px 0; border:1px solid #eee;">
+                    <button class="btn" onclick="loadRoster()">View Digital Directory</button>
                 </div>
             </div>
 
@@ -682,6 +722,31 @@ def dashboard():
                     else if (res.status === 402) showToast(data.error, true); 
                     else showToast(data.error || "Error", true);
                 } catch(e) { showToast("Connection failed", true); }
+            }
+            
+            // Core File Upload & Enrollment Engine
+            async function enrollStudent() {
+                const fileInput = document.getElementById('sPhoto');
+                let photo_b64 = null;
+                
+                if (fileInput.files.length > 0) {
+                    const reader = new FileReader();
+                    reader.readAsDataURL(fileInput.files[0]);
+                    await new Promise(resolve => reader.onload = resolve);
+                    photo_b64 = reader.result; 
+                }
+                
+                const payload = {
+                    first_name: document.getElementById('sFirst').value,
+                    last_name: document.getElementById('sLast').value,
+                    guardian_name: document.getElementById('sGName').value,
+                    guardian_contact: document.getElementById('sGContact').value,
+                    boarding_status: document.getElementById('sBoarding').value,
+                    house: document.getElementById('sHouse').value,
+                    photo_b64: photo_b64
+                };
+                
+                sendAction('/api/students', payload);
             }
 
             async function loadSchools() {
@@ -795,12 +860,10 @@ def dashboard():
                     document.getElementById('attDate').value = new Date().toISOString().split('T')[0];
                 }
 
-                // If on Super Admin view, load schools.
                 if (document.getElementById('school-container')) {
                     loadSchools();
                 }
                 
-                // If on Tenant Admin view, load charts.
                 if (document.getElementById('financeChart')) {
                     try {
                         const res = await fetch('/api/analytics'); 
