@@ -1,9 +1,11 @@
 import os
 import psycopg2
 import csv
+import json
+import decimal
 from io import StringIO
 from functools import wraps
-from datetime import datetime
+from datetime import datetime, date
 from flask import Flask, jsonify, request, render_template_string, Response
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user, UserMixin
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -14,6 +16,14 @@ app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'super-secure-enterprise
 
 login_manager = LoginManager()
 login_manager.init_app(app)
+
+# --- JSON ENCODER FOR DATABASE TYPES ---
+def custom_json_serializer(obj):
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, decimal.Decimal):
+        return float(obj)
+    raise TypeError(f"Type {type(obj)} not serializable")
 
 # --- 1. UNIFIED AUTH MODEL ---
 class User(UserMixin):
@@ -39,7 +49,7 @@ class User(UserMixin):
 def load_user(user_id):
     return User.get(user_id)
 
-# --- 2. THE SAAS BOUNCER (YEARLY BILLING LOCK) ---
+# --- 2. THE SAAS BOUNCER ---
 def require_active_subscription(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -58,16 +68,13 @@ def require_active_subscription(f):
         return f(*args, **kwargs)
     return decorated_function
 
-# --- 3. SYSTEM SETUP (MULTI-TENANT) ---
+# --- 3. SYSTEM SETUP ---
 @app.route('/api/setup_db')
 def setup_db():
     conn = get_db_connection()
     cur = conn.cursor()
     
-    # SAAS Master Table
     cur.execute("CREATE TABLE IF NOT EXISTS institutions (school_id SERIAL PRIMARY KEY, school_name VARCHAR(150) NOT NULL UNIQUE, subscription_expiry_date DATE NOT NULL)")
-    
-    # Multi-Tenant Core Tables
     cur.execute("CREATE TABLE IF NOT EXISTS students (student_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, first_name VARCHAR(100) NOT NULL, last_name VARCHAR(100) NOT NULL, guardian_name VARCHAR(100) NOT NULL, guardian_contact VARCHAR(20) NOT NULL, enrollment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cur.execute("CREATE TABLE IF NOT EXISTS system_users (user_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, email VARCHAR(100) UNIQUE NOT NULL, password_hash VARCHAR(255) NOT NULL, role VARCHAR(20) NOT NULL, linked_student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE)")
     cur.execute("CREATE TABLE IF NOT EXISTS subjects (subject_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, subject_name VARCHAR(100) NOT NULL)")
@@ -75,7 +82,6 @@ def setup_db():
     cur.execute("CREATE TABLE IF NOT EXISTS fees (fee_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, description VARCHAR(255) NOT NULL, amount_due DECIMAL(10, 2) NOT NULL, date_issued TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cur.execute("CREATE TABLE IF NOT EXISTS payments (payment_id SERIAL PRIMARY KEY, fee_id INTEGER REFERENCES fees(fee_id) ON DELETE CASCADE, amount_paid DECIMAL(10, 2) NOT NULL, payment_method VARCHAR(50) NOT NULL, payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     
-    # Auto-Create Super Admin (You) and a Test School (Winneba High)
     cur.execute("SELECT * FROM system_users WHERE role = 'superadmin'")
     if not cur.fetchone():
         hashed_sa = generate_password_hash('ceo123')
@@ -112,7 +118,7 @@ def logout():
     logout_user()
     return jsonify({"message": "Logged out safely."})
 
-# --- 5. SUPER ADMIN CONTROL ROOM ---
+# --- 5. SUPER ADMIN CONTROL ROOM & BACKUP ENGINE ---
 @app.route('/api/superadmin/schools', methods=['GET'])
 @login_required
 def get_schools():
@@ -135,6 +141,42 @@ def renew_school(school_id):
     conn.commit()
     cur.close(); conn.close()
     return jsonify({"message": f"Contract Renewed! {updated['school_name']} active until {updated['subscription_expiry_date']}"})
+
+# THE NEW VAULT: Data Extraction Engine
+@app.route('/api/superadmin/backup/<int:school_id>', methods=['GET'])
+@login_required
+def download_backup(school_id):
+    if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    cur.execute("SELECT school_name FROM institutions WHERE school_id = %s", (school_id,))
+    school = cur.fetchone()
+    if not school:
+        return jsonify({"error": "School not found"}), 404
+        
+    backup = {"school_name": school['school_name'], "export_date": datetime.now().isoformat(), "data": {}}
+    
+    # Extract strictly isolated tenant data
+    cur.execute("SELECT * FROM students WHERE school_id = %s", (school_id,))
+    backup['data']['students'] = cur.fetchall()
+    
+    cur.execute("SELECT * FROM fees WHERE school_id = %s", (school_id,))
+    backup['data']['fees'] = cur.fetchall()
+    
+    cur.execute("SELECT p.* FROM payments p JOIN fees f ON p.fee_id = f.fee_id WHERE f.school_id = %s", (school_id,))
+    backup['data']['payments'] = cur.fetchall()
+    
+    cur.execute("SELECT * FROM grades WHERE school_id = %s", (school_id,))
+    backup['data']['grades'] = cur.fetchall()
+    
+    cur.close(); conn.close()
+    
+    # Package into JSON format
+    json_data = json.dumps(backup, default=custom_json_serializer, indent=4)
+    filename = f"Backup_{school['school_name'].replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.json"
+    
+    return Response(json_data, mimetype="application/json", headers={"Content-Disposition": f"attachment;filename={filename}"})
 
 # --- 6. MULTI-TENANT ACADEMICS & FINANCE ---
 @app.route('/api/students', methods=['GET', 'POST'])
@@ -182,7 +224,7 @@ def dashboard():
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Ghana SMS | Enterprise Portal</title>
         <style>
-            :root { --primary: #0f4c81; --secondary: #f4f7f6; --accent: #28a745; --text: #333; --danger: #dc3545;}
+            :root { --primary: #0f4c81; --secondary: #f4f7f6; --accent: #28a745; --text: #333; --danger: #dc3545; --info: #17a2b8;}
             body { font-family: 'Segoe UI', system-ui, sans-serif; background-color: var(--secondary); margin: 0; display: flex; color: var(--text); }
             .sidebar { width: 250px; background: var(--primary); color: white; min-height: 100vh; padding: 20px; box-sizing: border-box; position: fixed; }
             .sidebar h2 { margin-top: 0; border-bottom: 1px solid rgba(255,255,255,0.2); padding-bottom: 10px; font-size: 1.2rem; }
@@ -196,6 +238,7 @@ def dashboard():
             .btn { background: var(--primary); color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-weight: bold; width: 100%; margin-bottom: 10px;}
             .btn-success { background: var(--accent); }
             .btn-danger { background: var(--danger); }
+            .btn-info { background: var(--info); }
             .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
             #toast { display: none; position: fixed; bottom: 30px; right: 30px; padding: 15px 25px; color: white; background: var(--accent); border-radius: 5px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); z-index: 1000; font-weight: bold; }
             table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.95rem; margin-top: 15px; }
@@ -237,7 +280,7 @@ def dashboard():
             {% elif current_user.role == 'superadmin' %}
             <div class="card">
                 <h3>Global Tenant Control Room</h3>
-                <p>Monitor school subscriptions and process yearly contract renewals.</p>
+                <p>Monitor school subscriptions, process contract renewals, and generate data backups.</p>
                 <button class="btn" onclick="loadSchools()">Refresh Tenant List</button>
                 <div id="school-container"></div>
             </div>
@@ -295,7 +338,7 @@ def dashboard():
                     const res = await fetch(endpoint, options);
                     const data = await res.json();
                     if (res.ok) showToast(data.message);
-                    else if (res.status === 402) showToast(data.error, true); // Catches the Bouncer!
+                    else if (res.status === 402) showToast(data.error, true); 
                     else showToast(data.error || "Error", true);
                     if (endpoint === '/api/setup_db') loadSchools();
                 } catch(e) { showToast("Connection failed", true); }
@@ -304,7 +347,7 @@ def dashboard():
             async function loadRoster() {
                 const res = await fetch('/api/students');
                 const data = await res.json();
-                if (res.status === 402) { showToast(data.error, true); return; } // Bouncer hits here too!
+                if (res.status === 402) { showToast(data.error, true); return; } 
                 let html = '<table><tr><th>ID</th><th>First</th><th>Last</th></tr>';
                 data.data.forEach(s => html += `<tr><td>${s.student_id}</td><td>${s.first_name}</td><td>${s.last_name}</td></tr>`);
                 html += '</table>';
@@ -315,13 +358,16 @@ def dashboard():
                 const res = await fetch('/api/superadmin/schools');
                 if(!res.ok) return;
                 const data = await res.json();
-                let html = '<table><tr><th>ID</th><th>School Name</th><th>Expiry Date</th><th>Status</th><th>Action</th></tr>';
+                let html = '<table><tr><th>ID</th><th>School Name</th><th>Expiry Date</th><th>Status</th><th>Actions</th></tr>';
                 data.data.forEach(s => {
                     const statusColor = s.status === 'Active' ? 'green' : 'red';
                     html += `<tr>
                         <td>${s.school_id}</td><td>${s.school_name}</td><td>${s.expiry_date}</td>
                         <td style="color:${statusColor}; font-weight:bold;">${s.status}</td>
-                        <td><button class="btn btn-success" onclick="sendAction('/api/superadmin/renew/${s.school_id}', {})">Renew 1 Year</button></td>
+                        <td>
+                            <button class="btn btn-success" style="width: auto; padding: 6px 12px; margin-right: 5px; margin-bottom: 0;" onclick="sendAction('/api/superadmin/renew/${s.school_id}', {})">Renew 1 Year</button>
+                            <button class="btn btn-info" style="width: auto; padding: 6px 12px; margin-bottom: 0;" onclick="window.location.href='/api/superadmin/backup/${s.school_id}'">⬇️ Backup Data</button>
+                        </td>
                     </tr>`;
                 });
                 html += '</table>';
