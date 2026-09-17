@@ -96,7 +96,6 @@ def setup_db():
     cur.execute("CREATE TABLE IF NOT EXISTS subjects (subject_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, subject_name VARCHAR(100) NOT NULL)")
     cur.execute("CREATE TABLE IF NOT EXISTS grades (grade_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, subject_id INTEGER REFERENCES subjects(subject_id) ON DELETE CASCADE, class_score INTEGER NOT NULL, exam_score INTEGER NOT NULL, total_score INTEGER NOT NULL, waec_grade VARCHAR(2) NOT NULL, academic_year VARCHAR(9) NOT NULL, term VARCHAR(20) NOT NULL, teacher_remarks VARCHAR(255))")
     
-    # Updated Segmented Billing Tables
     cur.execute("DROP TABLE IF EXISTS payments CASCADE")
     cur.execute("DROP TABLE IF EXISTS fees CASCADE")
     cur.execute("CREATE TABLE fees (fee_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, fee_category VARCHAR(50) NOT NULL, description VARCHAR(255) NOT NULL, amount_due DECIMAL(10, 2) NOT NULL, academic_year VARCHAR(9) NOT NULL, term VARCHAR(20) NOT NULL, date_issued TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
@@ -259,7 +258,6 @@ def restore_backup(school_id):
                 cur.execute("INSERT INTO students (student_id, school_id, first_name, last_name, guardian_name, guardian_contact, enrollment_date) VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (student_id) DO NOTHING", (r['student_id'], school_id, r['first_name'], r['last_name'], r['guardian_name'], r['guardian_contact'], r['enrollment_date']))
         if 'fees' in data['data']:
             for r in data['data']['fees']:
-                # Handle old schema formats smoothly during restore
                 cat = r.get('fee_category', 'General')
                 yr = r.get('academic_year', 'Unknown')
                 tm = r.get('term', 'Unknown')
@@ -550,6 +548,7 @@ def dashboard():
                     <h3>1. Issue Segmented Bill</h3>
                     <input type="number" id="bStuId" placeholder="Student ID">
                     <select id="bCat">
+                        <option value="Consolidated Fee">Consolidated Term Fee (All-Inclusive)</option>
                         <option value="Tuition">Tuition Fee</option>
                         <option value="PTA Dues">PTA Dues</option>
                         <option value="Feeding Fee">Feeding Fee</option>
