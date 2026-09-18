@@ -316,23 +316,48 @@ def log_attendance():
 @app.route('/api/fees/bill', methods=['POST'])
 @login_required
 def bill_student():
-    d = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
+    d = request.get_json()
+    conn = get_db_connection()
+    cur = conn.cursor()
     try:
-        cur.execute("INSERT INTO fees (school_id, student_id, fee_category, description, amount_due, academic_year, term) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING fee_id", (current_user.school_id, d.get('student_id'), d.get('fee_category'), d.get('description'), d.get('amount_due'), d.get('academic_year'), d.get('term')))
-        conn.commit(); return jsonify({"message": "Bill issued successfully!"}), 201
-    except psycopg2.errors.ForeignKeyViolation:
-        conn.rollback(); return jsonify({"error": "Student ID does not exist!"}), 400
-    finally: cur.close(); conn.close()
+        student_id = int(d.get('student_id') or 0)
+        amount_due = float(d.get('amount_due') or 0.0)
+        
+        cur.execute("INSERT INTO fees (school_id, student_id, fee_category, description, amount_due, academic_year, term) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING fee_id", 
+                    (current_user.school_id, student_id, d.get('fee_category'), d.get('description'), amount_due, d.get('academic_year'), d.get('term')))
+        conn.commit()
+        return jsonify({"message": "Bill issued successfully!"}), 201
+    except ValueError:
+        return jsonify({"error": "Student ID and Amount Due must be strict numbers!"}), 400
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": "Invalid Student ID or missing database record."}), 400
+    finally:
+        cur.close()
+        conn.close()
 
 @app.route('/api/fees/pay', methods=['POST'])
 @login_required
 def log_payment():
-    d = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
+    d = request.get_json()
+    conn = get_db_connection()
+    cur = conn.cursor()
     try:
-        cur.execute("INSERT INTO payments (fee_id, amount_paid, payment_method) VALUES (%s, %s, %s)", (d.get('fee_id'), d.get('amount_paid'), d.get('payment_method')))
-        conn.commit(); return jsonify({"message": "Payment logged securely!"}), 201
-    except Exception as e: conn.rollback(); return jsonify({"error": "Invalid Fee ID."}), 400
-    finally: cur.close(); conn.close()
+        fee_id = int(d.get('fee_id') or 0)
+        amount_paid = float(d.get('amount_paid') or 0.0)
+        
+        cur.execute("INSERT INTO payments (fee_id, amount_paid, payment_method) VALUES (%s, %s, %s)", 
+                    (fee_id, amount_paid, d.get('payment_method')))
+        conn.commit()
+        return jsonify({"message": "Payment logged securely!"}), 201
+    except ValueError:
+        return jsonify({"error": "Fee ID and Amount Paid must be strict numbers!"}), 400
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": "Invalid Fee ID."}), 400
+    finally:
+        cur.close()
+        conn.close()
 
 @app.route('/api/grades', methods=['POST'])
 @login_required
@@ -390,7 +415,6 @@ def send_sms_blast():
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # Route filtering based on Admin selection
     if audience == 'all':
         cur.execute("SELECT DISTINCT guardian_contact FROM students WHERE school_id = %s AND guardian_contact IS NOT NULL", (current_user.school_id,))
     elif audience == 'arrears':
@@ -414,13 +438,11 @@ def send_sms_blast():
     if not contacts:
         return jsonify({"error": "No valid phone numbers found for this audience."}), 404
 
-    # The Live Dispatch Logic
     SMS_API_KEY = os.environ.get('SMS_API_KEY')
-    SMS_SENDER_ID = os.environ.get('SMS_SENDER_ID', 'SMS_ADMIN') # Must be 11 characters max
+    SMS_SENDER_ID = os.environ.get('SMS_SENDER_ID', 'SMS_ADMIN')
 
     if SMS_API_KEY:
         try:
-            # Using Arkesel API v2 Standard as the core gateway
             url = "https://sms.arkesel.com/api/v2/sms/send"
             headers = {"api-key": SMS_API_KEY}
             payload = {
@@ -437,7 +459,6 @@ def send_sms_blast():
         except Exception as e:
             return jsonify({"error": f"Connection to Telecom Server failed: {str(e)}"}), 500
     else:
-        # Fallback Simulation Mode if no API key is provided
         return jsonify({"message": f"[SIMULATION] SMS processed for {len(contacts)} parents. Add SMS_API_KEY to Render to go live."}), 200
 
 @app.route('/api/register_staff', methods=['POST'])
