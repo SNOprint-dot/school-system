@@ -176,6 +176,56 @@ def onboard_school():
     except psycopg2.IntegrityError: conn.rollback(); return jsonify({"error": "School name or Admin email already exists!"}), 409
     finally: cur.close(); conn.close()
 
+@app.route('/api/superadmin/backup/<int:school_id>', methods=['GET'])
+@login_required
+def download_backup(school_id):
+    if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT school_name FROM institutions WHERE school_id = %s", (school_id,))
+    school = cur.fetchone()
+    if not school: return jsonify({"error": "School not found"}), 404
+    backup = {"school_name": school['school_name'], "export_date": datetime.now().isoformat(), "data": {}}
+    cur.execute("SELECT * FROM subjects WHERE school_id = %s", (school_id,)); backup['data']['subjects'] = cur.fetchall()
+    cur.execute("SELECT * FROM students WHERE school_id = %s", (school_id,)); backup['data']['students'] = cur.fetchall()
+    cur.execute("SELECT * FROM fees WHERE school_id = %s", (school_id,)); backup['data']['fees'] = cur.fetchall()
+    cur.execute("SELECT p.* FROM payments p JOIN fees f ON p.fee_id = f.fee_id WHERE f.school_id = %s", (school_id,)); backup['data']['payments'] = cur.fetchall()
+    cur.execute("SELECT * FROM grades WHERE school_id = %s", (school_id,)); backup['data']['grades'] = cur.fetchall()
+    cur.execute("SELECT * FROM expenses WHERE school_id = %s", (school_id,)); backup['data']['expenses'] = cur.fetchall()
+    cur.close(); conn.close()
+    json_data = json.dumps(backup, default=custom_json_serializer, indent=4)
+    return Response(json_data, mimetype="application/json", headers={"Content-Disposition": f"attachment;filename=Backup_{school['school_name'].replace(' ', '_')}.json"})
+
+@app.route('/api/superadmin/restore/<int:school_id>', methods=['POST'])
+@login_required
+def restore_backup(school_id):
+    if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
+    if 'file' not in request.files: return jsonify({"error": "No file uploaded"}), 400
+    file = request.files['file']
+    try:
+        data = json.load(file)
+        conn = get_db_connection(); cur = conn.cursor()
+        if 'subjects' in data['data']:
+            for r in data['data']['subjects']:
+                cur.execute("INSERT INTO subjects (subject_id, school_id, subject_name) VALUES (%s, %s, %s) ON CONFLICT (subject_id) DO NOTHING", (r['subject_id'], school_id, r['subject_name']))
+        if 'students' in data['data']:
+            for r in data['data']['students']:
+                cur.execute("INSERT INTO students (student_id, school_id, first_name, last_name, guardian_name, guardian_contact, boarding_status, house, photo_key, enrollment_date) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (student_id) DO NOTHING", (r['student_id'], school_id, r['first_name'], r['last_name'], r['guardian_name'], r['guardian_contact'], r.get('boarding_status', 'Day'), r.get('house', 'Unassigned'), r.get('photo_key'), r['enrollment_date']))
+        if 'fees' in data['data']:
+            for r in data['data']['fees']:
+                cur.execute("INSERT INTO fees (fee_id, school_id, student_id, fee_category, description, amount_due, academic_year, term, date_issued) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (fee_id) DO NOTHING", (r['fee_id'], school_id, r['student_id'], r.get('fee_category', 'General'), r['description'], r['amount_due'], r.get('academic_year', 'Unknown'), r.get('term', 'Unknown'), r['date_issued']))
+        if 'payments' in data['data']:
+            for r in data['data']['payments']:
+                cur.execute("INSERT INTO payments (payment_id, fee_id, amount_paid, payment_method, payment_date) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (payment_id) DO NOTHING", (r['payment_id'], r['fee_id'], r['amount_paid'], r['payment_method'], r['payment_date']))
+        if 'grades' in data['data']:
+            for r in data['data']['grades']:
+                cur.execute("INSERT INTO grades (grade_id, school_id, student_id, subject_id, class_score, exam_score, total_score, waec_grade, academic_year, term, teacher_remarks) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (grade_id) DO NOTHING", (r['grade_id'], school_id, r['student_id'], r['subject_id'], r.get('class_score', 0), r.get('exam_score', r.get('score', 0)), r.get('total_score', r.get('score', 0)), r['waec_grade'], r['academic_year'], r['term'], r.get('teacher_remarks', '')))
+        if 'expenses' in data['data']:
+            for r in data['data']['expenses']:
+                cur.execute("INSERT INTO expenses (expense_id, school_id, category, description, amount, date_incurred) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (expense_id) DO NOTHING", (r['expense_id'], school_id, r['category'], r['description'], r['amount'], r['date_incurred']))
+        conn.commit(); cur.close(); conn.close()
+        return jsonify({"message": f"Vault Restoration Complete for {data.get('school_name')}!"}), 200
+    except Exception as e: return jsonify({"error": f"Restoration failed: {str(e)}"}), 500
+
 # --- TENANT ENDPOINTS ---
 @app.route('/api/students', methods=['GET', 'POST'])
 @login_required
@@ -252,6 +302,16 @@ def manage_expenses():
         cur.execute("SELECT expense_id, category, description, amount, TO_CHAR(date_incurred, 'YYYY-MM-DD') as date FROM expenses WHERE school_id = %s ORDER BY date_incurred DESC", (current_user.school_id,))
         e = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": e})
 
+@app.route('/api/attendance', methods=['POST'])
+@login_required
+def log_attendance():
+    d = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO attendance (school_id, student_id, record_date, status) VALUES (%s, %s, %s, %s) ON CONFLICT (student_id, record_date) DO UPDATE SET status = EXCLUDED.status", (current_user.school_id, d.get('student_id'), d.get('record_date'), d.get('status')))
+        conn.commit(); return jsonify({"message": f"Attendance recorded for {d.get('record_date')}"})
+    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
+    finally: cur.close(); conn.close()
+
 @app.route('/api/fees/bill', methods=['POST'])
 @login_required
 def bill_student():
@@ -300,6 +360,7 @@ def add_grade():
 @app.route('/api/report_card/<int:student_id>', methods=['GET'])
 @login_required
 def get_report_card(student_id):
+    if current_user.role == 'guardian' and current_user.linked_student_id != student_id: return jsonify({"error": "Access Denied."}), 403
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT sub.subject_name, g.class_score, g.exam_score, g.total_score, g.waec_grade, g.teacher_remarks, g.term FROM grades g JOIN subjects sub ON g.subject_id = sub.subject_id WHERE g.student_id = %s AND g.school_id = %s", (student_id, current_user.school_id))
     grades = cur.fetchall(); cur.close(); conn.close(); return jsonify({"grades": grades})
@@ -307,10 +368,27 @@ def get_report_card(student_id):
 @app.route('/api/statement/<int:student_id>', methods=['GET'])
 @login_required
 def get_statement(student_id):
+    if current_user.role == 'guardian' and current_user.linked_student_id != student_id: return jsonify({"error": "Access Denied."}), 403
     conn = get_db_connection(); cur = conn.cursor()
     query = "SELECT f.fee_id, f.fee_category, f.academic_year, f.term, f.description, f.amount_due, COALESCE(SUM(p.amount_paid), 0) as total_paid, (f.amount_due - COALESCE(SUM(p.amount_paid), 0)) as remaining_balance FROM fees f LEFT JOIN payments p ON f.fee_id = p.fee_id WHERE f.student_id = %s AND f.school_id = %s GROUP BY f.fee_id, f.fee_category, f.academic_year, f.term, f.description, f.amount_due ORDER BY f.date_issued DESC"
     cur.execute(query, (student_id, current_user.school_id))
     statement = cur.fetchall(); cur.close(); conn.close(); return jsonify({"statement": statement}), 200
+
+@app.route('/api/sms/blast', methods=['POST'])
+@login_required
+def send_sms_blast():
+    return jsonify({"message": "SMS Simulation: Dispatched to selected audience successfully."})
+
+@app.route('/api/register_staff', methods=['POST'])
+@login_required
+def register_staff():
+    d = request.get_json(); hashed = generate_password_hash(d.get('password'))
+    conn = get_db_connection(); cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO system_users (school_id, email, password_hash, role, linked_student_id) VALUES (%s, %s, %s, %s, %s)", (current_user.school_id, d.get('email'), hashed, d.get('role'), d.get('linked_student_id') or None))
+        conn.commit(); return jsonify({"message": "Account created!"}), 201
+    except: return jsonify({"error": "Email exists."}), 409
+    finally: cur.close(); conn.close()
 
 # --- 8. THE FRONTEND DASHBOARD ---
 @app.route('/dashboard')
@@ -579,9 +657,21 @@ def dashboard():
                 const res = await fetch('/api/superadmin/schools');
                 if(!res.ok) return;
                 const data = await res.json();
-                let html = '<table style="width:100%; border-collapse: collapse; text-align: left;"><tr><th style="padding:10px; background:#0f4c81; color:white;">ID</th><th style="padding:10px; background:#0f4c81; color:white;">School Name</th><th style="padding:10px; background:#0f4c81; color:white;">Status</th></tr>';
+                let html = '<table style="width:100%; border-collapse: collapse; text-align: left;"><tr><th style="padding:10px; background:#0f4c81; color:white;">ID</th><th style="padding:10px; background:#0f4c81; color:white;">School Name</th><th style="padding:10px; background:#0f4c81; color:white;">Expiry Date</th><th style="padding:10px; background:#0f4c81; color:white;">Status</th><th style="padding:10px; background:#0f4c81; color:white;">Actions</th></tr>';
                 data.data.forEach(s => {
-                    html += `<tr><td style="padding:10px; border-bottom:1px solid #ddd;">${s.school_id}</td><td style="padding:10px; border-bottom:1px solid #ddd;">${s.school_name}</td><td style="padding:10px; border-bottom:1px solid #ddd;">${s.status}</td></tr>`;
+                    const statusColor = s.status === 'Active' ? 'green' : 'red';
+                    html += `<tr>
+                        <td style="padding:10px; border-bottom:1px solid #ddd;">${s.school_id}</td>
+                        <td style="padding:10px; border-bottom:1px solid #ddd;">${s.school_name}</td>
+                        <td style="padding:10px; border-bottom:1px solid #ddd;">${s.expiry_date}</td>
+                        <td style="color:${statusColor}; font-weight:bold; padding:10px; border-bottom:1px solid #ddd;">${s.status}</td>
+                        <td style="padding:10px; border-bottom:1px solid #ddd;">
+                            <button class="btn btn-success" style="width: auto; padding: 6px 12px; margin: 2px;" onclick="sendAction('/api/superadmin/renew/${s.school_id}', {})">Renew</button>
+                            <button class="btn btn-info" style="width: auto; padding: 6px 12px; margin: 2px;" onclick="window.location.href='/api/superadmin/backup/${s.school_id}'">⬇️ Backup</button>
+                            <input type="file" id="file_${s.school_id}" accept=".json" style="display:none;" onchange="uploadRestore(${s.school_id})">
+                            <button class="btn btn-danger" style="width: auto; padding: 6px 12px; margin: 2px;" onclick="document.getElementById('file_${s.school_id}').click()">⬆️ Restore</button>
+                        </td>
+                    </tr>`;
                 });
                 document.getElementById('school-container').innerHTML = html + '</table>';
             }
@@ -595,6 +685,21 @@ def dashboard():
                 if (res.ok) { showToast(data.message); loadSchools(); } else { showToast(data.error, true); }
             }
 
+            async function uploadRestore(schoolId) {
+                const fileInput = document.getElementById('file_' + schoolId);
+                if (!fileInput.files.length) return;
+                const formData = new FormData();
+                formData.append('file', fileInput.files[0]);
+                showToast("Restoring data, please wait...", false);
+                try {
+                    const res = await fetch('/api/superadmin/restore/' + schoolId, { method: 'POST', body: formData });
+                    const data = await res.json();
+                    if (res.ok) showToast(data.message);
+                    else showToast(data.error, true);
+                } catch(e) { showToast("Upload failed", true); }
+                fileInput.value = ''; 
+            }
+
             function renderTable(title, headers, rows, keys) {
                 const viewer = document.getElementById('data-viewer');
                 document.getElementById('viewer-title').innerText = title;
@@ -605,7 +710,17 @@ def dashboard():
                 html += '</tr>';
                 rows.forEach(row => {
                     html += '<tr>';
-                    keys.forEach(k => html += `<td style="padding:10px; border-bottom:1px solid #ddd;">${row[k]}</td>`);
+                    keys.forEach(k => {
+                        let val = row[k];
+                        if (k === 'remaining_balance' && val > 0) {
+                            html += `<td style="color:#dc3545; font-weight:bold; padding:10px; border-bottom:1px solid #ddd;">${val}</td>`;
+                        } else if (k === 'boarding_status') {
+                            let badge = val === 'Boarding' ? 'background:#0f4c81;color:white;' : 'background:#eee;color:black;';
+                            html += `<td style="padding:10px; border-bottom:1px solid #ddd;"><span style="${badge}padding:3px 8px;border-radius:12px;font-size:0.8rem;">${val}</span></td>`;
+                        } else {
+                            html += `<td style="padding:10px; border-bottom:1px solid #ddd;">${val}</td>`;
+                        }
+                    });
                     html += '</tr>';
                 });
                 container.innerHTML = html + '</table>';
