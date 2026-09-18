@@ -313,6 +313,7 @@ def log_attendance():
     except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
     finally: cur.close(); conn.close()
 
+# --- UPGRADED DATABASE VALIDATION ENGINE ---
 @app.route('/api/fees/bill', methods=['POST'])
 @login_required
 def bill_student():
@@ -322,16 +323,26 @@ def bill_student():
     try:
         student_id = int(d.get('student_id') or 0)
         amount_due = float(d.get('amount_due') or 0.0)
-        
+
+        # Pre-check: Does this student actually exist?
+        cur.execute("SELECT student_id FROM students WHERE student_id = %s AND school_id = %s", (student_id, current_user.school_id))
+        if not cur.fetchone():
+            return jsonify({"error": f"Student ID {student_id} does not exist! Please check the Digital Directory."}), 404
+
+        # Enforce strict string limits matching PostgreSQL constraints
+        academic_year = str(d.get('academic_year') or '')[:9]
+        term = str(d.get('term') or '')[:20]
+        desc = str(d.get('description') or '')[:250]
+
         cur.execute("INSERT INTO fees (school_id, student_id, fee_category, description, amount_due, academic_year, term) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING fee_id", 
-                    (current_user.school_id, student_id, d.get('fee_category'), d.get('description'), amount_due, d.get('academic_year'), d.get('term')))
+                    (current_user.school_id, student_id, d.get('fee_category'), desc, amount_due, academic_year, term))
         conn.commit()
         return jsonify({"message": "Bill issued successfully!"}), 201
     except ValueError:
-        return jsonify({"error": "Student ID and Amount Due must be strict numbers!"}), 400
+        return jsonify({"error": "Student ID and Amount Due must be numbers!"}), 400
     except Exception as e:
         conn.rollback()
-        return jsonify({"error": "Invalid Student ID or missing database record."}), 400
+        return jsonify({"error": f"Database Error: {str(e)}"}), 400
     finally:
         cur.close()
         conn.close()
@@ -345,16 +356,20 @@ def log_payment():
     try:
         fee_id = int(d.get('fee_id') or 0)
         amount_paid = float(d.get('amount_paid') or 0.0)
-        
+
+        cur.execute("SELECT fee_id FROM fees WHERE fee_id = %s AND school_id = %s", (fee_id, current_user.school_id))
+        if not cur.fetchone():
+            return jsonify({"error": f"Fee ID {fee_id} does not exist! Check the Statement."}), 404
+
         cur.execute("INSERT INTO payments (fee_id, amount_paid, payment_method) VALUES (%s, %s, %s)", 
                     (fee_id, amount_paid, d.get('payment_method')))
         conn.commit()
         return jsonify({"message": "Payment logged securely!"}), 201
     except ValueError:
-        return jsonify({"error": "Fee ID and Amount Paid must be strict numbers!"}), 400
+        return jsonify({"error": "Fee ID and Amount Paid must be numbers!"}), 400
     except Exception as e:
         conn.rollback()
-        return jsonify({"error": "Invalid Fee ID."}), 400
+        return jsonify({"error": f"Database Error: {str(e)}"}), 400
     finally:
         cur.close()
         conn.close()
@@ -364,24 +379,43 @@ def log_payment():
 def add_grade():
     d = request.get_json()
     try:
-        c_score = int(d.get('class_score') or 0); e_score = int(d.get('exam_score') or 0); stu_id = int(d.get('student_id') or 0)
-    except ValueError: return jsonify({"error": "Scores and ID must be numbers."}), 400
+        c_score = int(d.get('class_score') or 0)
+        e_score = int(d.get('exam_score') or 0)
+        stu_id = int(d.get('student_id') or 0)
+    except ValueError: 
+        return jsonify({"error": "Scores and ID must be numbers."}), 400
     
-    t_score = c_score + e_score; waec = get_waec_grade(t_score)
-    conn = get_db_connection(); cur = conn.cursor()
+    t_score = c_score + e_score
+    waec = get_waec_grade(t_score)
+    conn = get_db_connection()
+    cur = conn.cursor()
     try:
+        cur.execute("SELECT student_id FROM students WHERE student_id = %s AND school_id = %s", (stu_id, current_user.school_id))
+        if not cur.fetchone():
+            return jsonify({"error": f"Student ID {stu_id} does not exist! Check the Digital Directory."}), 404
+            
         cur.execute("SELECT subject_id FROM subjects WHERE subject_name = %s AND school_id = %s", (d.get('subject_name'), current_user.school_id))
         sub = cur.fetchone()
         if not sub:
             cur.execute("INSERT INTO subjects (school_id, subject_name) VALUES (%s, %s) RETURNING subject_id", (current_user.school_id, d.get('subject_name')))
             sub_id = cur.fetchone()['subject_id']
-        else: sub_id = sub['subject_id']
+        else: 
+            sub_id = sub['subject_id']
+        
+        academic_year = str(d.get('academic_year') or '')[:9]
+        term = str(d.get('term') or '')[:20]
+        remarks = str(d.get('remarks') or '')[:250]
+
         cur.execute("INSERT INTO grades (school_id, student_id, subject_id, class_score, exam_score, total_score, waec_grade, academic_year, term, teacher_remarks) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", 
-                    (current_user.school_id, stu_id, sub_id, c_score, e_score, t_score, waec, d.get('academic_year'), d.get('term'), d.get('remarks')))
-        conn.commit(); return jsonify({"message": f"SBA Recorded! Total: {t_score}% ({waec})"})
-    except psycopg2.errors.ForeignKeyViolation:
-        conn.rollback(); return jsonify({"error": "Student ID does not exist!"}), 400
-    finally: cur.close(); conn.close()
+                    (current_user.school_id, stu_id, sub_id, c_score, e_score, t_score, waec, academic_year, term, remarks))
+        conn.commit()
+        return jsonify({"message": f"SBA Recorded! Total: {t_score}% ({waec})"})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": f"Database Error: {str(e)}"}), 400
+    finally:
+        cur.close()
+        conn.close()
 
 @app.route('/api/report_card/<int:student_id>', methods=['GET'])
 @login_required
