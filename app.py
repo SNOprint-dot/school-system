@@ -430,7 +430,10 @@ def dashboard():
                     <button onclick="document.getElementById('analytics-section').scrollIntoView()">📊 Dashboard</button>
                     <button onclick="document.getElementById('finance-section').scrollIntoView()">💰 Financials</button>
                     <button onclick="document.getElementById('admissions-section').scrollIntoView()">🎓 Admissions & IDs</button>
-                    <button onclick="document.getElementById('academics-section').scrollIntoView()">📚 Academics (SBA)</button>
+                    <button onclick="document.getElementById('attendance-section').scrollIntoView()">📅 Roll Call</button>
+                    <button onclick="document.getElementById('academics-section').scrollIntoView()">📚 Academics</button>
+                    <button onclick="document.getElementById('sms-section').scrollIntoView()">📟 SMS Desk</button>
+                    <button onclick="document.getElementById('hr-section').scrollIntoView()">🧑‍🏫 Staff HR</button>
                 {% endif %}
                 <br><br><button class="btn-danger" onclick="logout()">Secure Logout</button>
             {% else %}
@@ -478,7 +481,6 @@ def dashboard():
             <div id="finance-section" class="card">
                 <h3>💰 Financial Ledger & Operations</h3>
                 <div class="grid-2">
-                    <!-- The Restored Bill Issuance Form -->
                     <div style="background: #f8f9fa; padding: 15px; border-radius: 8px;">
                         <h4 style="margin-top:0;">1. Issue Segmented Bill</h4>
                         <input type="number" id="bStuId" placeholder="Student ID (Required)">
@@ -499,7 +501,6 @@ def dashboard():
                         <button class="btn btn-success" onclick="sendAction('/api/fees/bill', {student_id: document.getElementById('bStuId').value, fee_category: document.getElementById('bCat').value, amount_due: document.getElementById('bAmount').value, academic_year: document.getElementById('bYear').value, term: document.getElementById('bTerm').value, description: document.getElementById('bDesc').value})">Issue Bill</button>
                     </div>
 
-                    <!-- Payment & Expenses -->
                     <div>
                         <div style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
                             <h4 style="margin-top:0;">2. Record Payment</h4>
@@ -544,7 +545,23 @@ def dashboard():
                 </div>
             </div>
 
-            <!-- The Restored SBA Desk -->
+            <div id="attendance-section" class="card" style="border: 2px solid var(--info);">
+                <h3>📅 Daily Roll Call & Feeding Optimization</h3>
+                <div class="grid-2">
+                    <div>
+                        <input type="date" id="attDate" value="">
+                        <input type="number" id="attStuId" placeholder="Student ID">
+                    </div>
+                    <div>
+                        <select id="attStatus">
+                            <option value="Present">Present (Include in Feeding)</option>
+                            <option value="Absent">Absent (Remove from Feeding)</option>
+                        </select>
+                        <button class="btn btn-info" onclick="sendAction('/api/attendance', {student_id: document.getElementById('attStuId').value, record_date: document.getElementById('attDate').value, status: document.getElementById('attStatus').value})">Mark Attendance</button>
+                    </div>
+                </div>
+            </div>
+
             <div id="academics-section" class="card grid-2">
                 <div>
                     <h3>Record SBA Grade (30/70)</h3>
@@ -569,6 +586,39 @@ def dashboard():
                     <button class="btn btn-success" onclick="loadReport()">View Terminal Report Card</button>
                     <hr style="margin:20px 0; border:1px solid #eee;">
                     <button class="btn btn-info" onclick="loadStatement()">View Financial Statement</button>
+                </div>
+            </div>
+
+            <div id="sms-section" class="card" style="border: 2px solid var(--info);">
+                <h3>📟 SMS Communication Desk</h3>
+                <div class="grid-2">
+                    <div>
+                        <label style="font-weight:bold; display:block; margin-bottom:5px;">Target Audience</label>
+                        <select id="smsAudience">
+                            <option value="all">Broadcast to All Parents</option>
+                            <option value="arrears">Only Parents with Unpaid Arrears</option>
+                            <option value="boarding">Parents of Boarding Students</option>
+                        </select>
+                        <p style="font-size:0.8rem; color:#666;">The system will automatically extract contact numbers from the database based on your selection.</p>
+                    </div>
+                    <div>
+                        <label style="font-weight:bold; display:block; margin-bottom:5px;">Message Content</label>
+                        <textarea id="smsBody" placeholder="Enter your text message here..."></textarea>
+                        <button class="btn btn-info" onclick="sendAction('/api/sms/blast', {audience: document.getElementById('smsAudience').value, message: document.getElementById('smsBody').value})">Send SMS Broadcast</button>
+                    </div>
+                </div>
+            </div>
+
+            <div id="hr-section" class="card grid-2">
+                <div>
+                    <h3>Register Staff Profile</h3>
+                    <input type="email" id="tEmail" placeholder="Teacher Email">
+                    <input type="password" id="tPass" placeholder="Temporary Password">
+                    <button class="btn" onclick="sendAction('/api/register_staff', {email: document.getElementById('tEmail').value, password: document.getElementById('tPass').value, role: 'teacher'})">Add to HR Directory</button>
+                </div>
+                <div>
+                    <h3>Compliance Vault</h3>
+                    <p style="font-size: 0.9rem; color: #666;">Maintain digital records of staff to ensure instant readiness for GES auditing.</p>
                 </div>
             </div>
 
@@ -751,7 +801,14 @@ def dashboard():
             }
 
             async function loadDashboardData() {
-                if (document.getElementById('school-container')) loadSchools();
+                if (document.getElementById('attDate')) {
+                    document.getElementById('attDate').value = new Date().toISOString().split('T')[0];
+                }
+
+                if (document.getElementById('school-container')) {
+                    loadSchools();
+                }
+                
                 if (document.getElementById('financeChart')) {
                     try {
                         const res = await fetch('/api/analytics'); const data = await res.json();
