@@ -264,6 +264,31 @@ def manage_students():
         cur.execute("SELECT student_id, first_name, last_name, boarding_status, house, guardian_contact FROM students WHERE school_id = %s ORDER BY student_id DESC", (current_user.school_id,))
         students = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": students})
 
+@app.route('/api/students/<int:student_id>', methods=['DELETE'])
+@login_required
+@require_active_subscription
+def delete_student(student_id):
+    if current_user.role != 'admin': return jsonify({"error": "Admin clearance required."}), 403
+    conn = get_db_connection(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT photo_key FROM students WHERE student_id = %s AND school_id = %s", (student_id, current_user.school_id))
+        student = cur.fetchone()
+        if not student: return jsonify({"error": "Student record not found."}), 404
+        
+        # PostgreSQL CASCADE drops all associated grades, fees, and attendance records
+        cur.execute("DELETE FROM students WHERE student_id = %s AND school_id = %s", (student_id, current_user.school_id))
+        conn.commit()
+        
+        if student['photo_key'] and AWS_BUCKET_NAME:
+            try: s3_client.delete_object(Bucket=AWS_BUCKET_NAME, Key=student['photo_key'])
+            except: pass
+            
+        return jsonify({"message": f"Student ID {student_id} permanently deleted."}), 200
+    except Exception as e:
+        conn.rollback(); return jsonify({"error": f"Database Error: {str(e)}"}), 500
+    finally:
+        cur.close(); conn.close()
+
 @app.route('/api/photo/<int:student_id>', methods=['GET'])
 def get_photo(student_id):
     conn = get_db_connection(); cur = conn.cursor()
@@ -855,6 +880,16 @@ def dashboard():
                 sendAction('/api/students', payload);
             }
 
+            async function deleteStudent(id) {
+                if(!confirm("WARNING: This will permanently delete the student and ALL associated grades, fees, and attendance records. Continue?")) return;
+                try {
+                    const res = await fetch('/api/students/' + id, { method: 'DELETE' });
+                    const data = await res.json();
+                    if (res.ok) { showToast(data.message); loadRoster(); }
+                    else showToast(data.error, true);
+                } catch(e) { showToast("Connection failed", true); }
+            }
+
             async function loadSchools() {
                 const res = await fetch('/api/superadmin/schools');
                 if(!res.ok) return;
@@ -916,6 +951,8 @@ def dashboard():
                         let val = row[k];
                         if (k === 'photo') {
                             html += `<td style="padding:10px; border-bottom:1px solid #ddd; width: 60px;"><img src="/api/photo/${row['student_id']}" style="width:45px; height:45px; border-radius:50%; object-fit:cover; border:2px solid #ccc; background:#eee;"></td>`;
+                        } else if (k === 'action_delete_student') {
+                            html += `<td style="padding:10px; border-bottom:1px solid #ddd;"><button class="btn btn-danger" style="padding:4px 8px; font-size:0.8rem; margin:0; width:auto;" onclick="deleteStudent(${row['student_id']})">Delete</button></td>`;
                         } else if (k === 'remaining_balance' && val > 0) {
                             html += `<td style="color:#dc3545; font-weight:bold; padding:10px; border-bottom:1px solid #ddd;">${val}</td>`;
                         } else if (k === 'boarding_status') {
@@ -934,7 +971,7 @@ def dashboard():
 
             async function loadRoster() {
                 const res = await fetch('/api/students'); const data = await res.json();
-                renderTable("Student Roster", ['Photo', 'ID', 'First Name', 'Last Name', 'Status', 'House', 'Guardian Contact'], data.data, ['photo', 'student_id', 'first_name', 'last_name', 'boarding_status', 'house', 'guardian_contact']);
+                renderTable("Student Roster", ['Photo', 'ID', 'First Name', 'Last Name', 'Status', 'House', 'Guardian Contact', 'Action'], data.data, ['photo', 'student_id', 'first_name', 'last_name', 'boarding_status', 'house', 'guardian_contact', 'action_delete_student']);
             }
             async function loadExpenses() {
                 const res = await fetch('/api/expenses'); const data = await res.json();
