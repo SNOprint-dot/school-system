@@ -415,6 +415,7 @@ def dashboard():
             .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
             .metric-box { padding: 15px; border-radius: 8px; color: white; text-align: center; }
             #toast { display: none; position: fixed; bottom: 30px; right: 30px; padding: 15px 25px; color: white; background: var(--accent); border-radius: 5px; z-index: 1000; font-weight: bold; }
+            .hidden { display: none !important; }
         </style>
     </head>
     <body>
@@ -424,16 +425,16 @@ def dashboard():
             {% if current_user.is_authenticated %}
                 <div style="font-size: 0.85rem; color: #a5c3e0; margin-bottom: 20px;">Role: <span style="text-transform: uppercase;">{{ current_user.role }}</span></div>
                 {% if current_user.role == 'superadmin' %}
-                    <button onclick="loadSchools()">🏢 Global Tenants</button>
+                    <button onclick="window.location.reload()">🏢 Global Tenants</button>
                     <button class="btn-success" onclick="sendAction('/api/setup_db', {}, true)">Sync Database</button>
                 {% elif current_user.role == 'admin' %}
-                    <button onclick="document.getElementById('analytics-section').scrollIntoView()">📊 Dashboard</button>
-                    <button onclick="document.getElementById('finance-section').scrollIntoView()">💰 Financials</button>
-                    <button onclick="document.getElementById('admissions-section').scrollIntoView()">🎓 Admissions & IDs</button>
-                    <button onclick="document.getElementById('attendance-section').scrollIntoView()">📅 Roll Call</button>
-                    <button onclick="document.getElementById('academics-section').scrollIntoView()">📚 Academics</button>
-                    <button onclick="document.getElementById('sms-section').scrollIntoView()">📟 SMS Desk</button>
-                    <button onclick="document.getElementById('hr-section').scrollIntoView()">🧑‍🏫 Staff HR</button>
+                    <button onclick="showSection('analytics-section')">📊 Dashboard</button>
+                    <button onclick="showSection('finance-section')">💰 Financials</button>
+                    <button onclick="showSection('admissions-section')">🎓 Admissions & IDs</button>
+                    <button onclick="showSection('attendance-section')">📅 Roll Call</button>
+                    <button onclick="showSection('academics-section')">📚 Academics</button>
+                    <button onclick="showSection('sms-section')">📟 SMS Desk</button>
+                    <button onclick="showSection('hr-section')">🧑‍🏫 Staff HR</button>
                 {% endif %}
                 <br><br><button class="btn-danger" onclick="logout()">Secure Logout</button>
             {% else %}
@@ -465,7 +466,8 @@ def dashboard():
 
             {% elif current_user.role == 'admin' %}
             
-            <div id="analytics-section" class="card">
+            <!-- Dashboard Section -->
+            <div id="analytics-section" class="card admin-section">
                 <h3>Corporate Analytics</h3>
                 <div class="grid-2" style="margin-bottom: 20px;">
                     <div class="metric-box" style="background: var(--primary);" id="metricRevenue">Gross Revenue: GHS 0.00</div>
@@ -478,7 +480,8 @@ def dashboard():
                 </div>
             </div>
 
-            <div id="finance-section" class="card">
+            <!-- Financials Section -->
+            <div id="finance-section" class="card admin-section hidden" style="border: 2px solid var(--danger);">
                 <h3>💰 Financial Ledger & Operations</h3>
                 <div class="grid-2">
                     <div style="background: #f8f9fa; padding: 15px; border-radius: 8px;">
@@ -522,7 +525,8 @@ def dashboard():
                 </div>
             </div>
 
-            <div id="admissions-section" class="card grid-2">
+            <!-- Admissions Section -->
+            <div id="admissions-section" class="card grid-2 admin-section hidden">
                 <div>
                     <h3>Enroll New Student</h3>
                     <div class="grid-2"><input type="text" id="sFirst" placeholder="First Name"><input type="text" id="sLast" placeholder="Last Name"></div>
@@ -545,7 +549,8 @@ def dashboard():
                 </div>
             </div>
 
-            <div id="attendance-section" class="card" style="border: 2px solid var(--info);">
+            <!-- Attendance Section -->
+            <div id="attendance-section" class="card admin-section hidden" style="border: 2px solid var(--info);">
                 <h3>📅 Daily Roll Call & Feeding Optimization</h3>
                 <div class="grid-2">
                     <div>
@@ -562,7 +567,8 @@ def dashboard():
                 </div>
             </div>
 
-            <div id="academics-section" class="card grid-2">
+            <!-- Academics Section -->
+            <div id="academics-section" class="card grid-2 admin-section hidden">
                 <div>
                     <h3>Record SBA Grade (30/70)</h3>
                     <div class="grid-2">
@@ -589,7 +595,8 @@ def dashboard():
                 </div>
             </div>
 
-            <div id="sms-section" class="card" style="border: 2px solid var(--info);">
+            <!-- SMS Desk Section -->
+            <div id="sms-section" class="card admin-section hidden" style="border: 2px solid var(--info);">
                 <h3>📟 SMS Communication Desk</h3>
                 <div class="grid-2">
                     <div>
@@ -609,7 +616,8 @@ def dashboard():
                 </div>
             </div>
 
-            <div id="hr-section" class="card grid-2">
+            <!-- Staff HR Section -->
+            <div id="hr-section" class="card grid-2 admin-section hidden">
                 <div>
                     <h3>Register Staff Profile</h3>
                     <input type="email" id="tEmail" placeholder="Teacher Email">
@@ -622,7 +630,8 @@ def dashboard():
                 </div>
             </div>
 
-            <div class="card" id="data-viewer" style="display: none; border: 2px solid var(--primary);">
+            <!-- Shared Data Viewer -->
+            <div class="card hidden" id="data-viewer" style="border: 2px solid var(--primary);">
                 <h3 id="viewer-title">Data Explorer</h3>
                 <div id="table-container"></div>
             </div>
@@ -630,6 +639,22 @@ def dashboard():
         </main>
 
         <script>
+            function showSection(sectionId) {
+                const sections = ['analytics-section', 'finance-section', 'admissions-section', 'attendance-section', 'academics-section', 'sms-section', 'hr-section'];
+                sections.forEach(id => {
+                    const el = document.getElementById(id);
+                    if(el) el.classList.add('hidden');
+                });
+                
+                const target = document.getElementById(sectionId);
+                if(target) target.classList.remove('hidden');
+                
+                const viewer = document.getElementById('data-viewer');
+                if(viewer) viewer.classList.add('hidden');
+
+                if (sectionId === 'analytics-section') loadDashboardData();
+            }
+
             function showToast(message, isError=false) {
                 const toast = document.getElementById('toast');
                 toast.innerText = message;
@@ -754,7 +779,7 @@ def dashboard():
                 const viewer = document.getElementById('data-viewer');
                 document.getElementById('viewer-title').innerText = title;
                 const container = document.getElementById('table-container');
-                if (!rows || rows.length === 0) { container.innerHTML = '<div style="padding: 20px;">No records found.</div>'; viewer.style.display = 'block'; return; }
+                if (!rows || rows.length === 0) { container.innerHTML = '<div style="padding: 20px;">No records found.</div>'; viewer.classList.remove('hidden'); return; }
                 let html = '<table style="width:100%; border-collapse: collapse;"><tr>';
                 headers.forEach(h => html += `<th style="background:#0f4c81;color:white;padding:10px;text-align:left;">${h}</th>`);
                 html += '</tr>';
@@ -774,7 +799,8 @@ def dashboard():
                     html += '</tr>';
                 });
                 container.innerHTML = html + '</table>';
-                viewer.style.display = 'block'; viewer.scrollIntoView({behavior: "smooth"});
+                viewer.classList.remove('hidden'); 
+                viewer.scrollIntoView({behavior: "smooth"});
             }
 
             async function loadRoster() {
@@ -800,6 +826,10 @@ def dashboard():
                 renderTable("Segmented Ledger", ['Fee ID', 'Category', 'Year', 'Term', 'Due', 'Paid', 'Arrears'], data.statement, ['fee_id', 'fee_category', 'academic_year', 'term', 'amount_due', 'total_paid', 'remaining_balance']);
             }
 
+            // Keep track of charts so we can destroy and redraw them without overlaps
+            let financeChartInstance = null;
+            let waecChartInstance = null;
+
             async function loadDashboardData() {
                 if (document.getElementById('attDate')) {
                     document.getElementById('attDate').value = new Date().toISOString().split('T')[0];
@@ -816,11 +846,14 @@ def dashboard():
                         document.getElementById('metricExpenses').innerText = `Total Expenses: GHS ${data.financials.expenses.toLocaleString()}`;
                         document.getElementById('metricMargin').innerText = `Net Margin: GHS ${data.financials.net_margin.toLocaleString()}`;
                         
-                        new Chart(document.getElementById('financeChart').getContext('2d'), {
+                        if (financeChartInstance) financeChartInstance.destroy();
+                        financeChartInstance = new Chart(document.getElementById('financeChart').getContext('2d'), {
                             type: 'doughnut', data: { labels: ['Revenue', 'Arrears', 'Expenses'], datasets: [{ data: [data.financials.paid, data.financials.outstanding, data.financials.expenses], backgroundColor: ['#28a745', '#ffc107', '#dc3545'], borderWidth: 0 }] }, options: { responsive: true, maintainAspectRatio: false }
                         });
+
                         const labels = data.performance.map(p => p.waec_grade); const counts = data.performance.map(p => p.count);
-                        new Chart(document.getElementById('waecChart').getContext('2d'), {
+                        if (waecChartInstance) waecChartInstance.destroy();
+                        waecChartInstance = new Chart(document.getElementById('waecChart').getContext('2d'), {
                             type: 'bar', data: { labels: labels, datasets: [{ label: 'Students', data: counts, backgroundColor: '#0f4c81' }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { title: { display: true, text: 'WAEC Grade Distribution' } } }
                         });
                     } catch(e) {}
