@@ -787,7 +787,9 @@ def dashboard():
                     html += '<tr>';
                     keys.forEach(k => {
                         let val = row[k];
-                        if (k === 'remaining_balance' && val > 0) {
+                        if (k === 'photo') {
+                            html += `<td style="padding:10px; border-bottom:1px solid #ddd; width: 60px;"><img src="/api/photo/${row['student_id']}" style="width:45px; height:45px; border-radius:50%; object-fit:cover; border:2px solid #ccc; background:#eee;"></td>`;
+                        } else if (k === 'remaining_balance' && val > 0) {
                             html += `<td style="color:#dc3545; font-weight:bold; padding:10px; border-bottom:1px solid #ddd;">${val}</td>`;
                         } else if (k === 'boarding_status') {
                             let badge = val === 'Boarding' ? 'background:#0f4c81;color:white;' : 'background:#eee;color:black;';
@@ -805,7 +807,7 @@ def dashboard():
 
             async function loadRoster() {
                 const res = await fetch('/api/students'); const data = await res.json();
-                renderTable("Student Roster", ['ID', 'First Name', 'Last Name', 'Status', 'House', 'Guardian Contact'], data.data, ['student_id', 'first_name', 'last_name', 'boarding_status', 'house', 'guardian_contact']);
+                renderTable("Student Roster", ['Photo', 'ID', 'First Name', 'Last Name', 'Status', 'House', 'Guardian Contact'], data.data, ['photo', 'student_id', 'first_name', 'last_name', 'boarding_status', 'house', 'guardian_contact']);
             }
             async function loadExpenses() {
                 const res = await fetch('/api/expenses'); const data = await res.json();
@@ -826,7 +828,6 @@ def dashboard():
                 renderTable("Segmented Ledger", ['Fee ID', 'Category', 'Year', 'Term', 'Due', 'Paid', 'Arrears'], data.statement, ['fee_id', 'fee_category', 'academic_year', 'term', 'amount_due', 'total_paid', 'remaining_balance']);
             }
 
-            // Keep track of charts so we can destroy and redraw them without overlaps
             let financeChartInstance = null;
             let waecChartInstance = null;
 
