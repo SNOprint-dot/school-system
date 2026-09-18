@@ -84,28 +84,42 @@ def require_active_subscription(f):
         return f(*args, **kwargs)
     return decorated_function
 
-# --- SETUP & BACKUP ---
-@app.route('/api/setup_db')
-def setup_db():
-    conn = get_db_connection(); cur = conn.cursor()
+# --- CORE DATABASE ENGINE ---
+def initialize_database():
+    conn = get_db_connection()
+    cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS institutions (school_id SERIAL PRIMARY KEY, school_name VARCHAR(150) NOT NULL UNIQUE, subscription_expiry_date DATE NOT NULL)")
     cur.execute("CREATE TABLE IF NOT EXISTS students (student_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, first_name VARCHAR(100) NOT NULL, last_name VARCHAR(100) NOT NULL, guardian_name VARCHAR(100) NOT NULL, guardian_contact VARCHAR(20) NOT NULL, enrollment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    
     cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS boarding_status VARCHAR(20) DEFAULT 'Day'")
     cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS house VARCHAR(100) DEFAULT 'Unassigned'")
     cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS photo_key VARCHAR(255)")
+    
     cur.execute("CREATE TABLE IF NOT EXISTS system_users (user_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, email VARCHAR(100) UNIQUE NOT NULL, password_hash VARCHAR(255) NOT NULL, role VARCHAR(20) NOT NULL, linked_student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE)")
     cur.execute("CREATE TABLE IF NOT EXISTS subjects (subject_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, subject_name VARCHAR(100) NOT NULL)")
     cur.execute("CREATE TABLE IF NOT EXISTS grades (grade_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, subject_id INTEGER REFERENCES subjects(subject_id) ON DELETE CASCADE, class_score INTEGER NOT NULL, exam_score INTEGER NOT NULL, total_score INTEGER NOT NULL, waec_grade VARCHAR(2) NOT NULL, academic_year VARCHAR(9) NOT NULL, term VARCHAR(20) NOT NULL, teacher_remarks VARCHAR(255))")
-    cur.execute("CREATE TABLE IF NOT EXISTS fees (fee_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, fee_category VARCHAR(50) NOT NULL, description VARCHAR(255) NOT NULL, amount_due DECIMAL(10, 2) NOT NULL, academic_year VARCHAR(9) NOT NULL, term VARCHAR(20) NOT NULL, date_issued TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    
+    cur.execute("CREATE TABLE IF NOT EXISTS fees (fee_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, description VARCHAR(255) NOT NULL, amount_due DECIMAL(10, 2) NOT NULL, date_issued TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    cur.execute("ALTER TABLE fees ADD COLUMN IF NOT EXISTS fee_category VARCHAR(50) DEFAULT 'General'")
+    cur.execute("ALTER TABLE fees ADD COLUMN IF NOT EXISTS academic_year VARCHAR(9) DEFAULT 'Unknown'")
+    cur.execute("ALTER TABLE fees ADD COLUMN IF NOT EXISTS term VARCHAR(20) DEFAULT 'Unknown'")
+
     cur.execute("CREATE TABLE IF NOT EXISTS payments (payment_id SERIAL PRIMARY KEY, fee_id INTEGER REFERENCES fees(fee_id) ON DELETE CASCADE, amount_paid DECIMAL(10, 2) NOT NULL, payment_method VARCHAR(50) NOT NULL, payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cur.execute("CREATE TABLE IF NOT EXISTS expenses (expense_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, category VARCHAR(50) NOT NULL, description VARCHAR(255) NOT NULL, amount DECIMAL(10, 2) NOT NULL, date_incurred TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cur.execute("CREATE TABLE IF NOT EXISTS attendance (attendance_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, record_date DATE NOT NULL, status VARCHAR(20) NOT NULL, UNIQUE(student_id, record_date))")
+    
     cur.execute("SELECT * FROM system_users WHERE role = 'superadmin'")
     if not cur.fetchone():
         hashed_sa = generate_password_hash('ceo123')
         cur.execute("INSERT INTO system_users (email, password_hash, role) VALUES (%s, %s, %s)", ('superadmin@engine.com', hashed_sa, 'superadmin'))
-    conn.commit(); cur.close(); conn.close()
-    return jsonify({"message": "Multi-Tenant SaaS Engine Ready!"})
+    conn.commit()
+    cur.close()
+    conn.close()
+
+@app.route('/api/setup_db')
+def setup_db():
+    initialize_database()
+    return jsonify({"message": "Multi-Tenant SaaS Engine Ready! Database patched."})
 
 def automated_weekly_backup():
     if not AWS_BUCKET_NAME: return
@@ -313,7 +327,6 @@ def log_attendance():
     except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
     finally: cur.close(); conn.close()
 
-# --- UPGRADED DATABASE VALIDATION ENGINE ---
 @app.route('/api/fees/bill', methods=['POST'])
 @login_required
 def bill_student():
@@ -324,12 +337,10 @@ def bill_student():
         student_id = int(d.get('student_id') or 0)
         amount_due = float(d.get('amount_due') or 0.0)
 
-        # Pre-check: Does this student actually exist?
         cur.execute("SELECT student_id FROM students WHERE student_id = %s AND school_id = %s", (student_id, current_user.school_id))
         if not cur.fetchone():
             return jsonify({"error": f"Student ID {student_id} does not exist! Please check the Digital Directory."}), 404
 
-        # Enforce strict string limits matching PostgreSQL constraints
         academic_year = str(d.get('academic_year') or '')[:9]
         term = str(d.get('term') or '')[:20]
         desc = str(d.get('description') or '')[:250]
@@ -982,6 +993,14 @@ def dashboard():
     </html>
     """
     return render_template_string(html_template, current_user=current_user)
+
+# --- AUTOMATIC BOOT SEQUENCE ---
+with app.app_context():
+    try:
+        initialize_database()
+        print("SaaS Database Engine synchronized successfully on boot.")
+    except Exception as e:
+        print(f"Boot synchronization skipped (Database may be asleep): {e}")
 
 if __name__ == '__main__':
     app.run(debug=False, host='0.0.0.0', port=5000)
