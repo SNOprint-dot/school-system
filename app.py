@@ -6,6 +6,7 @@ import decimal
 import boto3
 import base64
 import uuid
+import requests
 from io import StringIO
 from functools import wraps
 from datetime import datetime, date
@@ -374,10 +375,70 @@ def get_statement(student_id):
     cur.execute(query, (student_id, current_user.school_id))
     statement = cur.fetchall(); cur.close(); conn.close(); return jsonify({"statement": statement}), 200
 
+# --- LIVE SMS GATEWAY INTEGRATION ---
 @app.route('/api/sms/blast', methods=['POST'])
 @login_required
 def send_sms_blast():
-    return jsonify({"message": "SMS Simulation: Dispatched to selected audience successfully."})
+    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
+    data = request.get_json()
+    audience = data.get('audience')
+    message = data.get('message')
+
+    if not message:
+        return jsonify({"error": "Message body cannot be empty."}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # Route filtering based on Admin selection
+    if audience == 'all':
+        cur.execute("SELECT DISTINCT guardian_contact FROM students WHERE school_id = %s AND guardian_contact IS NOT NULL", (current_user.school_id,))
+    elif audience == 'arrears':
+        cur.execute("""
+            SELECT DISTINCT s.guardian_contact
+            FROM students s
+            JOIN fees f ON s.student_id = f.student_id
+            LEFT JOIN payments p ON f.fee_id = p.fee_id
+            WHERE s.school_id = %s AND s.guardian_contact IS NOT NULL
+            GROUP BY s.guardian_contact, f.fee_id, f.amount_due
+            HAVING (f.amount_due - COALESCE(SUM(p.amount_paid), 0)) > 0
+        """, (current_user.school_id,))
+    elif audience == 'boarding':
+        cur.execute("SELECT DISTINCT guardian_contact FROM students WHERE school_id = %s AND boarding_status = 'Boarding' AND guardian_contact IS NOT NULL", (current_user.school_id,))
+    
+    raw_contacts = cur.fetchall()
+    cur.close(); conn.close()
+
+    contacts = [row['guardian_contact'].strip() for row in raw_contacts if row['guardian_contact']]
+
+    if not contacts:
+        return jsonify({"error": "No valid phone numbers found for this audience."}), 404
+
+    # The Live Dispatch Logic
+    SMS_API_KEY = os.environ.get('SMS_API_KEY')
+    SMS_SENDER_ID = os.environ.get('SMS_SENDER_ID', 'SMS_ADMIN') # Must be 11 characters max
+
+    if SMS_API_KEY:
+        try:
+            # Using Arkesel API v2 Standard as the core gateway
+            url = "https://sms.arkesel.com/api/v2/sms/send"
+            headers = {"api-key": SMS_API_KEY}
+            payload = {
+                "sender": SMS_SENDER_ID,
+                "message": message,
+                "recipients": contacts
+            }
+            response = requests.post(url, json=payload, headers=headers)
+            
+            if response.status_code in [200, 201]:
+                return jsonify({"message": f"Live SMS Blast sent successfully to {len(contacts)} parents!"}), 200
+            else:
+                return jsonify({"error": "Telecom Gateway rejected the request. Verify your API Key."}), 500
+        except Exception as e:
+            return jsonify({"error": f"Connection to Telecom Server failed: {str(e)}"}), 500
+    else:
+        # Fallback Simulation Mode if no API key is provided
+        return jsonify({"message": f"[SIMULATION] SMS processed for {len(contacts)} parents. Add SMS_API_KEY to Render to go live."}), 200
 
 @app.route('/api/register_staff', methods=['POST'])
 @login_required
