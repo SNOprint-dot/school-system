@@ -89,10 +89,12 @@ def initialize_database():
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS institutions (school_id SERIAL PRIMARY KEY, school_name VARCHAR(150) NOT NULL UNIQUE, subscription_expiry_date DATE NOT NULL)")
-    
-    # New Institution Profile Fields
     cur.execute("ALTER TABLE institutions ADD COLUMN IF NOT EXISTS address VARCHAR(255) DEFAULT 'Ghana'")
     cur.execute("ALTER TABLE institutions ADD COLUMN IF NOT EXISTS phone VARCHAR(50) DEFAULT '0000000000'")
+    
+    # NEW: White-Label Branding Fields
+    cur.execute("ALTER TABLE institutions ADD COLUMN IF NOT EXISTS primary_color VARCHAR(20) DEFAULT '#0f4c81'")
+    cur.execute("ALTER TABLE institutions ADD COLUMN IF NOT EXISTS logo_key VARCHAR(255)")
     
     cur.execute("CREATE TABLE IF NOT EXISTS students (student_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, first_name VARCHAR(100) NOT NULL, last_name VARCHAR(100) NOT NULL, guardian_name VARCHAR(100) NOT NULL, guardian_contact VARCHAR(20) NOT NULL, enrollment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS boarding_status VARCHAR(20) DEFAULT 'Day'")
@@ -175,7 +177,7 @@ def logout():
 def get_schools():
     if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
     conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT school_id, school_name, TO_CHAR(subscription_expiry_date, 'YYYY-MM-DD') as expiry_date, CASE WHEN subscription_expiry_date >= CURRENT_DATE THEN 'Active' ELSE 'Expired' END as status FROM institutions ORDER BY school_id")
+    cur.execute("SELECT school_id, school_name, primary_color, TO_CHAR(subscription_expiry_date, 'YYYY-MM-DD') as expiry_date, CASE WHEN subscription_expiry_date >= CURRENT_DATE THEN 'Active' ELSE 'Expired' END as status FROM institutions ORDER BY school_id")
     schools = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": schools})
 
 @app.route('/api/superadmin/onboard', methods=['POST'])
@@ -190,6 +192,38 @@ def onboard_school():
         conn.commit(); return jsonify({"message": f"Onboarded {data.get('school_name')}!"}), 201
     except psycopg2.IntegrityError: conn.rollback(); return jsonify({"error": "School name or Admin email already exists!"}), 409
     finally: cur.close(); conn.close()
+
+# NEW: Tenant Branding API
+@app.route('/api/superadmin/branding/<int:school_id>', methods=['POST'])
+@login_required
+def update_branding(school_id):
+    if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
+    d = request.get_json()
+    color = d.get('color') or '#0f4c81'
+    logo_b64 = d.get('logo_b64')
+    
+    conn = get_db_connection(); cur = conn.cursor()
+    if logo_b64 and AWS_BUCKET_NAME:
+        try:
+            if ',' in logo_b64: logo_b64 = logo_b64.split(',')[1]
+            logo_key = f"school_logos/{school_id}/{uuid.uuid4().hex}.png"
+            s3_client.put_object(Bucket=AWS_BUCKET_NAME, Key=logo_key, Body=base64.b64decode(logo_b64), ContentType='image/png')
+            cur.execute("UPDATE institutions SET primary_color = %s, logo_key = %s WHERE school_id = %s", (color, logo_key, school_id))
+        except Exception: pass
+    else:
+        cur.execute("UPDATE institutions SET primary_color = %s WHERE school_id = %s", (color, school_id))
+    
+    conn.commit(); cur.close(); conn.close()
+    return jsonify({"message": "School branding & colors updated successfully!"})
+
+@app.route('/api/superadmin/renew/<int:school_id>', methods=['POST'])
+@login_required
+def renew_school(school_id):
+    if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("UPDATE institutions SET subscription_expiry_date = CURRENT_DATE + INTERVAL '1 year' WHERE school_id = %s RETURNING school_name, subscription_expiry_date", (school_id,))
+    updated = cur.fetchone(); conn.commit(); cur.close(); conn.close()
+    return jsonify({"message": f"Contract Renewed! {updated['school_name']} active until {updated['subscription_expiry_date']}"})
 
 @app.route('/api/superadmin/backup/<int:school_id>', methods=['GET'])
 @login_required
@@ -270,7 +304,6 @@ def manage_students():
 def update_delete_student(student_id):
     if current_user.role != 'admin': return jsonify({"error": "Admin clearance required."}), 403
     conn = get_db_connection(); cur = conn.cursor()
-    
     if request.method == 'PUT':
         d = request.get_json()
         try:
@@ -279,18 +312,15 @@ def update_delete_student(student_id):
                 SET first_name = %s, last_name = %s, current_class = %s, boarding_status = %s, house = %s, guardian_contact = %s 
                 WHERE student_id = %s AND school_id = %s
             """, (d.get('first_name'), d.get('last_name'), d.get('current_class'), d.get('boarding_status'), d.get('house'), d.get('guardian_contact'), student_id, current_user.school_id))
-            conn.commit()
-            return jsonify({"message": f"Student ID {student_id} updated successfully."}), 200
+            conn.commit(); return jsonify({"message": f"Student ID {student_id} updated successfully."}), 200
         except Exception as e:
             conn.rollback(); return jsonify({"error": f"Update failed: {str(e)}"}), 500
         finally: cur.close(); conn.close()
-
     elif request.method == 'DELETE':
         try:
             cur.execute("SELECT photo_key FROM students WHERE student_id = %s AND school_id = %s", (student_id, current_user.school_id))
             student = cur.fetchone()
             if not student: return jsonify({"error": "Student record not found."}), 404
-            
             cur.execute("DELETE FROM students WHERE student_id = %s AND school_id = %s", (student_id, current_user.school_id))
             conn.commit()
             if student['photo_key'] and AWS_BUCKET_NAME:
@@ -309,10 +339,8 @@ def bulk_enroll():
     file = request.files['file']
     try:
         stream = StringIO(file.stream.read().decode("UTF8"), newline=None)
-        csv_input = csv.reader(stream)
-        next(csv_input, None) 
-        conn = get_db_connection()
-        cur = conn.cursor()
+        csv_input = csv.reader(stream); next(csv_input, None) 
+        conn = get_db_connection(); cur = conn.cursor()
         count = 0
         for row in csv_input:
             if len(row) >= 2: 
@@ -327,10 +355,8 @@ def bulk_enroll():
                 cur.execute("INSERT INTO students (school_id, first_name, last_name, current_class, guardian_name, guardian_contact, boarding_status, house) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                             (current_user.school_id, fname, lname, c_class, g_name, g_contact, b_status, house))
                 count += 1
-        conn.commit()
-        return jsonify({"message": f"Bulk Upload Success! Enrolled {count} students."}), 201
-    except Exception as e:
-        return jsonify({"error": f"Upload failed. Ensure CSV format is correct. Error: {str(e)}"}), 500
+        conn.commit(); return jsonify({"message": f"Bulk Upload Success! Enrolled {count} students."}), 201
+    except Exception as e: return jsonify({"error": f"Upload failed. Ensure CSV format is correct. Error: {str(e)}"}), 500
     finally:
         if 'cur' in locals(): cur.close(); conn.close()
 
@@ -341,18 +367,15 @@ def promote_students():
     d = request.get_json()
     from_class = str(d.get('from_class') or '').strip()
     to_class = str(d.get('to_class') or '').strip()
-    if not from_class or not to_class: 
-        return jsonify({"error": "You must provide both Current and Next class names."}), 400
+    if not from_class or not to_class: return jsonify({"error": "You must provide both Current and Next class names."}), 400
     conn = get_db_connection(); cur = conn.cursor()
     try:
         cur.execute("UPDATE students SET current_class = %s WHERE current_class = %s AND school_id = %s RETURNING student_id", (to_class, from_class, current_user.school_id))
         promoted = cur.fetchall()
-        conn.commit()
-        return jsonify({"message": f"Success! Promoted {len(promoted)} students from {from_class} to {to_class}."}), 200
+        conn.commit(); return jsonify({"message": f"Success! Promoted {len(promoted)} students from {from_class} to {to_class}."}), 200
     except Exception as e:
         conn.rollback(); return jsonify({"error": f"Database Error: {str(e)}"}), 500
-    finally:
-        cur.close(); conn.close()
+    finally: cur.close(); conn.close()
 
 @app.route('/api/photo/<int:student_id>', methods=['GET'])
 def get_photo(student_id):
@@ -366,6 +389,19 @@ def get_photo(student_id):
         except Exception: pass
     return Response('<svg xmlns="http://www.w3.org/2000/svg" width="70" height="90"><rect width="70" height="90" fill="#eee"/><text x="15" y="50" font-family="Arial" font-size="12" fill="#999">PHOTO</text></svg>', mimetype='image/svg+xml')
 
+@app.route('/api/logo/<int:school_id>', methods=['GET'])
+def get_school_logo(school_id):
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT logo_key FROM institutions WHERE school_id = %s", (school_id,))
+    inst = cur.fetchone(); cur.close(); conn.close()
+    if inst and inst['logo_key'] and AWS_BUCKET_NAME:
+        try:
+            file_obj = s3_client.get_object(Bucket=AWS_BUCKET_NAME, Key=inst['logo_key'])
+            return Response(file_obj['Body'].read(), mimetype='image/png')
+        except Exception: pass
+    svg = '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="background:var(--primary); padding:10px; border-radius:12px;"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>'
+    return Response(svg, mimetype='image/svg+xml')
+
 @app.route('/print_ids', methods=['GET'])
 @login_required
 def print_ids():
@@ -375,7 +411,7 @@ def print_ids():
     cur.execute("SELECT school_name, address, phone FROM institutions WHERE school_id = %s", (current_user.school_id,))
     inst = cur.fetchone(); cur.close(); conn.close()
     
-    html = f"<!DOCTYPE html><html><head><title>Print IDs</title><style>body{{font-family:Arial;background:#f0f0f0;padding:20px;}}.page{{display:grid;grid-template-columns:repeat(2,1fr);gap:15px;max-width:800px;margin:auto;}}.id-card{{background:white;border:2px solid #0f4c81;border-radius:8px;padding:15px;width:350px;height:200px;box-sizing:border-box;position:relative;overflow:hidden;}}.header{{background:#0f4c81;color:white;text-align:center;padding:5px;margin:-15px -15px 10px -15px;border-radius:6px 6px 0 0;font-weight:bold;font-size:14px;}}.photo-box{{width:70px;height:90px;border:1px solid #ccc;float:left;margin-right:15px;background:#eee;}}.details{{float:left;font-size:12px;line-height:1.6;width:calc(100% - 90px);}}.footer{{position:absolute;bottom:0;left:0;width:100%;background:#eee;text-align:center;font-size:10px;padding:5px 0;font-weight:bold;}}@media print{{body{{background:white;padding:0;}}.no-print{{display:none;}}}}</style></head><body><button class='no-print' onclick='window.print()' style='padding:10px;margin-bottom:20px;cursor:pointer;'>🖨️ Print IDs</button><div class='page'>"
+    html = f"<!DOCTYPE html><html><head><title>Print IDs</title><style>body{{font-family:Arial;background:#f0f0f0;padding:20px;}}.page{{display:grid;grid-template-columns:repeat(2,1fr);gap:15px;max-width:800px;margin:auto;}}.id-card{{background:white;border:2px solid var(--primary, #0f4c81);border-radius:8px;padding:15px;width:350px;height:200px;box-sizing:border-box;position:relative;overflow:hidden;}}.header{{background:var(--primary, #0f4c81);color:white;text-align:center;padding:5px;margin:-15px -15px 10px -15px;border-radius:6px 6px 0 0;font-weight:bold;font-size:14px;}}.photo-box{{width:70px;height:90px;border:1px solid #ccc;float:left;margin-right:15px;background:#eee;}}.details{{float:left;font-size:12px;line-height:1.6;width:calc(100% - 90px);}}.footer{{position:absolute;bottom:0;left:0;width:100%;background:#eee;text-align:center;font-size:10px;padding:5px 0;font-weight:bold;}}@media print{{body{{background:white;padding:0;}}.no-print{{display:none;}}}}</style></head><body><button class='no-print' onclick='window.print()' style='padding:10px;margin-bottom:20px;cursor:pointer;'>🖨️ Print IDs</button><div class='page'>"
     for s in students:
         class_str = s.get('current_class') if s.get('current_class') and s.get('current_class') != 'Unassigned' else 'N/A'
         html += f"<div class='id-card'><div class='header'>{inst['school_name']}</div><div class='photo-box'><img src='/api/photo/{s['student_id']}' style='width:100%;height:100%;object-fit:cover;'></div><div class='details'><strong>Name:</strong> {s['first_name']} {s['last_name']}<br><strong>ID:</strong> {inst['school_name'][:3].upper()}-{s['student_id']:04d}<br><strong>Class/Prog:</strong> {class_str}<br><strong>Status:</strong> {s['boarding_status']}</div><div class='footer'>CONTACT: {inst['phone']} | {inst['address']}</div></div>"
@@ -439,8 +475,9 @@ def print_report(student_id):
     student = cur.fetchone()
     if not student: return "Student record not found or access denied.", 404
     
-    cur.execute("SELECT school_name, address, phone FROM institutions WHERE school_id = %s", (current_user.school_id,))
+    cur.execute("SELECT school_name, address, phone, primary_color FROM institutions WHERE school_id = %s", (current_user.school_id,))
     inst = cur.fetchone()
+    primary_color = inst['primary_color'] or '#0f4c81'
     
     cur.execute("SELECT sub.subject_name, g.class_score, g.exam_score, g.total_score, g.waec_grade, g.teacher_remarks, g.term, g.academic_year FROM grades g JOIN subjects sub ON g.subject_id = sub.subject_id WHERE g.student_id = %s AND g.school_id = %s ORDER BY g.academic_year DESC, g.term DESC, sub.subject_name", (student_id, current_user.school_id))
     grades = cur.fetchall(); cur.close(); conn.close()
@@ -454,35 +491,41 @@ def print_report(student_id):
     html = f"""
     <!DOCTYPE html><html><head><title>Terminal Report | {student['first_name']} {student['last_name']}</title>
     <style>
+        :root {{ --primary: {primary_color}; }}
         body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #eee; padding: 20px; color: #333; }}
         .page {{ background: white; max-width: 900px; margin: auto; padding: 40px; box-shadow: 0 0 15px rgba(0,0,0,0.1); border-radius: 8px; }}
-        .header {{ display: flex; justify-content: space-between; border-bottom: 3px solid #0f4c81; padding-bottom: 20px; margin-bottom: 30px; }}
-        .school-name {{ color: #0f4c81; font-size: 28px; font-weight: bold; margin: 0 0 5px 0; text-transform: uppercase; }}
+        .header {{ display: flex; justify-content: space-between; border-bottom: 3px solid var(--primary); padding-bottom: 20px; margin-bottom: 30px; }}
+        .school-name {{ color: var(--primary); font-size: 28px; font-weight: bold; margin: 0 0 5px 0; text-transform: uppercase; }}
         .student-details {{ font-size: 16px; line-height: 1.8; margin-top: 15px; }}
-        .photo {{ width: 120px; height: 140px; border: 2px solid #0f4c81; object-fit: cover; border-radius: 5px; }}
+        .photo {{ width: 120px; height: 140px; border: 2px solid var(--primary); object-fit: cover; border-radius: 5px; }}
         table {{ width: 100%; border-collapse: collapse; margin-bottom: 40px; }}
         th, td {{ border: 1px solid #ddd; padding: 12px; text-align: left; font-size: 14px; }}
-        th {{ background: #0f4c81; color: white; text-transform: uppercase; font-size: 13px; }}
+        th {{ background: var(--primary); color: white; text-transform: uppercase; font-size: 13px; }}
         tr:nth-child(even) {{ background-color: #f9f9f9; }}
         .signatures {{ display: flex; justify-content: space-between; margin-top: 80px; padding: 0 20px; }}
         .sig-line {{ border-top: 2px solid #333; width: 250px; text-align: center; padding-top: 10px; font-weight: bold; font-size: 14px; text-transform: uppercase; }}
-        .btn-print {{ padding:12px 25px; margin-bottom:20px; cursor:pointer; background:#28a745; color:white; border:none; border-radius:5px; font-weight:bold; font-size: 16px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+        .btn-print {{ padding:12px 25px; margin-bottom:20px; cursor:pointer; background:#28a745; color:white; border:none; border-radius:8px; font-weight:bold; font-size: 16px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
         @media print {{ body {{ background: white; padding: 0; }} .page {{ box-shadow: none; max-width: 100%; padding: 0; }} .no-print {{ display: none; }} }}
     </style>
     </head><body>
     <div style="text-align: center;"><button class="no-print btn-print" onclick="window.print()">🖨️ Print Official Report</button></div>
     <div class="page">
         <div class="header">
-            <div>
-                <h1 class="school-name">{inst['school_name']}</h1>
-                <div style="font-size:12px; color:#666; margin-bottom:15px;">{inst['address']} | Tel: {inst['phone']}</div>
-                <h2 style="margin: 0 0 10px 0; color: #555;">OFFICIAL TERMINAL REPORT</h2>
-                <div class="student-details">
-                    <strong>STUDENT NAME:</strong> {student['first_name'].upper()} {student['last_name'].upper()}<br>
-                    <strong>STUDENT ID:</strong> {inst['school_name'][:3].upper()}-{student['student_id']:04d}<br>
-                    <strong>CURRENT CLASS:</strong> {student['current_class'].upper()}<br>
-                    <strong>BOARDING STATUS:</strong> {student['boarding_status'].upper()}
+            <div style="display:flex; gap: 20px;">
+                <img src="/api/logo/{current_user.school_id}" style="width:90px; height:90px; object-fit:contain;">
+                <div>
+                    <h1 class="school-name">{inst['school_name']}</h1>
+                    <div style="font-size:12px; color:#666; margin-bottom:15px;">{inst['address']} | Tel: {inst['phone']}</div>
+                    <h2 style="margin: 0 0 10px 0; color: #555;">OFFICIAL TERMINAL REPORT</h2>
                 </div>
+            </div>
+        </div>
+        <div style="display:flex; justify-content: space-between; align-items: flex-end; margin-bottom: 25px;">
+            <div class="student-details">
+                <strong>STUDENT NAME:</strong> {student['first_name'].upper()} {student['last_name'].upper()}<br>
+                <strong>STUDENT ID:</strong> {inst['school_name'][:3].upper()}-{student['student_id']:04d}<br>
+                <strong>CURRENT CLASS:</strong> {student['current_class'].upper()}<br>
+                <strong>BOARDING STATUS:</strong> {student['boarding_status'].upper()}
             </div>
             <img src="/api/photo/{student['student_id']}" class="photo">
         </div>
@@ -520,8 +563,7 @@ def bulk_bill():
     desc = str(d.get('description') or '').strip()[:250]
     fee_cat = str(d.get('fee_category') or 'General')[:50]
     
-    if not target_class or amount_due <= 0:
-        return jsonify({"error": "Class and Amount Due are required."}), 400
+    if not target_class or amount_due <= 0: return jsonify({"error": "Class and Amount Due are required."}), 400
 
     conn = get_db_connection(); cur = conn.cursor()
     try:
@@ -531,27 +573,23 @@ def bulk_bill():
             WHERE current_class = %s AND school_id = %s
             RETURNING fee_id
         """, (fee_cat, desc, amount_due, academic_year, term, target_class, current_user.school_id))
-        billed = cur.fetchall()
-        conn.commit()
+        billed = cur.fetchall(); conn.commit()
         return jsonify({"message": f"Bulk Bill issued successfully to {len(billed)} students in {target_class}!"}), 201
     except Exception as e:
         conn.rollback(); return jsonify({"error": f"Database Error: {str(e)}"}), 400
-    finally:
-        cur.close(); conn.close()
+    finally: cur.close(); conn.close()
 
 @app.route('/api/fees/bill', methods=['POST'])
 @login_required
 def bill_student():
     d = request.get_json()
-    conn = get_db_connection()
-    cur = conn.cursor()
+    conn = get_db_connection(); cur = conn.cursor()
     try:
         student_id = int(d.get('student_id') or 0)
         amount_due = float(d.get('amount_due') or 0.0)
 
         cur.execute("SELECT student_id FROM students WHERE student_id = %s AND school_id = %s", (student_id, current_user.school_id))
-        if not cur.fetchone():
-            return jsonify({"error": f"Student ID {student_id} does not exist! Please check the Digital Directory."}), 404
+        if not cur.fetchone(): return jsonify({"error": f"Student ID {student_id} does not exist! Please check the Digital Directory."}), 404
 
         academic_year = str(d.get('academic_year') or '')[:9]
         term = str(d.get('term') or '')[:20]
@@ -559,16 +597,10 @@ def bill_student():
 
         cur.execute("INSERT INTO fees (school_id, student_id, fee_category, description, amount_due, academic_year, term) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING fee_id", 
                     (current_user.school_id, student_id, d.get('fee_category'), desc, amount_due, academic_year, term))
-        conn.commit()
-        return jsonify({"message": "Bill issued successfully!"}), 201
-    except ValueError:
-        return jsonify({"error": "Student ID and Amount Due must be numbers!"}), 400
-    except Exception as e:
-        conn.rollback()
-        return jsonify({"error": f"Database Error: {str(e)}"}), 400
-    finally:
-        cur.close()
-        conn.close()
+        conn.commit(); return jsonify({"message": "Bill issued successfully!"}), 201
+    except ValueError: return jsonify({"error": "Student ID and Amount Due must be numbers!"}), 400
+    except Exception as e: conn.rollback(); return jsonify({"error": f"Database Error: {str(e)}"}), 400
+    finally: cur.close(); conn.close()
 
 @app.route('/api/fees/<int:fee_id>', methods=['DELETE'])
 @login_required
@@ -589,34 +621,25 @@ def reverse_bill(fee_id):
 @login_required
 def log_payment():
     d = request.get_json()
-    conn = get_db_connection()
-    cur = conn.cursor()
+    conn = get_db_connection(); cur = conn.cursor()
     try:
         fee_id = int(d.get('fee_id') or 0)
         amount_paid = float(d.get('amount_paid') or 0.0)
 
         cur.execute("SELECT fee_id FROM fees WHERE fee_id = %s AND school_id = %s", (fee_id, current_user.school_id))
-        if not cur.fetchone():
-            return jsonify({"error": f"Fee ID {fee_id} does not exist! Check the Statement."}), 404
+        if not cur.fetchone(): return jsonify({"error": f"Fee ID {fee_id} does not exist! Check the Statement."}), 404
 
         cur.execute("INSERT INTO payments (fee_id, amount_paid, payment_method) VALUES (%s, %s, %s)", 
                     (fee_id, amount_paid, d.get('payment_method')))
-        conn.commit()
-        return jsonify({"message": "Payment logged securely!"}), 201
-    except ValueError:
-        return jsonify({"error": "Fee ID and Amount Paid must be numbers!"}), 400
-    except Exception as e:
-        conn.rollback()
-        return jsonify({"error": f"Database Error: {str(e)}"}), 400
-    finally:
-        cur.close()
-        conn.close()
+        conn.commit(); return jsonify({"message": "Payment logged securely!"}), 201
+    except ValueError: return jsonify({"error": "Fee ID and Amount Paid must be numbers!"}), 400
+    except Exception as e: conn.rollback(); return jsonify({"error": f"Database Error: {str(e)}"}), 400
+    finally: cur.close(); conn.close()
 
 @app.route('/api/debtors', methods=['GET'])
 @login_required
 def get_debtors():
-    conn = get_db_connection()
-    cur = conn.cursor()
+    conn = get_db_connection(); cur = conn.cursor()
     query = """
         SELECT s.student_id, s.first_name, s.last_name, s.guardian_contact,
                (SUM(f.amount_due) - COALESCE((SELECT SUM(amount_paid) FROM payments p JOIN fees f2 ON p.fee_id = f2.fee_id WHERE f2.student_id = s.student_id), 0)) as arrears
@@ -628,8 +651,7 @@ def get_debtors():
         ORDER BY arrears DESC
     """
     cur.execute(query, (current_user.school_id,))
-    debtors = cur.fetchall()
-    cur.close(); conn.close()
+    debtors = cur.fetchall(); cur.close(); conn.close()
     return jsonify({"data": debtors})
 
 @app.route('/api/statement/<int:student_id>', methods=['GET'])
@@ -789,107 +811,179 @@ def update_settings():
         conn.rollback(); return jsonify({"error": str(e)}), 500
     finally: cur.close(); conn.close()
 
-# --- 8. THE FRONTEND DASHBOARD ---
+# --- 8. THE FRONTEND DASHBOARD WITH BRANDING ENGINE ---
 @app.route('/dashboard')
 def dashboard():
+    # Tenant Branding Variable Fetcher
+    school_name = "Global ERP Engine"
+    primary_color = "#0f4c81"
+    
+    if current_user.is_authenticated and current_user.school_id:
+        conn = get_db_connection(); cur = conn.cursor()
+        cur.execute("SELECT school_name, primary_color FROM institutions WHERE school_id = %s", (current_user.school_id,))
+        inst = cur.fetchone(); cur.close(); conn.close()
+        if inst:
+            school_name = inst['school_name']
+            primary_color = inst['primary_color'] or "#0f4c81"
+
     html_template = """
     <!DOCTYPE html>
     <html lang="en">
     <head>
-        <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Ghana SMS | ERP</title>
+        <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{{ school_name }} | ERP Portal</title>
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
-            :root { --primary: #0f4c81; --secondary: #f4f7f6; --accent: #28a745; --text: #333; --danger: #dc3545; --info: #17a2b8; --warning: #ffc107;}
+            :root { --primary: {{ primary_color }}; --secondary: #f4f7fa; --accent: #28a745; --text: #333; --danger: #dc3545; --info: #17a2b8; --warning: #ffc107;}
             body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--secondary); margin: 0; display: flex; color: var(--text); }
-            .sidebar { width: 250px; background: var(--primary); color: white; min-height: 100vh; padding: 20px; box-sizing: border-box; position: fixed; overflow-y: auto;}
-            .sidebar h2 { margin-top: 0; border-bottom: 1px solid rgba(255,255,255,0.2); padding-bottom: 10px; font-size: 1.2rem; }
-            .sidebar button { background: rgba(255,255,255,0.1); color: white; border: none; padding: 12px; width: 100%; text-align: left; margin-bottom: 5px; border-radius: 4px; cursor: pointer; transition: 0.3s; }
-            .sidebar button:hover { background: rgba(255,255,255,0.2); }
-            .main-content { margin-left: 250px; flex: 1; padding: 40px; box-sizing: border-box; min-height: 100vh; }
-            .card { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 20px; }
-            h3 { margin-top: 0; color: var(--primary); border-bottom: 2px solid #eee; padding-bottom: 8px;}
-            input, select, textarea { width: 100%; padding: 10px; margin-bottom: 15px; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box;}
-            .btn { background: var(--primary); color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-weight: bold; width: 100%; margin-bottom: 10px;}
+            
+            .sidebar { width: 260px; background: var(--primary); color: white; min-height: 100vh; padding: 20px; box-sizing: border-box; position: fixed; overflow-y: auto; box-shadow: 2px 0 15px rgba(0,0,0,0.1); z-index: 100;}
+            .sidebar-header { margin-bottom: 30px; padding-bottom: 15px; border-bottom: 1px solid rgba(255,255,255,0.15); display: flex; align-items: center; gap: 12px; }
+            .sidebar h2 { margin: 0; font-size: 1.1rem; line-height: 1.3; font-weight: 600; letter-spacing: 0.5px;}
+            .sidebar button { background: transparent; color: rgba(255,255,255,0.85); border: none; padding: 12px 15px; width: 100%; text-align: left; margin-bottom: 8px; border-radius: 8px; cursor: pointer; transition: all 0.2s ease; font-size: 0.95rem; font-weight: 500;}
+            .sidebar button:hover { background: rgba(255,255,255,0.15); color: white; padding-left: 20px;}
+            
+            .main-content { margin-left: 260px; flex: 1; padding: 40px; box-sizing: border-box; min-height: 100vh; }
+            
+            /* Sleek Modern Cards */
+            .card { background: white; padding: 30px; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.04); border: 1px solid #eaeaea; margin-bottom: 25px; transition: transform 0.2s ease;}
+            h3 { margin-top: 0; color: var(--primary); border-bottom: 2px solid #f0f0f0; padding-bottom: 10px; margin-bottom: 20px;}
+            
+            /* Modern Inputs */
+            input, select, textarea { width: 100%; padding: 12px; margin-bottom: 15px; border: 1px solid #ced4da; border-radius: 8px; box-sizing: border-box; transition: all 0.2s ease; font-family: inherit;}
+            input:focus, select:focus, textarea:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(0,0,0,0.05); }
+            
+            /* Animated Buttons */
+            .btn { background: var(--primary); color: white; border: none; padding: 12px 20px; border-radius: 8px; cursor: pointer; font-weight: bold; width: 100%; margin-bottom: 10px; transition: all 0.3s ease; box-shadow: 0 4px 6px rgba(0,0,0,0.1);}
+            .btn:hover { transform: translateY(-2px); box-shadow: 0 6px 12px rgba(0,0,0,0.15); filter: brightness(1.05);}
             .btn-success { background: var(--accent); } .btn-danger { background: var(--danger); } .btn-info { background: var(--info); } .btn-warning { background: var(--warning); color: #333;}
+            
             .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-            .metric-box { padding: 15px; border-radius: 8px; color: white; text-align: center; }
-            #toast { display: none; position: fixed; bottom: 30px; right: 30px; padding: 15px 25px; color: white; background: var(--accent); border-radius: 5px; z-index: 1000; font-weight: bold; }
+            .metric-box { padding: 20px; border-radius: 12px; color: white; text-align: center; font-size: 1.1rem; font-weight: bold; box-shadow: 0 4px 15px rgba(0,0,0,0.1);}
+            
+            #toast { display: none; position: fixed; bottom: 30px; right: 30px; padding: 15px 25px; color: white; background: var(--accent); border-radius: 8px; z-index: 1000; font-weight: bold; box-shadow: 0 10px 30px rgba(0,0,0,0.2); animation: fadein 0.5s;}
             .hidden { display: none !important; }
+            
+            @keyframes fadein { from {bottom: 0; opacity: 0;} to {bottom: 30px; opacity: 1;} }
         </style>
     </head>
     <body>
         <div id="toast">Message</div>
         <div class="sidebar">
-            <h2>SaaS ERP Engine</h2>
+            <div class="sidebar-header">
+                {% if current_user.is_authenticated and current_user.school_id %}
+                    <img src="/api/logo/{{ current_user.school_id }}" style="width: 45px; height: 45px; object-fit: contain; background: white; border-radius: 8px; padding: 2px;">
+                {% else %}
+                    <span style="font-size: 30px;">🌍</span>
+                {% endif %}
+                <h2>{{ school_name }}</h2>
+            </div>
+            
             {% if current_user.is_authenticated %}
-                <div style="font-size: 0.85rem; color: #a5c3e0; margin-bottom: 20px;">Role: <span style="text-transform: uppercase;">{{ current_user.role }}</span></div>
+                <div style="font-size: 0.8rem; color: rgba(255,255,255,0.6); margin-bottom: 20px; text-transform: uppercase; font-weight: bold; letter-spacing: 1px;">Access Level: {{ current_user.role }}</div>
                 
                 {% if current_user.role == 'superadmin' %}
                     <button onclick="window.location.reload()">🏢 Global Tenants</button>
-                    <button class="btn-success" onclick="sendAction('/api/setup_db', {}, true)">Sync Database</button>
+                    <button class="btn-success" onclick="sendAction('/api/setup_db', {}, true)" style="color:white; margin-top:20px;">🔄 Sync Database Engine</button>
                 
                 {% elif current_user.role == 'admin' %}
-                    <button onclick="showSection('analytics-section')">📊 Dashboard</button>
+                    <button onclick="showSection('analytics-section')">📊 Corporate Dashboard</button>
                     <button onclick="showSection('finance-section')">💰 Financials & Billing</button>
-                    <button onclick="showSection('admissions-section')">🎓 Admissions & IDs</button>
-                    <button onclick="showSection('attendance-section')">📅 Roll Call</button>
-                    <button onclick="showSection('academics-section')">📚 Academics</button>
-                    <button onclick="showSection('sms-section')">📟 SMS Desk</button>
-                    <button onclick="showSection('hr-section')">🧑‍🏫 HR & Parent Portal</button>
-                    <button onclick="showSection('settings-section')">⚙️ Settings</button>
+                    <button onclick="showSection('admissions-section')">🎓 Admissions & Directory</button>
+                    <button onclick="showSection('attendance-section')">📅 Roll Call & Feeding</button>
+                    <button onclick="showSection('academics-section')">📚 Academic Reporting</button>
+                    <button onclick="showSection('sms-section')">📟 Live SMS Gateway</button>
+                    <button onclick="showSection('hr-section')">🧑‍🏫 Staff HR & Parent Access</button>
+                    <button onclick="showSection('settings-section')">⚙️ Profile Settings</button>
                 
                 {% elif current_user.role == 'teacher' %}
                     <button onclick="showSection('attendance-section')">📅 Daily Roll Call</button>
-                    <button onclick="showSection('academics-section')">📚 SBA Grading</button>
+                    <button onclick="showSection('academics-section')">📚 SBA Grading Matrix</button>
                 
                 {% elif current_user.role == 'guardian' %}
                     <button onclick="showSection('guardian-section')">👨‍👩‍👧 Guardian Portal</button>
                 {% endif %}
                 
-                <br><br><button class="btn-danger" onclick="logout()">Secure Logout</button>
+                <div style="position: absolute; bottom: 30px; width: calc(100% - 40px);">
+                    <button class="btn-danger" style="color:white;" onclick="logout()">🔒 Secure Logout</button>
+                </div>
             {% else %}
-                <button class="btn-success" onclick="sendAction('/api/setup_db', {}, true)">1. Sync Database</button>
+                <button class="btn-success" style="color:white;" onclick="sendAction('/api/setup_db', {}, true)">1. Sync System Core</button>
             {% endif %}
         </div>
 
         <main class="main-content">
-            <h1>Platform Dashboard</h1>
+            {% if current_user.is_authenticated and current_user.school_id %}
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 30px;">
+                <div>
+                    <h1 style="margin:0; color: var(--primary); font-size: 28px;">Enterprise Control Panel</h1>
+                    <p style="margin: 5px 0 0 0; color: #666;">Welcome back to the {{ school_name }} administration portal.</p>
+                </div>
+            </div>
+            {% else %}
+                <h1 style="color: var(--primary); margin-bottom: 30px;">System Gateway</h1>
+            {% endif %}
+
             {% if not current_user.is_authenticated %}
-            <div class="card" style="max-width: 400px; margin: 0 auto;">
-                <h3>System Login</h3>
-                <input type="email" id="email" placeholder="Email Address">
-                <input type="password" id="pass" placeholder="Password">
-                <button class="btn" onclick="login()">Login</button>
+            <div class="card" style="max-width: 400px; margin: 50px auto; border-top: 5px solid var(--primary);">
+                <h3 style="text-align: center; border:none;">Authorized Personnel Only</h3>
+                <input type="email" id="email" placeholder="Official Email Address">
+                <input type="password" id="pass" placeholder="Secure Password">
+                <button class="btn" style="margin-top: 10px;" onclick="login()">Authenticate Login</button>
             </div>
             
             {% elif current_user.role == 'guardian' %}
-            <!-- Guardian Read-Only Portal -->
             <div id="guardian-section" class="card admin-section">
                 <h3>👨‍👩‍👧 Guardian Access Portal</h3>
                 <div class="grid-2">
-                    <div style="background: #e9ecef; padding: 20px; border-radius: 8px; text-align: center;">
-                        <h4 style="margin-top:0;">Academic Performance</h4>
-                        <p style="font-size: 0.9rem; color: #555;">View and download your ward's official end-of-term grading report.</p>
-                        <button class="btn btn-success" onclick="window.open('/print_report/{{ current_user.linked_student_id }}', '_blank')">🖨️ View & Print Terminal Report</button>
+                    <div style="background: #e9ecef; padding: 25px; border-radius: 12px; text-align: center; box-shadow: inset 0 2px 5px rgba(0,0,0,0.02);">
+                        <h4 style="margin-top:0; color: var(--primary);">Academic Performance</h4>
+                        <p style="font-size: 0.9rem; color: #555; margin-bottom: 20px;">View and download your ward's official end-of-term grading report directly to your device.</p>
+                        <button class="btn btn-success" style="width:auto;" onclick="window.open('/print_report/{{ current_user.linked_student_id }}', '_blank')">🖨️ View & Print Terminal Report</button>
                     </div>
-                    <div style="background: #fff3cd; padding: 20px; border-radius: 8px; text-align: center; border: 1px solid var(--warning);">
-                        <h4 style="margin-top:0;">Financial Statement</h4>
-                        <p style="font-size: 0.9rem; color: #555;">Review issued fee bills, recorded payments, and outstanding arrears.</p>
-                        <button class="btn btn-info" onclick="loadStatement({{ current_user.linked_student_id }})">View Financial Ledger</button>
+                    <div style="background: #fff3cd; padding: 25px; border-radius: 12px; text-align: center; border: 1px solid var(--warning);">
+                        <h4 style="margin-top:0; color: #856404;">Financial Statement</h4>
+                        <p style="font-size: 0.9rem; color: #555; margin-bottom: 20px;">Review issued fee bills, recorded payments, and check any outstanding tuition arrears.</p>
+                        <button class="btn btn-warning" style="width:auto; color: #333;" onclick="loadStatement({{ current_user.linked_student_id }})">View Financial Ledger</button>
                     </div>
                 </div>
             </div>
 
             {% elif current_user.role == 'superadmin' %}
             <div class="card" style="border: 2px solid var(--accent);">
-                <h3>🚀 Onboard New School</h3>
+                <h3>🚀 Provision New School Tenant</h3>
                 <div class="grid-2">
-                    <div><input type="text" id="onboardSchool" placeholder="School Name"><input type="email" id="onboardEmail" placeholder="Admin Email"></div>
-                    <div><input type="password" id="onboardPass" placeholder="Admin Password"><button class="btn btn-success" onclick="onboardNewSchool()">Provision Tenant</button></div>
+                    <div><input type="text" id="onboardSchool" placeholder="Official School Name"><input type="email" id="onboardEmail" placeholder="Administrator Email"></div>
+                    <div><input type="password" id="onboardPass" placeholder="Temporary Password"><button class="btn btn-success" onclick="onboardNewSchool()">Provision SaaS Tenant</button></div>
                 </div>
             </div>
+            
+            <!-- NEW: Hidden Branding Modal Panel for Superadmin -->
+            <div id="branding-div" class="card hidden" style="border: 2px solid var(--warning); background: #fffdf5;">
+                <h3>🎨 White-Label Branding Engine</h3>
+                <p style="font-size:0.9rem; color:#555;">Customize the theme color and official crest for <strong id="brandSchoolName"></strong>.</p>
+                <input type="hidden" id="brandSchoolId">
+                <div class="grid-2">
+                    <div>
+                        <label style="font-weight:bold; display:block; margin-bottom:8px;">Primary Theme Color</label>
+                        <input type="color" id="brandColor" style="height: 50px; padding: 5px; cursor:pointer;">
+                    </div>
+                    <div>
+                        <label style="font-weight:bold; display:block; margin-bottom:8px;">School Crest / Logo Upload</label>
+                        <input type="file" id="brandLogo" accept="image/png, image/jpeg" style="background:white;">
+                    </div>
+                </div>
+                <div style="display:flex; gap: 10px; margin-top: 10px;">
+                    <button class="btn btn-warning" style="color:#333;" onclick="saveBranding()">Apply Theme & Refresh</button>
+                    <button class="btn" style="background:#666;" onclick="document.getElementById('branding-div').classList.add('hidden')">Cancel</button>
+                </div>
+            </div>
+
             <div class="card">
-                <h3>Global Tenants</h3><button class="btn" onclick="loadSchools()">Refresh List</button><div id="school-container"></div>
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 20px;">
+                    <h3 style="margin:0; border:none;">Global Server Tenants</h3>
+                    <button class="btn" style="width:auto; margin:0;" onclick="loadSchools()">🔄 Refresh Server Data</button>
+                </div>
+                <div id="school-container"></div>
             </div>
 
             {% elif current_user.role in ['admin', 'teacher'] %}
@@ -897,25 +991,25 @@ def dashboard():
                 {% if current_user.role == 'admin' %}
                 <!-- Analytics Section -->
                 <div id="analytics-section" class="card admin-section">
-                    <h3>Corporate Analytics</h3>
-                    <div class="grid-2" style="margin-bottom: 20px;">
+                    <h3>Corporate Dashboard Overview</h3>
+                    <div class="grid-2" style="margin-bottom: 30px;">
                         <div class="metric-box" style="background: var(--primary);" id="metricRevenue">Gross Revenue: GHS 0.00</div>
                         <div class="metric-box" style="background: var(--danger);" id="metricExpenses">Total Expenses: GHS 0.00</div>
-                        <div class="metric-box" style="background: var(--accent); grid-column: span 2;" id="metricMargin">Net Margin: GHS 0.00</div>
+                        <div class="metric-box" style="background: var(--accent); grid-column: span 2;" id="metricMargin">Net Operational Margin: GHS 0.00</div>
                     </div>
                     <div class="grid-2">
-                        <div style="position: relative; height: 250px;"><canvas id="financeChart"></canvas></div>
-                        <div style="position: relative; height: 250px;"><canvas id="waecChart"></canvas></div>
+                        <div style="position: relative; height: 300px; padding:15px; border:1px solid #eee; border-radius:12px;"><canvas id="financeChart"></canvas></div>
+                        <div style="position: relative; height: 300px; padding:15px; border:1px solid #eee; border-radius:12px;"><canvas id="waecChart"></canvas></div>
                     </div>
                 </div>
 
-                <!-- Financials Section (With Automated Bulk Billing & Reversal) -->
-                <div id="finance-section" class="card admin-section hidden" style="border: 2px solid var(--danger);">
-                    <h3>💰 Financial Ledger & Operations</h3>
+                <!-- Financials Section -->
+                <div id="finance-section" class="card admin-section hidden" style="border-top: 5px solid var(--danger);">
+                    <h3>💰 Financial Ledger & Billing Operations</h3>
                     <div class="grid-2">
                         <div>
-                            <div style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
-                                <h4 style="margin-top:0;">1. Issue Segmented Bill (Individual)</h4>
+                            <div style="background: #f8f9fa; padding: 20px; border-radius: 12px; margin-bottom: 20px; border: 1px solid #eee;">
+                                <h4 style="margin-top:0; color: var(--primary);">1. Issue Segmented Bill (Individual)</h4>
                                 <input type="number" id="bStuId" placeholder="Student ID (Required)">
                                 <select id="bCat">
                                     <option value="Consolidated Fee">Consolidated Term Fee</option>
@@ -934,9 +1028,9 @@ def dashboard():
                                 <button class="btn btn-success" onclick="issueBill()">Issue Bill & View Ledger</button>
                             </div>
 
-                            <div style="background: #e2e3e5; padding: 15px; border-radius: 8px; border: 1px solid #ccc;">
-                                <h4 style="margin-top:0;">⚡ Automated Bulk Class Billing</h4>
-                                <p style="font-size: 0.8rem; color: #555;">Instantly issue the same fee to every student in a specific class.</p>
+                            <div style="background: #e2e3e5; padding: 20px; border-radius: 12px; border: 1px solid #ccc;">
+                                <h4 style="margin-top:0; color:#333;">⚡ Automated Bulk Class Billing</h4>
+                                <p style="font-size: 0.85rem; color: #555;">Instantly issue the exact same fee to every active student in a specific class cohort.</p>
                                 <input type="text" id="bbClass" placeholder="Target Class (e.g., Basic 3)">
                                 <select id="bbCat"><option value="Consolidated Fee">Consolidated Term Fee</option><option value="Tuition">Tuition Fee</option><option value="PTA Dues">PTA Dues</option></select>
                                 <div class="grid-2">
@@ -944,75 +1038,83 @@ def dashboard():
                                     <input type="text" id="bbYear" placeholder="Year">
                                 </div>
                                 <input type="number" id="bbAmount" placeholder="Amount Due (GHS)">
-                                <input type="text" id="bbDesc" placeholder="Memo">
-                                <button class="btn btn-primary" onclick="bulkBillClass()">Execute Bulk Billing</button>
+                                <input type="text" id="bbDesc" placeholder="Memo / Description">
+                                <button class="btn btn-primary" onclick="bulkBillClass()">Execute Bulk Billing Protocol</button>
                             </div>
                         </div>
 
                         <div>
-                            <div style="background: #e9ecef; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
-                                <h4 style="margin-top:0;">2. Student Ledger & Payments</h4>
-                                <p style="font-size: 0.85rem; color: #555;">Search a student to view bills, check balances, record payments, or reverse errors.</p>
-                                <div class="grid-2">
-                                    <input type="number" id="stateStuId" placeholder="Student ID">
-                                    <button class="btn btn-primary" style="background: var(--primary);" onclick="loadStatement()">Open Ledger</button>
+                            <div style="background: #e9ecef; padding: 20px; border-radius: 12px; margin-bottom: 20px; border: 1px solid #dee2e6;">
+                                <h4 style="margin-top:0; color: var(--primary);">2. Student Ledger & Payments</h4>
+                                <p style="font-size: 0.85rem; color: #555;">Search a student to view active bills, check real-time balances, record cash payments, or reverse billing errors.</p>
+                                <div class="grid-2" style="align-items: center;">
+                                    <input type="number" id="stateStuId" placeholder="Target Student ID" style="margin-bottom:0;">
+                                    <button class="btn" style="margin-bottom:0;" onclick="loadStatement()">Open Secure Ledger</button>
                                 </div>
                             </div>
                             
-                            <div style="background: #fff3cd; padding: 15px; border-radius: 8px; border: 1px solid var(--warning); margin-bottom: 15px;">
-                                <h4 style="margin-top:0;">3. Arrears & Debtors Tracker</h4>
-                                <button class="btn btn-warning" onclick="loadDebtors()">View All Students Who Owe</button>
+                            <div style="background: #fff3cd; padding: 20px; border-radius: 12px; border: 1px solid var(--warning); margin-bottom: 20px;">
+                                <h4 style="margin-top:0; color: #856404;">3. Live Arrears & Debtors Radar</h4>
+                                <p style="font-size: 0.85rem; color: #666;">Generate an instant report of all active students with negative ledger balances.</p>
+                                <button class="btn btn-warning" style="color:#333;" onclick="loadDebtors()">Scan Database for Debtors</button>
                             </div>
                             
-                            <div style="background: #f8d7da; padding: 15px; border-radius: 8px; border: 1px solid var(--danger);">
-                                <h4 style="margin-top:0;">4. Log Operational Expense</h4>
-                                <select id="eCat"><option value="Staff Salaries">Staff Salaries</option><option value="Boarding Provisions">Boarding Provisions</option><option value="Utilities">Utilities</option></select>
-                                <div class="grid-2"><input type="text" id="eDesc" placeholder="Desc"><input type="number" id="eAmount" placeholder="Amount"></div>
-                                <button class="btn btn-danger" onclick="sendAction('/api/expenses', {category: document.getElementById('eCat').value, description: document.getElementById('eDesc').value, amount: document.getElementById('eAmount').value})">Log Outflow</button>
-                                <button class="btn btn-info" style="margin-bottom:0;" onclick="loadExpenses()">View Expenses</button>
+                            <div style="background: #f8d7da; padding: 20px; border-radius: 12px; border: 1px solid var(--danger);">
+                                <h4 style="margin-top:0; color: #721c24;">4. Log Operational Cash Outflow</h4>
+                                <select id="eCat"><option value="Staff Salaries">Staff Salaries</option><option value="Boarding Provisions">Boarding Provisions</option><option value="Utilities">Facility Utilities</option><option value="Maintenance">Maintenance & Repairs</option></select>
+                                <div class="grid-2"><input type="text" id="eDesc" placeholder="Memo"><input type="number" id="eAmount" placeholder="Amount (GHS)"></div>
+                                <button class="btn btn-danger" onclick="sendAction('/api/expenses', {category: document.getElementById('eCat').value, description: document.getElementById('eDesc').value, amount: document.getElementById('eAmount').value})">Log Cash Outflow</button>
+                                <button class="btn btn-info" style="margin-bottom:0;" onclick="loadExpenses()">Review Expense Ledger</button>
                             </div>
                         </div>
                     </div>
                 </div>
 
-                <!-- Admissions Section (With Bulk CSV & Edits) -->
-                <div id="admissions-section" class="card grid-2 admin-section hidden">
+                <!-- Admissions Section -->
+                <div id="admissions-section" class="card grid-2 admin-section hidden" style="border-top: 5px solid var(--primary);">
                     <div>
-                        <h3>Enroll New Student (Manual)</h3>
-                        <div class="grid-2"><input type="text" id="sFirst" placeholder="First Name"><input type="text" id="sLast" placeholder="Last Name"></div>
-                        <div class="grid-2">
-                            <input type="text" id="sClass" placeholder="Class / Program (e.g., Basic 1)">
-                            <select id="sBoarding"><option value="Day">Day Student</option><option value="Boarding">Boarding Student</option></select>
-                        </div>
-                        <div class="grid-2">
-                            <input type="text" id="sHouse" placeholder="House (or N/A)">
-                            <input type="text" id="sGName" placeholder="Guardian Name">
-                        </div>
-                        <div class="grid-2" style="margin-bottom: 15px;">
-                            <input type="text" id="sGContact" placeholder="Guardian Contact">
-                            <div>
-                                <label style="font-size:0.8rem; font-weight:bold; display:block; margin-bottom: 5px;">Passport Photo</label>
-                                <input type="file" id="sPhoto" accept="image/*" style="margin-bottom: 0;">
+                        <div style="background: #f8f9fa; padding: 20px; border-radius: 12px; margin-bottom: 20px; border: 1px solid #eee;">
+                            <h3 style="margin-top:0; border:none; padding:0; margin-bottom:15px;">Enroll New Student (Manual)</h3>
+                            <div class="grid-2"><input type="text" id="sFirst" placeholder="First Name"><input type="text" id="sLast" placeholder="Last Name"></div>
+                            <div class="grid-2">
+                                <input type="text" id="sClass" placeholder="Class / Program (e.g., Basic 1)">
+                                <select id="sBoarding"><option value="Day">Day Student</option><option value="Boarding">Boarding Student</option></select>
                             </div>
+                            <div class="grid-2">
+                                <input type="text" id="sHouse" placeholder="House (or N/A)">
+                                <input type="text" id="sGName" placeholder="Guardian Name">
+                            </div>
+                            <div class="grid-2" style="margin-bottom: 15px;">
+                                <input type="text" id="sGContact" placeholder="Guardian Contact">
+                                <div>
+                                    <label style="font-size:0.8rem; font-weight:bold; display:block; margin-bottom: 5px; color:#555;">Passport Photo (Auto-Compress)</label>
+                                    <input type="file" id="sPhoto" accept="image/*" style="margin-bottom: 0;">
+                                </div>
+                            </div>
+                            <button class="btn btn-success" onclick="enrollStudent()">Register Student into Database</button>
                         </div>
-                        <button class="btn btn-success" onclick="enrollStudent()">Register Student</button>
                         
-                        <div style="background: #e9ecef; padding: 15px; border-radius: 8px; margin-top: 15px;">
-                            <h4 style="margin-top:0;">Bulk CSV Enrollment</h4>
-                            <p style="font-size: 0.8rem; color: #555;">Upload a CSV file. Columns must be exactly: <i>First Name, Last Name, Class, Guardian Name, Guardian Contact, Boarding Status, House</i>.</p>
-                            <input type="file" id="csvUpload" accept=".csv">
-                            <button class="btn btn-primary" onclick="bulkEnrollCSV()">Upload & Import Roster</button>
+                        <div style="background: #e9ecef; padding: 20px; border-radius: 12px; border: 1px solid #dee2e6;">
+                            <h4 style="margin-top:0; color: var(--primary);">Bulk CSV Enrollment Engine</h4>
+                            <p style="font-size: 0.85rem; color: #555;">Upload a standard CSV file. Columns MUST match exactly: <br><i>First Name, Last Name, Class, Guardian Name, Guardian Contact, Boarding Status, House</i>.</p>
+                            <div style="display:flex; gap:10px; align-items:center;">
+                                <input type="file" id="csvUpload" accept=".csv" style="margin-bottom:0; background:white;">
+                                <button class="btn btn-primary" style="margin-bottom:0; width:60%;" onclick="bulkEnrollCSV()">Import Roster</button>
+                            </div>
                         </div>
                     </div>
                     <div>
-                        <h3>ID & Directory Tools</h3>
-                        <button class="btn btn-warning" onclick="window.open('/print_ids', '_blank')">🖨️ Generate Batch ID Cards</button>
-                        <button class="btn btn-info" onclick="loadRoster()">View Digital Directory</button>
-                        <hr style="margin:20px 0; border:1px solid #eee;">
+                        <div style="background: white; padding: 20px; border-radius: 12px; margin-bottom: 20px; border: 1px solid #eee; box-shadow: 0 4px 6px rgba(0,0,0,0.02);">
+                            <h3 style="margin-top:0; border:none; padding:0; margin-bottom:15px;">ID & Directory Tools</h3>
+                            <div class="grid-2">
+                                <button class="btn btn-warning" style="color:#333;" onclick="window.open('/print_ids', '_blank')">🖨️ Generate Batch ID Cards</button>
+                                <button class="btn btn-info" onclick="loadRoster()">View Digital Directory</button>
+                            </div>
+                        </div>
                         
-                        <!-- NEW: Student Edit Engine -->
-                        <div style="background: #fff3cd; padding: 15px; border-radius: 8px; border: 1px solid var(--warning); margin-bottom: 15px;">
-                            <h4 style="margin-top:0;">✏️ Edit/Correct Student Details</h4>
+                        <div style="background: #fff3cd; padding: 20px; border-radius: 12px; border: 1px solid var(--warning); margin-bottom: 20px;">
+                            <h4 style="margin-top:0; color: #856404;">✏️ Data Correction Editor</h4>
+                            <p style="font-size: 0.85rem; color: #666;">Fix typos or update a student's profile without deleting their financial history.</p>
                             <input type="number" id="editStuId" placeholder="Target Student ID">
                             <div class="grid-2">
                                 <input type="text" id="editFirst" placeholder="Corrected First Name">
@@ -1022,149 +1124,163 @@ def dashboard():
                                 <input type="text" id="editClass" placeholder="Corrected Class">
                                 <select id="editBoarding"><option value="Day">Day Student</option><option value="Boarding">Boarding Student</option></select>
                             </div>
-                            <button class="btn btn-warning" onclick="editStudent()" style="color:#333;">Save Corrections</button>
+                            <button class="btn btn-warning" onclick="editStudent()" style="color:#333;">Save Corrections to Record</button>
                         </div>
 
-                        <div style="background: #e2e3e5; padding: 15px; border-radius: 8px;">
-                            <h4 style="margin-top:0;">End-of-Year Promotion Engine</h4>
-                            <p style="font-size:0.8rem; color:#555;">Move an entire class cohort up to the next grade level instantly.</p>
+                        <div style="background: #e2e3e5; padding: 20px; border-radius: 12px; border: 1px solid #ccc;">
+                            <h4 style="margin-top:0; color: #333;">End-of-Year Promotion Engine</h4>
+                            <p style="font-size:0.85rem; color:#555;">Move an entire class cohort up to the next academic grade level instantly.</p>
                             <div class="grid-2">
                                 <input type="text" id="promoFrom" placeholder="Current Class">
                                 <input type="text" id="promoTo" placeholder="Next Class">
                             </div>
-                            <button class="btn btn-primary" onclick="promoteClass()">Promote Cohort</button>
+                            <button class="btn btn-primary" onclick="promoteClass()">Promote Entire Cohort</button>
                         </div>
                     </div>
                 </div>
                 
                 <!-- School Settings Profile -->
-                <div id="settings-section" class="card admin-section hidden" style="border: 2px solid var(--primary);">
-                    <h3>⚙️ Institution Profile Settings</h3>
-                    <p style="font-size: 0.9rem; color: #555;">Update your contact details so they print correctly on ID Cards and Terminal Reports.</p>
-                    <div class="grid-2" style="max-width: 600px;">
-                        <div>
-                            <label style="font-weight:bold;">School Address / Location</label>
-                            <input type="text" id="setAddress" placeholder="e.g., P.O Box 123, Winneba">
-                        </div>
-                        <div>
-                            <label style="font-weight:bold;">Official Contact Number</label>
-                            <input type="text" id="setPhone" placeholder="e.g., 0244123456">
-                        </div>
+                <div id="settings-section" class="card admin-section hidden" style="border-top: 5px solid var(--primary);">
+                    <h3>⚙️ Institution Profile & Branding Settings</h3>
+                    <p style="font-size: 0.95rem; color: #555; margin-bottom: 25px;">Update your school's official contact details. These will print directly onto the headers of your generated Student ID Cards and Terminal Report Cards.</p>
+                    <div style="background: #f8f9fa; padding: 25px; border-radius: 12px; border: 1px solid #eee; max-width: 600px;">
+                        <label style="font-weight:bold; color:var(--primary); margin-bottom:8px; display:block;">Official School Address / Location</label>
+                        <input type="text" id="setAddress" placeholder="e.g., P.O Box 123, Winneba, Central Region" style="font-size:1.05rem;">
+                        
+                        <label style="font-weight:bold; color:var(--primary); margin-bottom:8px; display:block; margin-top:15px;">Official Contact Number</label>
+                        <input type="text" id="setPhone" placeholder="e.g., 0244123456" style="font-size:1.05rem;">
+                        
+                        <button class="btn btn-success" style="margin-top: 15px; font-size:1.05rem;" onclick="sendAction('/api/settings', {address: document.getElementById('setAddress').value, phone: document.getElementById('setPhone').value})">Save Profile Updates</button>
                     </div>
-                    <button class="btn btn-success" style="max-width: 600px;" onclick="sendAction('/api/settings', {address: document.getElementById('setAddress').value, phone: document.getElementById('setPhone').value})">Save Profile Updates</button>
+                    <p style="font-size: 0.85rem; color: #888; margin-top: 20px;"><i>Note: To change your institution's name, core theme color, or logo, please contact your Super Admin.</i></p>
                 </div>
                 {% endif %}
 
                 <!-- Shared Teacher/Admin Sections -->
-                <div id="attendance-section" class="card admin-section {% if current_user.role == 'admin' %}hidden{% endif %}" style="border: 2px solid var(--info);">
-                    <h3>📅 Daily Roll Call & Feeding Optimization</h3>
-                    <div class="grid-2">
-                        <div>
-                            <input type="date" id="attDate" value="">
-                            <input type="number" id="attStuId" placeholder="Student ID">
+                <div id="attendance-section" class="card admin-section {% if current_user.role == 'admin' %}hidden{% endif %}" style="border-top: 5px solid var(--info);">
+                    <h3>📅 Daily Roll Call & Feeding Optimization Tracker</h3>
+                    <div style="background: #e9ecef; padding: 25px; border-radius: 12px; max-width: 800px; border: 1px solid #dee2e6;">
+                        <div class="grid-2" style="align-items: end;">
+                            <div>
+                                <label style="font-weight:bold; font-size:0.9rem; color:#555; display:block; margin-bottom:5px;">Select Date</label>
+                                <input type="date" id="attDate" value="" style="margin-bottom:0;">
+                            </div>
+                            <div>
+                                <label style="font-weight:bold; font-size:0.9rem; color:#555; display:block; margin-bottom:5px;">Target Student ID</label>
+                                <input type="number" id="attStuId" placeholder="ID" style="margin-bottom:0;">
+                            </div>
                         </div>
-                        <div>
-                            <select id="attStatus">
-                                <option value="Present">Present (Include in Feeding)</option>
-                                <option value="Absent">Absent (Remove from Feeding)</option>
+                        <div class="grid-2" style="margin-top: 20px;">
+                            <select id="attStatus" style="margin-bottom:0; font-weight:bold;">
+                                <option value="Present">✅ Present (Include in Daily Feeding)</option>
+                                <option value="Absent">❌ Absent (Remove from Daily Feeding)</option>
                             </select>
-                            <button class="btn btn-info" onclick="sendAction('/api/attendance', {student_id: document.getElementById('attStuId').value, record_date: document.getElementById('attDate').value, status: document.getElementById('attStatus').value})">Mark Attendance</button>
+                            <button class="btn btn-info" style="margin-bottom:0;" onclick="sendAction('/api/attendance', {student_id: document.getElementById('attStuId').value, record_date: document.getElementById('attDate').value, status: document.getElementById('attStatus').value})">Commit Attendance Record</button>
                         </div>
                     </div>
                 </div>
 
-                <div id="academics-section" class="card grid-2 admin-section hidden">
+                <div id="academics-section" class="card grid-2 admin-section hidden" style="border-top: 5px solid var(--accent);">
                     <div>
-                        <h3>Record SBA Grade (30/70)</h3>
-                        <div class="grid-2">
-                            <input type="number" id="gStuId" placeholder="Student ID (Required)">
-                            <input type="text" id="gSub" placeholder="Subject">
+                        <div style="background: #f8f9fa; padding: 20px; border-radius: 12px; border: 1px solid #eee;">
+                            <h3 style="margin-top:0; border:none; padding:0; margin-bottom:15px; color:var(--primary);">Record SBA Grade (30/70 Matrix)</h3>
+                            <div class="grid-2">
+                                <input type="number" id="gStuId" placeholder="Student ID (Required)">
+                                <input type="text" id="gSub" placeholder="Subject Name">
+                            </div>
+                            <div class="grid-2">
+                                <input type="number" id="gClass" placeholder="Class Score (30%)">
+                                <input type="number" id="gExam" placeholder="Exam Score (70%)">
+                            </div>
+                            <div class="grid-2">
+                                <input type="text" id="gTerm" placeholder="Term (e.g. Term 1)">
+                                <input type="text" id="gYear" placeholder="Year (e.g. 2026)">
+                            </div>
+                            <input type="text" id="gRem" placeholder="Teacher's Qualitative Remark (e.g. Very impressive)">
+                            <button class="btn btn-success" onclick="sendAction('/api/grades', {student_id: document.getElementById('gStuId').value, subject_name: document.getElementById('gSub').value, class_score: document.getElementById('gClass').value, exam_score: document.getElementById('gExam').value, term: document.getElementById('gTerm').value, academic_year: document.getElementById('gYear').value, remarks: document.getElementById('gRem').value})">Save Academic Record to Vault</button>
                         </div>
-                        <div class="grid-2">
-                            <input type="number" id="gClass" placeholder="Class Score (30%)">
-                            <input type="number" id="gExam" placeholder="Exam Score (70%)">
-                        </div>
-                        <div class="grid-2">
-                            <input type="text" id="gTerm" placeholder="Term (e.g. Term 1)">
-                            <input type="text" id="gYear" placeholder="Year (e.g. 2026)">
-                        </div>
-                        <input type="text" id="gRem" placeholder="Teacher's Remark (e.g. Very impressive)">
-                        <button class="btn" onclick="sendAction('/api/grades', {student_id: document.getElementById('gStuId').value, subject_name: document.getElementById('gSub').value, class_score: document.getElementById('gClass').value, exam_score: document.getElementById('gExam').value, term: document.getElementById('gTerm').value, academic_year: document.getElementById('gYear').value, remarks: document.getElementById('gRem').value})">Save SBA Record</button>
                     </div>
                     <div>
-                        <h3>Terminal Reports</h3>
-                        <p style="font-size: 0.85rem; color: #555;">View raw grading data or generate a beautifully formatted, print-ready official report card.</p>
-                        <input type="number" id="repId" placeholder="Student ID">
-                        <button class="btn btn-info" onclick="loadReport()">View Raw Data Table</button>
-                        <button class="btn btn-success" onclick="printReportCard()">🖨️ Generate Official Report Card</button>
+                        <div style="background: #e9ecef; padding: 20px; border-radius: 12px; border: 1px solid #dee2e6; height: 100%; box-sizing: border-box;">
+                            <h3 style="margin-top:0; border:none; padding:0; margin-bottom:15px; color:var(--primary);">Terminal Report Generation</h3>
+                            <p style="font-size: 0.9rem; color: #555; line-height: 1.5; margin-bottom: 20px;">Review raw grading inputs in the table viewer to check for data entry errors, or generate a beautifully formatted, official print-ready report card for the student.</p>
+                            <label style="font-weight:bold; font-size:0.9rem; color:#555; display:block; margin-bottom:5px;">Target Student ID</label>
+                            <input type="number" id="repId" placeholder="Enter ID to pull records...">
+                            <div class="grid-2" style="margin-top: 15px;">
+                                <button class="btn btn-info" onclick="loadReport()">View Raw Data</button>
+                                <button class="btn btn-success" onclick="printReportCard()">🖨️ Print Official Report</button>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
                 {% if current_user.role == 'admin' %}
                 <!-- SMS Desk Section -->
-                <div id="sms-section" class="card admin-section hidden" style="border: 2px solid var(--info);">
-                    <h3>📟 SMS Communication Desk</h3>
+                <div id="sms-section" class="card admin-section hidden" style="border-top: 5px solid var(--info);">
+                    <h3>📟 Live SMS Communication Desk</h3>
                     <div class="grid-2">
-                        <div>
-                            <label style="font-weight:bold; display:block; margin-bottom:5px;">Target Audience</label>
-                            <select id="smsAudience">
-                                <option value="all">Broadcast to All Parents</option>
-                                <option value="arrears">Only Parents with Unpaid Arrears</option>
-                                <option value="boarding">Parents of Boarding Students</option>
+                        <div style="background: #f8f9fa; padding: 20px; border-radius: 12px; border: 1px solid #eee;">
+                            <label style="font-weight:bold; display:block; margin-bottom:10px; font-size:1.1rem; color:var(--primary);">1. Select Target Audience</label>
+                            <select id="smsAudience" style="font-size:1.05rem; padding:15px;">
+                                <option value="all">Broadcast to ALL Active Parents</option>
+                                <option value="arrears">Only Parents with Unpaid Tuition Arrears</option>
+                                <option value="boarding">Only Parents of Boarding Students</option>
                             </select>
-                            <p style="font-size:0.8rem; color:#666;">The system will automatically extract contact numbers from the database based on your selection.</p>
+                            <p style="font-size:0.85rem; color:#666; line-height:1.5; margin-top:15px;">The engine will automatically scan the database, isolate the relevant guardian phone numbers, filter out duplicates, and route the payload to the national telecom gateway.</p>
                         </div>
-                        <div>
-                            <label style="font-weight:bold; display:block; margin-bottom:5px;">Message Content</label>
-                            <textarea id="smsBody" placeholder="Enter your text message here..."></textarea>
-                            <button class="btn btn-info" onclick="sendAction('/api/sms/blast', {audience: document.getElementById('smsAudience').value, message: document.getElementById('smsBody').value})">Send SMS Broadcast</button>
+                        <div style="background: #e9ecef; padding: 20px; border-radius: 12px; border: 1px solid #dee2e6;">
+                            <label style="font-weight:bold; display:block; margin-bottom:10px; font-size:1.1rem; color:var(--primary);">2. Compose Payload</label>
+                            <textarea id="smsBody" placeholder="Type your official broadcast message here..." style="height: 120px; resize: none;"></textarea>
+                            <button class="btn btn-info" style="font-size:1.1rem; padding:15px;" onclick="sendAction('/api/sms/blast', {audience: document.getElementById('smsAudience').value, message: document.getElementById('smsBody').value})">Deploy SMS Broadcast 🚀</button>
                         </div>
                     </div>
                 </div>
 
                 <!-- Expanded Staff HR Vault & Guardian Access -->
-                <div id="hr-section" class="card grid-2 admin-section hidden">
+                <div id="hr-section" class="card grid-2 admin-section hidden" style="border-top: 5px solid #6c757d;">
                     <div>
-                        <h3>Register Staff Profile</h3>
-                        <div class="grid-2">
-                            <input type="email" id="tEmail" placeholder="Teacher Email">
-                            <input type="password" id="tPass" placeholder="Temporary Password">
-                        </div>
-                        <div class="grid-2">
-                            <input type="text" id="tPhone" placeholder="Phone Number">
-                            <input type="text" id="tSubj" placeholder="Assigned Subject">
-                        </div>
-                        <input type="number" id="tSal" placeholder="Base Salary (GHS)">
-                        <button class="btn btn-success" onclick="registerStaff()">Add to HR Directory</button>
-                        
-                        <hr style="margin:20px 0; border:1px solid #eee;">
-                        
-                        <div style="background: #e9ecef; padding: 15px; border-radius: 8px;">
-                            <h4 style="margin-top:0;">Register Guardian Portal Access</h4>
-                            <p style="font-size:0.8rem; color:#555;">Create a secure login for a parent to view only their ward's terminal reports and financial ledgers.</p>
+                        <div style="background: #f8f9fa; padding: 20px; border-radius: 12px; margin-bottom: 20px; border: 1px solid #eee;">
+                            <h3 style="margin-top:0; border:none; padding:0; margin-bottom:15px; color:var(--primary);">Register Staff Profile</h3>
                             <div class="grid-2">
-                                <input type="email" id="gEmail" placeholder="Parent Email">
-                                <input type="password" id="gPass" placeholder="Password">
+                                <input type="email" id="tEmail" placeholder="Teacher Email (Login ID)">
+                                <input type="password" id="tPass" placeholder="Temporary Password">
                             </div>
-                            <input type="number" id="gStuId" placeholder="Linked Student ID">
-                            <button class="btn btn-primary" onclick="registerGuardian()">Grant Portal Access</button>
+                            <div class="grid-2">
+                                <input type="text" id="tPhone" placeholder="Mobile Number">
+                                <input type="text" id="tSubj" placeholder="Primary Assigned Subject">
+                            </div>
+                            <input type="number" id="tSal" placeholder="Monthly Base Salary (GHS)">
+                            <button class="btn btn-success" onclick="registerStaff()">Add Teacher to HR Directory</button>
+                        </div>
+                        
+                        <div style="background: #e9ecef; padding: 20px; border-radius: 12px; border: 1px solid #dee2e6;">
+                            <h3 style="margin-top:0; border:none; padding:0; margin-bottom:10px; color:var(--primary);">Guardian Portal Access</h3>
+                            <p style="font-size:0.85rem; color:#555; margin-bottom:15px;">Create a secure login for a parent. They will only be able to view their specific ward's terminal reports and financial ledgers.</p>
+                            <div class="grid-2">
+                                <input type="email" id="gEmail" placeholder="Parent Email Address">
+                                <input type="password" id="gPass" placeholder="Secure Password">
+                            </div>
+                            <input type="number" id="gStuId" placeholder="Target Linked Student ID">
+                            <button class="btn btn-primary" onclick="registerGuardian()">Grant Parent Portal Access</button>
                         </div>
                     </div>
                     <div>
-                        <h3>Compliance & Payroll Vault</h3>
-                        <p style="font-size: 0.9rem; color: #666;">Maintain digital records of your teaching staff to ensure instant readiness for GES auditing.</p>
-                        <button class="btn btn-info" onclick="loadStaff()">View Staff Directory</button>
+                        <div style="background: white; padding: 20px; border-radius: 12px; border: 1px solid #eee; height: 100%; box-sizing: border-box; box-shadow: 0 4px 6px rgba(0,0,0,0.02);">
+                            <h3 style="margin-top:0; border:none; padding:0; margin-bottom:15px; color:var(--primary);">Compliance & Payroll Vault</h3>
+                            <p style="font-size: 0.95rem; color: #555; line-height:1.6; margin-bottom:25px;">Maintain strictly confidential digital records of your academic teaching staff to ensure instant data readiness for Ghana Education Service (GES) auditing and internal monthly payroll calculations.</p>
+                            <button class="btn btn-info" onclick="loadStaff()">View Official Staff Directory</button>
+                        </div>
                     </div>
                 </div>
                 {% endif %}
 
                 <!-- Shared Data Viewer (With Offline CSV Export) -->
-                <div class="card hidden" id="data-viewer" style="border: 2px solid var(--primary);">
-                    <div style="display:flex; justify-content:space-between; align-items:center; border-bottom: 2px solid #eee; padding-bottom: 8px; margin-bottom:15px;">
-                        <h3 id="viewer-title" style="border:none; margin:0; padding:0;">Data Explorer</h3>
-                        <button class="btn btn-success" style="width:auto; margin:0;" onclick="exportTableToCSV('Exported_Data.csv')">⬇️ Download to Excel/CSV</button>
+                <div class="card hidden" id="data-viewer" style="border: 2px solid var(--primary); box-shadow: 0 15px 35px rgba(0,0,0,0.1); border-radius: 16px; overflow:hidden; padding: 0;">
+                    <div style="background: var(--primary); padding: 20px 30px; display:flex; justify-content:space-between; align-items:center;">
+                        <h3 id="viewer-title" style="border:none; margin:0; padding:0; color:white; font-size:1.2rem;">Data Explorer</h3>
+                        <button class="btn" style="background:rgba(255,255,255,0.2); color:white; width:auto; margin:0; border-radius:6px; box-shadow:none;" onclick="exportTableToCSV('Exported_Data.csv')">⬇️ Download to Excel/CSV</button>
                     </div>
-                    <div id="table-container"></div>
+                    <div id="table-container" style="padding: 30px; overflow-x: auto;"></div>
                 </div>
             {% endif %}
         </main>
@@ -1443,19 +1559,56 @@ def dashboard():
                 window.open('/print_report/' + id, '_blank');
             }
 
+            // --- SUPERADMIN SPECIFIC FUNCTIONS ---
+            function openBrandingModal(schoolId, currentColor, schoolName) {
+                document.getElementById('branding-div').classList.remove('hidden');
+                document.getElementById('brandSchoolId').value = schoolId;
+                document.getElementById('brandColor').value = currentColor || '#0f4c81';
+                document.getElementById('brandSchoolName').innerText = schoolName;
+                document.getElementById('branding-div').scrollIntoView({behavior: "smooth"});
+            }
+
+            async function saveBranding() {
+                const id = document.getElementById('brandSchoolId').value;
+                const color = document.getElementById('brandColor').value;
+                const fileInput = document.getElementById('brandLogo');
+                let logo_b64 = null;
+                
+                if (fileInput.files.length > 0) {
+                    const file = fileInput.files[0];
+                    logo_b64 = await new Promise((resolve) => {
+                        const reader = new FileReader();
+                        reader.onload = function(e) { resolve(e.target.result); };
+                        reader.readAsDataURL(file);
+                    });
+                }
+                try {
+                    const res = await fetch('/api/superadmin/branding/' + id, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({color: color, logo_b64: logo_b64}) });
+                    const data = await res.json();
+                    if(res.ok) { showToast(data.message); loadSchools(); document.getElementById('branding-div').classList.add('hidden'); }
+                    else { showToast(data.error, true); }
+                } catch(e) { showToast("Connection failed", true); }
+            }
+
             async function loadSchools() {
                 const res = await fetch('/api/superadmin/schools');
                 if(!res.ok) return;
                 const data = await res.json();
-                let html = '<table style="width:100%; border-collapse: collapse; text-align: left;"><tr><th style="padding:10px; background:#0f4c81; color:white;">ID</th><th style="padding:10px; background:#0f4c81; color:white;">School Name</th><th style="padding:10px; background:#0f4c81; color:white;">Expiry Date</th><th style="padding:10px; background:#0f4c81; color:white;">Status</th><th style="padding:10px; background:#0f4c81; color:white;">Actions</th></tr>';
+                let html = '<table style="width:100%; border-collapse: collapse; text-align: left;"><tr><th style="padding:15px; border-bottom:2px solid #ddd;">ID</th><th style="padding:15px; border-bottom:2px solid #ddd;">School Name</th><th style="padding:15px; border-bottom:2px solid #ddd;">Expiry Date</th><th style="padding:15px; border-bottom:2px solid #ddd;">Status</th><th style="padding:15px; border-bottom:2px solid #ddd;">Actions</th></tr>';
                 data.data.forEach(s => {
                     const statusColor = s.status === 'Active' ? 'green' : 'red';
                     html += `<tr>
-                        <td style="padding:10px; border-bottom:1px solid #ddd;">${s.school_id}</td>
-                        <td style="padding:10px; border-bottom:1px solid #ddd;">${s.school_name}</td>
-                        <td style="padding:10px; border-bottom:1px solid #ddd;">${s.expiry_date}</td>
-                        <td style="color:${statusColor}; font-weight:bold; padding:10px; border-bottom:1px solid #ddd;">${s.status}</td>
-                        <td style="padding:10px; border-bottom:1px solid #ddd;">
+                        <td style="padding:15px; border-bottom:1px solid #eee; font-weight:bold;">${s.school_id}</td>
+                        <td style="padding:15px; border-bottom:1px solid #eee;">
+                            <div style="display:flex; align-items:center; gap:10px;">
+                                <div style="width:15px; height:15px; border-radius:50%; background:${s.primary_color};"></div>
+                                <strong>${s.school_name}</strong>
+                            </div>
+                        </td>
+                        <td style="padding:15px; border-bottom:1px solid #eee;">${s.expiry_date}</td>
+                        <td style="color:${statusColor}; font-weight:bold; padding:15px; border-bottom:1px solid #eee;">${s.status}</td>
+                        <td style="padding:15px; border-bottom:1px solid #eee;">
+                            <button class="btn btn-warning" style="width: auto; padding: 6px 12px; margin: 2px; color:#333;" onclick="openBrandingModal(${s.school_id}, '${s.primary_color}', '${s.school_name}')">🎨 Brand</button>
                             <button class="btn btn-success" style="width: auto; padding: 6px 12px; margin: 2px;" onclick="sendAction('/api/superadmin/renew/${s.school_id}', {})">Renew</button>
                             <button class="btn btn-info" style="width: auto; padding: 6px 12px; margin: 2px;" onclick="window.location.href='/api/superadmin/backup/${s.school_id}'">⬇️ Backup</button>
                             <input type="file" id="file_${s.school_id}" accept=".json" style="display:none;" onchange="uploadRestore(${s.school_id})">
@@ -1490,42 +1643,43 @@ def dashboard():
                 fileInput.value = ''; 
             }
 
+            // --- DATA RENDERERS ---
             function renderTable(title, headers, rows, keys) {
                 const viewer = document.getElementById('data-viewer');
                 document.getElementById('viewer-title').innerText = title;
                 const container = document.getElementById('table-container');
-                if (!rows || rows.length === 0) { container.innerHTML = '<div style="padding: 20px;">No records found.</div>'; viewer.classList.remove('hidden'); return; }
+                if (!rows || rows.length === 0) { container.innerHTML = '<div style="padding: 20px; color:#666;">No records found in database.</div>'; viewer.classList.remove('hidden'); return; }
                 let html = '<table style="width:100%; border-collapse: collapse;"><tr>';
-                headers.forEach(h => html += `<th style="background:#0f4c81;color:white;padding:10px;text-align:left;">${h}</th>`);
+                headers.forEach(h => html += `<th style="background:#f8f9fa; color:var(--primary); padding:15px; text-align:left; border-bottom: 2px solid #ddd; font-weight:bold;">${h}</th>`);
                 html += '</tr>';
                 rows.forEach(row => {
-                    html += '<tr>';
+                    html += '<tr style="transition: background 0.2s;" onmouseover="this.style.background=\'#f8f9fa\'" onmouseout="this.style.background=\'white\'">';
                     keys.forEach(k => {
                         let val = row[k];
                         if (k === 'photo') {
-                            html += `<td style="padding:10px; border-bottom:1px solid #ddd; width: 60px;"><img src="/api/photo/${row['student_id']}" style="width:45px; height:45px; border-radius:50%; object-fit:cover; border:2px solid #ccc; background:#eee;"></td>`;
+                            html += `<td style="padding:15px; border-bottom:1px solid #eee; width: 60px;"><img src="/api/photo/${row['student_id']}" style="width:45px; height:45px; border-radius:8px; object-fit:cover; border:2px solid #ccc; background:#eee;"></td>`;
                         } else if (k === 'action_pay') {
-                            html += `<td style="padding:10px; border-bottom:1px solid #ddd;">`;
+                            html += `<td style="padding:15px; border-bottom:1px solid #eee;">`;
                             if (row['remaining_balance'] > 0) {
-                                html += `<button class="btn btn-success" style="padding:4px 12px; font-size:0.85rem; margin:0; width:auto;" onclick="processPayment(${row['fee_id']}, ${row['remaining_balance']}, ${row['student_id']})">Pay Bill</button>`;
+                                html += `<button class="btn btn-success" style="padding:6px 12px; font-size:0.85rem; margin:0; width:auto;" onclick="processPayment(${row['fee_id']}, ${row['remaining_balance']}, ${row['student_id']})">Pay Bill</button>`;
                             } else {
-                                html += `<span style="color:var(--accent); font-weight:bold; margin-right: 10px;">Cleared</span>`;
+                                html += `<span style="color:var(--accent); font-weight:bold; margin-right: 15px;">Cleared</span>`;
                             }
-                            html += `<button class="btn btn-danger" style="padding:4px 8px; font-size:0.8rem; margin:0 0 0 5px; width:auto; background:#dc3545;" onclick="deleteBill(${row['fee_id']}, ${row['student_id']})">Reverse Bill</button></td>`;
+                            html += `<button class="btn btn-danger" style="padding:6px 12px; font-size:0.85rem; margin:0 0 0 5px; width:auto; background:white; color:var(--danger); border:1px solid var(--danger); box-shadow:none;" onclick="deleteBill(${row['fee_id']}, ${row['student_id']})">Reverse Bill</button></td>`;
                         } else if (k === 'action_roster') {
-                            html += `<td style="padding:10px; border-bottom:1px solid #ddd;">
-                                <button class="btn btn-danger" style="padding:4px 8px; font-size:0.8rem; margin:0 2px; width:auto;" onclick="deleteStudent(${row['student_id']})">🗑️ Delete</button>
+                            html += `<td style="padding:15px; border-bottom:1px solid #eee;">
+                                <button class="btn btn-danger" style="padding:6px 12px; font-size:0.85rem; margin:0; width:auto;" onclick="deleteStudent(${row['student_id']})">🗑️ Delete</button>
                             </td>`;
                         } else if (k === 'action_debtor') {
-                            html += `<td style="padding:10px; border-bottom:1px solid #ddd;"><button class="btn btn-info" style="padding:4px 8px; font-size:0.8rem; margin:0; width:auto;" onclick="loadStatement(${row['student_id']})">Open Ledger</button></td>`;
+                            html += `<td style="padding:15px; border-bottom:1px solid #eee;"><button class="btn btn-info" style="padding:6px 12px; font-size:0.85rem; margin:0; width:auto;" onclick="loadStatement(${row['student_id']})">Open Ledger</button></td>`;
                         } else if (k === 'remaining_balance' || k === 'arrears') {
                             let color = val > 0 ? '#dc3545' : '#28a745';
-                            html += `<td style="color:${color}; font-weight:bold; padding:10px; border-bottom:1px solid #ddd;">${val}</td>`;
+                            html += `<td style="color:${color}; font-weight:bold; padding:15px; border-bottom:1px solid #eee;">${val}</td>`;
                         } else if (k === 'boarding_status') {
-                            let badge = val === 'Boarding' ? 'background:#0f4c81;color:white;' : 'background:#eee;color:black;';
-                            html += `<td style="padding:10px; border-bottom:1px solid #ddd;"><span style="${badge}padding:3px 8px;border-radius:12px;font-size:0.8rem;">${val}</span></td>`;
+                            let badge = val === 'Boarding' ? 'background:var(--primary);color:white;' : 'background:#e9ecef;color:#555;';
+                            html += `<td style="padding:15px; border-bottom:1px solid #eee;"><span style="${badge}padding:4px 10px;border-radius:12px;font-size:0.8rem; font-weight:bold;">${val}</span></td>`;
                         } else {
-                            html += `<td style="padding:10px; border-bottom:1px solid #ddd;">${val}</td>`;
+                            html += `<td style="padding:15px; border-bottom:1px solid #eee;">${val}</td>`;
                         }
                     });
                     html += '</tr>';
@@ -1600,7 +1754,7 @@ def dashboard():
                         const labels = data.performance.map(p => p.waec_grade); const counts = data.performance.map(p => p.count);
                         if (waecChartInstance) waecChartInstance.destroy();
                         waecChartInstance = new Chart(document.getElementById('waecChart').getContext('2d'), {
-                            type: 'bar', data: { labels: labels, datasets: [{ label: 'Students', data: counts, backgroundColor: '#0f4c81' }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { title: { display: true, text: 'WAEC Grade Distribution' } } }
+                            type: 'bar', data: { labels: labels, datasets: [{ label: 'Students', data: counts, backgroundColor: '{{ primary_color }}' }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { title: { display: true, text: 'WAEC Grade Distribution' } } }
                         });
                     } catch(e) {}
                 }
@@ -1610,7 +1764,7 @@ def dashboard():
     </body>
     </html>
     """
-    return render_template_string(html_template, current_user=current_user)
+    return render_template_string(html_template, current_user=current_user, school_name=school_name, primary_color=primary_color)
 
 # --- AUTOMATIC BOOT SEQUENCE ---
 with app.app_context():
