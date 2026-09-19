@@ -97,6 +97,12 @@ def initialize_database():
     cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS photo_key VARCHAR(255)")
     
     cur.execute("CREATE TABLE IF NOT EXISTS system_users (user_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, email VARCHAR(100) UNIQUE NOT NULL, password_hash VARCHAR(255) NOT NULL, role VARCHAR(20) NOT NULL, linked_student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE)")
+    
+    # Expand HR Vault Fields
+    cur.execute("ALTER TABLE system_users ADD COLUMN IF NOT EXISTS phone VARCHAR(20)")
+    cur.execute("ALTER TABLE system_users ADD COLUMN IF NOT EXISTS subject VARCHAR(100)")
+    cur.execute("ALTER TABLE system_users ADD COLUMN IF NOT EXISTS base_salary DECIMAL(10,2) DEFAULT 0.00")
+
     cur.execute("CREATE TABLE IF NOT EXISTS subjects (subject_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, subject_name VARCHAR(100) NOT NULL)")
     cur.execute("CREATE TABLE IF NOT EXISTS grades (grade_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, subject_id INTEGER REFERENCES subjects(subject_id) ON DELETE CASCADE, class_score INTEGER NOT NULL, exam_score INTEGER NOT NULL, total_score INTEGER NOT NULL, waec_grade VARCHAR(2) NOT NULL, academic_year VARCHAR(9) NOT NULL, term VARCHAR(20) NOT NULL, teacher_remarks VARCHAR(255))")
     
@@ -289,6 +295,28 @@ def delete_student(student_id):
     finally:
         cur.close(); conn.close()
 
+# THE PROMOTION ENGINE
+@app.route('/api/students/promote', methods=['POST'])
+@login_required
+def promote_students():
+    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
+    d = request.get_json()
+    from_class = str(d.get('from_class') or '').strip()
+    to_class = str(d.get('to_class') or '').strip()
+    if not from_class or not to_class: 
+        return jsonify({"error": "You must provide both Current and Next class names."}), 400
+    
+    conn = get_db_connection(); cur = conn.cursor()
+    try:
+        cur.execute("UPDATE students SET current_class = %s WHERE current_class = %s AND school_id = %s RETURNING student_id", (to_class, from_class, current_user.school_id))
+        promoted = cur.fetchall()
+        conn.commit()
+        return jsonify({"message": f"Success! Promoted {len(promoted)} students from {from_class} to {to_class}."}), 200
+    except Exception as e:
+        conn.rollback(); return jsonify({"error": f"Database Error: {str(e)}"}), 500
+    finally:
+        cur.close(); conn.close()
+
 @app.route('/api/photo/<int:student_id>', methods=['GET'])
 def get_photo(student_id):
     conn = get_db_connection(); cur = conn.cursor()
@@ -314,6 +342,75 @@ def print_ids():
         class_str = s.get('current_class') if s.get('current_class') and s.get('current_class') != 'Unassigned' else 'N/A'
         html += f"<div class='id-card'><div class='header'>{school_name}</div><div class='photo-box'><img src='/api/photo/{s['student_id']}' style='width:100%;height:100%;object-fit:cover;'></div><div class='details'><strong>Name:</strong> {s['first_name']} {s['last_name']}<br><strong>ID:</strong> {school_name[:3].upper()}-{s['student_id']:04d}<br><strong>Class/Prog:</strong> {class_str}<br><strong>Status:</strong> {s['boarding_status']}</div><div class='footer'>VALID FOR CURRENT ACADEMIC YEAR ONLY</div></div>"
     html += "</div></body></html>"
+    return html
+
+# THE PRINTABLE REPORT CARD GENERATOR
+@app.route('/print_report/<int:student_id>', methods=['GET'])
+@login_required
+def print_report(student_id):
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT * FROM students WHERE student_id = %s AND school_id = %s", (student_id, current_user.school_id))
+    student = cur.fetchone()
+    if not student: return "Student record not found or access denied.", 404
+    
+    cur.execute("SELECT school_name FROM institutions WHERE school_id = %s", (current_user.school_id,))
+    school_name = cur.fetchone()['school_name']
+    
+    cur.execute("SELECT sub.subject_name, g.class_score, g.exam_score, g.total_score, g.waec_grade, g.teacher_remarks, g.term, g.academic_year FROM grades g JOIN subjects sub ON g.subject_id = sub.subject_id WHERE g.student_id = %s AND g.school_id = %s ORDER BY g.academic_year DESC, g.term DESC, sub.subject_name", (student_id, current_user.school_id))
+    grades = cur.fetchall()
+    cur.close(); conn.close()
+
+    table_rows = ""
+    for g in grades:
+        table_rows += f"<tr><td>{g['subject_name']}</td><td>{g['class_score']}</td><td>{g['exam_score']}</td><td><strong>{g['total_score']}</strong></td><td><strong>{g['waec_grade']}</strong></td><td>{g['teacher_remarks']}</td><td>{g['term']} ({g['academic_year']})</td></tr>"
+
+    if not table_rows: table_rows = "<tr><td colspan='7' style='text-align:center;'>No academic records found for this student.</td></tr>"
+
+    html = f"""
+    <!DOCTYPE html><html><head><title>Terminal Report | {student['first_name']} {student['last_name']}</title>
+    <style>
+        body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #eee; padding: 20px; color: #333; }}
+        .page {{ background: white; max-width: 900px; margin: auto; padding: 40px; box-shadow: 0 0 15px rgba(0,0,0,0.1); border-radius: 8px; }}
+        .header {{ display: flex; justify-content: space-between; border-bottom: 3px solid #0f4c81; padding-bottom: 20px; margin-bottom: 30px; }}
+        .school-name {{ color: #0f4c81; font-size: 28px; font-weight: bold; margin: 0 0 10px 0; text-transform: uppercase; }}
+        .student-details {{ font-size: 16px; line-height: 1.8; }}
+        .photo {{ width: 120px; height: 140px; border: 2px solid #0f4c81; object-fit: cover; border-radius: 5px; }}
+        table {{ width: 100%; border-collapse: collapse; margin-bottom: 40px; }}
+        th, td {{ border: 1px solid #ddd; padding: 12px; text-align: left; font-size: 14px; }}
+        th {{ background: #0f4c81; color: white; text-transform: uppercase; font-size: 13px; }}
+        tr:nth-child(even) {{ background-color: #f9f9f9; }}
+        .signatures {{ display: flex; justify-content: space-between; margin-top: 80px; padding: 0 20px; }}
+        .sig-line {{ border-top: 2px solid #333; width: 250px; text-align: center; padding-top: 10px; font-weight: bold; font-size: 14px; text-transform: uppercase; }}
+        .btn-print {{ padding:12px 25px; margin-bottom:20px; cursor:pointer; background:#28a745; color:white; border:none; border-radius:5px; font-weight:bold; font-size: 16px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+        @media print {{ body {{ background: white; padding: 0; }} .page {{ box-shadow: none; max-width: 100%; padding: 0; }} .no-print {{ display: none; }} }}
+    </style>
+    </head><body>
+    <div style="text-align: center;"><button class="no-print btn-print" onclick="window.print()">🖨️ Print Official Report</button></div>
+    <div class="page">
+        <div class="header">
+            <div>
+                <h1 class="school-name">{school_name}</h1>
+                <h2 style="margin: 0 0 15px 0; color: #555;">OFFICIAL TERMINAL REPORT</h2>
+                <div class="student-details">
+                    <strong>STUDENT NAME:</strong> {student['first_name'].upper()} {student['last_name'].upper()}<br>
+                    <strong>STUDENT ID:</strong> {school_name[:3].upper()}-{student['student_id']:04d}<br>
+                    <strong>CURRENT CLASS:</strong> {student['current_class'].upper()}<br>
+                    <strong>BOARDING STATUS:</strong> {student['boarding_status'].upper()}
+                </div>
+            </div>
+            <img src="/api/photo/{student['student_id']}" class="photo">
+        </div>
+        <table>
+            <tr><th>Subject</th><th>Class (30%)</th><th>Exam (70%)</th><th>Total (100%)</th><th>Grade</th><th>Teacher's Remarks</th><th>Academic Term</th></tr>
+            {table_rows}
+        </table>
+        <div class="signatures">
+            <div class="sig-line">Class Teacher's Signature</div>
+            <div class="sig-line">Headmaster's Signature</div>
+        </div>
+    </div>
+    </body></html>
+    """
     return html
 
 @app.route('/api/analytics', methods=['GET'])
@@ -552,16 +649,32 @@ def send_sms_blast():
     else:
         return jsonify({"message": f"[SIMULATION] SMS processed for {len(contacts)} parents. Add SMS_API_KEY to Render to go live."}), 200
 
+# --- THE HR VAULT ---
 @app.route('/api/register_staff', methods=['POST'])
 @login_required
 def register_staff():
-    d = request.get_json(); hashed = generate_password_hash(d.get('password'))
+    if current_user.role != 'admin': return jsonify({"error": "Admin clearance required."}), 403
+    d = request.get_json()
+    hashed = generate_password_hash(d.get('password'))
     conn = get_db_connection(); cur = conn.cursor()
     try:
-        cur.execute("INSERT INTO system_users (school_id, email, password_hash, role, linked_student_id) VALUES (%s, %s, %s, %s, %s)", (current_user.school_id, d.get('email'), hashed, d.get('role'), d.get('linked_student_id') or None))
-        conn.commit(); return jsonify({"message": "Account created!"}), 201
-    except: return jsonify({"error": "Email exists."}), 409
-    finally: cur.close(); conn.close()
+        base_salary = float(d.get('salary') or 0.0)
+        cur.execute("INSERT INTO system_users (school_id, email, password_hash, role, phone, subject, base_salary) VALUES (%s, %s, %s, %s, %s, %s, %s)", 
+                    (current_user.school_id, d.get('email'), hashed, 'teacher', d.get('phone'), d.get('subject'), base_salary))
+        conn.commit(); return jsonify({"message": "Staff Profile Created in HR Vault!"}), 201
+    except Exception as e:
+        conn.rollback(); return jsonify({"error": "Email exists or invalid data format."}), 409
+    finally:
+        cur.close(); conn.close()
+
+@app.route('/api/staff', methods=['GET'])
+@login_required
+def get_staff():
+    if current_user.role != 'admin': return jsonify({"error": "Admin clearance required."}), 403
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT email, phone, subject, base_salary FROM system_users WHERE school_id = %s AND role = 'teacher' ORDER BY email", (current_user.school_id,))
+    staff = cur.fetchall(); cur.close(); conn.close()
+    return jsonify({"data": staff})
 
 # --- 8. THE FRONTEND DASHBOARD ---
 @app.route('/dashboard')
@@ -597,9 +710,11 @@ def dashboard():
             <h2>SaaS ERP Engine</h2>
             {% if current_user.is_authenticated %}
                 <div style="font-size: 0.85rem; color: #a5c3e0; margin-bottom: 20px;">Role: <span style="text-transform: uppercase;">{{ current_user.role }}</span></div>
+                
                 {% if current_user.role == 'superadmin' %}
                     <button onclick="window.location.reload()">🏢 Global Tenants</button>
                     <button class="btn-success" onclick="sendAction('/api/setup_db', {}, true)">Sync Database</button>
+                
                 {% elif current_user.role == 'admin' %}
                     <button onclick="showSection('analytics-section')">📊 Dashboard</button>
                     <button onclick="showSection('finance-section')">💰 Financials & Billing</button>
@@ -608,7 +723,12 @@ def dashboard():
                     <button onclick="showSection('academics-section')">📚 Academics</button>
                     <button onclick="showSection('sms-section')">📟 SMS Desk</button>
                     <button onclick="showSection('hr-section')">🧑‍🏫 Staff HR</button>
+                
+                {% elif current_user.role == 'teacher' %}
+                    <button onclick="showSection('attendance-section')">📅 Daily Roll Call</button>
+                    <button onclick="showSection('academics-section')">📚 SBA Grading</button>
                 {% endif %}
+                
                 <br><br><button class="btn-danger" onclick="logout()">Secure Logout</button>
             {% else %}
                 <button class="btn-success" onclick="sendAction('/api/setup_db', {}, true)">1. Sync Database</button>
@@ -637,186 +757,208 @@ def dashboard():
                 <h3>Global Tenants</h3><button class="btn" onclick="loadSchools()">Refresh List</button><div id="school-container"></div>
             </div>
 
-            {% elif current_user.role == 'admin' %}
+            {% elif current_user.role in ['admin', 'teacher'] %}
             
-            <!-- Dashboard Section -->
-            <div id="analytics-section" class="card admin-section">
-                <h3>Corporate Analytics</h3>
-                <div class="grid-2" style="margin-bottom: 20px;">
-                    <div class="metric-box" style="background: var(--primary);" id="metricRevenue">Gross Revenue: GHS 0.00</div>
-                    <div class="metric-box" style="background: var(--danger);" id="metricExpenses">Total Expenses: GHS 0.00</div>
-                    <div class="metric-box" style="background: var(--accent); grid-column: span 2;" id="metricMargin">Net Margin: GHS 0.00</div>
-                </div>
-                <div class="grid-2">
-                    <div style="position: relative; height: 250px;"><canvas id="financeChart"></canvas></div>
-                    <div style="position: relative; height: 250px;"><canvas id="waecChart"></canvas></div>
-                </div>
-            </div>
-
-            <!-- Financials Section (OVERHAULED) -->
-            <div id="finance-section" class="card admin-section hidden" style="border: 2px solid var(--danger);">
-                <h3>💰 Financial Ledger & Operations</h3>
-                <div class="grid-2">
-                    <div style="background: #f8f9fa; padding: 15px; border-radius: 8px;">
-                        <h4 style="margin-top:0;">1. Issue Segmented Bill</h4>
-                        <input type="number" id="bStuId" placeholder="Student ID (Required)">
-                        <select id="bCat">
-                            <option value="Consolidated Fee">Consolidated Term Fee (All-Inclusive)</option>
-                            <option value="Tuition">Tuition Fee</option>
-                            <option value="PTA Dues">PTA Dues</option>
-                            <option value="Feeding Fee">Feeding Fee</option>
-                            <option value="Exams Fee">Exams Fee</option>
-                            <option value="Arrears (Past Term)">Arrears (Past Term)</option>
-                        </select>
-                        <div class="grid-2">
-                            <input type="text" id="bTerm" placeholder="Term (e.g. Term 1)">
-                            <input type="text" id="bYear" placeholder="Year (e.g. 2026)">
-                        </div>
-                        <input type="number" id="bAmount" placeholder="Amount Due (GHS)">
-                        <input type="text" id="bDesc" placeholder="Description / Memo">
-                        <button class="btn btn-success" onclick="issueBill()">Issue Bill & View Ledger</button>
+                {% if current_user.role == 'admin' %}
+                <!-- Analytics Section -->
+                <div id="analytics-section" class="card admin-section">
+                    <h3>Corporate Analytics</h3>
+                    <div class="grid-2" style="margin-bottom: 20px;">
+                        <div class="metric-box" style="background: var(--primary);" id="metricRevenue">Gross Revenue: GHS 0.00</div>
+                        <div class="metric-box" style="background: var(--danger);" id="metricExpenses">Total Expenses: GHS 0.00</div>
+                        <div class="metric-box" style="background: var(--accent); grid-column: span 2;" id="metricMargin">Net Margin: GHS 0.00</div>
                     </div>
+                    <div class="grid-2">
+                        <div style="position: relative; height: 250px;"><canvas id="financeChart"></canvas></div>
+                        <div style="position: relative; height: 250px;"><canvas id="waecChart"></canvas></div>
+                    </div>
+                </div>
 
-                    <div>
-                        <div style="background: #e9ecef; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
-                            <h4 style="margin-top:0;">2. Student Ledger & Payments</h4>
-                            <p style="font-size: 0.85rem; color: #555;">Search a student to instantly view their bills, check balances, and record payments.</p>
+                <!-- Financials Section -->
+                <div id="finance-section" class="card admin-section hidden" style="border: 2px solid var(--danger);">
+                    <h3>💰 Financial Ledger & Operations</h3>
+                    <div class="grid-2">
+                        <div style="background: #f8f9fa; padding: 15px; border-radius: 8px;">
+                            <h4 style="margin-top:0;">1. Issue Segmented Bill</h4>
+                            <input type="number" id="bStuId" placeholder="Student ID (Required)">
+                            <select id="bCat">
+                                <option value="Consolidated Fee">Consolidated Term Fee (All-Inclusive)</option>
+                                <option value="Tuition">Tuition Fee</option>
+                                <option value="PTA Dues">PTA Dues</option>
+                                <option value="Feeding Fee">Feeding Fee</option>
+                                <option value="Exams Fee">Exams Fee</option>
+                                <option value="Arrears (Past Term)">Arrears (Past Term)</option>
+                            </select>
                             <div class="grid-2">
-                                <input type="number" id="stateStuId" placeholder="Student ID">
-                                <button class="btn btn-primary" style="background: var(--primary);" onclick="loadStatement()">Open Ledger</button>
+                                <input type="text" id="bTerm" placeholder="Term (e.g. Term 1)">
+                                <input type="text" id="bYear" placeholder="Year (e.g. 2026)">
+                            </div>
+                            <input type="number" id="bAmount" placeholder="Amount Due (GHS)">
+                            <input type="text" id="bDesc" placeholder="Description / Memo">
+                            <button class="btn btn-success" onclick="issueBill()">Issue Bill & View Ledger</button>
+                        </div>
+
+                        <div>
+                            <div style="background: #e9ecef; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                                <h4 style="margin-top:0;">2. Student Ledger & Payments</h4>
+                                <p style="font-size: 0.85rem; color: #555;">Search a student to instantly view their bills, check balances, and record payments.</p>
+                                <div class="grid-2">
+                                    <input type="number" id="stateStuId" placeholder="Student ID">
+                                    <button class="btn btn-primary" style="background: var(--primary);" onclick="loadStatement()">Open Ledger</button>
+                                </div>
+                            </div>
+                            
+                            <div style="background: #fff3cd; padding: 15px; border-radius: 8px; border: 1px solid var(--warning); margin-bottom: 15px;">
+                                <h4 style="margin-top:0;">3. Arrears & Debtors Tracker</h4>
+                                <button class="btn btn-warning" onclick="loadDebtors()">View All Students Who Owe</button>
+                            </div>
+                            
+                            <div style="background: #f8d7da; padding: 15px; border-radius: 8px; border: 1px solid var(--danger);">
+                                <h4 style="margin-top:0;">4. Log Operational Expense</h4>
+                                <select id="eCat"><option value="Staff Salaries">Staff Salaries</option><option value="Boarding Provisions">Boarding Provisions</option><option value="Utilities">Utilities</option></select>
+                                <div class="grid-2"><input type="text" id="eDesc" placeholder="Desc"><input type="number" id="eAmount" placeholder="Amount"></div>
+                                <button class="btn btn-danger" onclick="sendAction('/api/expenses', {category: document.getElementById('eCat').value, description: document.getElementById('eDesc').value, amount: document.getElementById('eAmount').value})">Log Outflow</button>
+                                <button class="btn btn-info" style="margin-bottom:0;" onclick="loadExpenses()">View Expenses</button>
                             </div>
                         </div>
-                        
-                        <div style="background: #fff3cd; padding: 15px; border-radius: 8px; border: 1px solid var(--warning); margin-bottom: 15px;">
-                            <h4 style="margin-top:0;">3. Arrears & Debtors Tracker</h4>
-                            <button class="btn btn-warning" onclick="loadDebtors()">View All Students Who Owe</button>
+                    </div>
+                </div>
+
+                <!-- Admissions Section (With Promotion Engine) -->
+                <div id="admissions-section" class="card grid-2 admin-section hidden">
+                    <div>
+                        <h3>Enroll New Student</h3>
+                        <div class="grid-2"><input type="text" id="sFirst" placeholder="First Name"><input type="text" id="sLast" placeholder="Last Name"></div>
+                        <div class="grid-2">
+                            <input type="text" id="sClass" placeholder="Class / Program (e.g., Basic 1)">
+                            <select id="sBoarding"><option value="Day">Day Student</option><option value="Boarding">Boarding Student</option></select>
                         </div>
+                        <div class="grid-2">
+                            <input type="text" id="sHouse" placeholder="House (or N/A)">
+                            <input type="text" id="sGName" placeholder="Guardian Name">
+                        </div>
+                        <div class="grid-2" style="margin-bottom: 15px;">
+                            <input type="text" id="sGContact" placeholder="Guardian Contact">
+                            <div>
+                                <label style="font-size:0.8rem; font-weight:bold; display:block; margin-bottom: 5px;">Passport Photo</label>
+                                <input type="file" id="sPhoto" accept="image/*" style="margin-bottom: 0;">
+                            </div>
+                        </div>
+                        <button class="btn btn-success" onclick="enrollStudent()">Register Student</button>
+                    </div>
+                    <div>
+                        <h3>ID & Directory Tools</h3>
+                        <button class="btn btn-warning" onclick="window.open('/print_ids', '_blank')">🖨️ Generate Batch ID Cards</button>
+                        <button class="btn btn-info" onclick="loadRoster()">View Digital Directory</button>
+                        <hr style="margin:20px 0; border:1px solid #eee;">
                         
-                        <div style="background: #f8d7da; padding: 15px; border-radius: 8px; border: 1px solid var(--danger);">
-                            <h4 style="margin-top:0;">4. Log Operational Expense</h4>
-                            <select id="eCat"><option value="Staff Salaries">Staff Salaries</option><option value="Boarding Provisions">Boarding Provisions</option><option value="Utilities">Utilities</option></select>
-                            <div class="grid-2"><input type="text" id="eDesc" placeholder="Desc"><input type="number" id="eAmount" placeholder="Amount"></div>
-                            <button class="btn btn-danger" onclick="sendAction('/api/expenses', {category: document.getElementById('eCat').value, description: document.getElementById('eDesc').value, amount: document.getElementById('eAmount').value})">Log Outflow</button>
-                            <button class="btn btn-info" style="margin-bottom:0;" onclick="loadExpenses()">View Expenses</button>
+                        <!-- NEW: Promotion Engine -->
+                        <div style="background: #e2e3e5; padding: 15px; border-radius: 8px;">
+                            <h4 style="margin-top:0;">End-of-Year Promotion Engine</h4>
+                            <p style="font-size:0.8rem; color:#555;">Move an entire class cohort up to the next grade level instantly.</p>
+                            <input type="text" id="promoFrom" placeholder="Current Class (Exact Name)">
+                            <input type="text" id="promoTo" placeholder="Next Class (Exact Name)">
+                            <button class="btn btn-warning" onclick="promoteClass()" style="color:#333;">Promote Cohort</button>
                         </div>
                     </div>
                 </div>
-            </div>
+                {% endif %}
 
-            <!-- Admissions Section -->
-            <div id="admissions-section" class="card grid-2 admin-section hidden">
-                <div>
-                    <h3>Enroll New Student</h3>
-                    <div class="grid-2"><input type="text" id="sFirst" placeholder="First Name"><input type="text" id="sLast" placeholder="Last Name"></div>
+                <!-- Shared Teacher/Admin Sections -->
+                <div id="attendance-section" class="card admin-section {% if current_user.role == 'admin' %}hidden{% endif %}" style="border: 2px solid var(--info);">
+                    <h3>📅 Daily Roll Call & Feeding Optimization</h3>
                     <div class="grid-2">
-                        <input type="text" id="sClass" placeholder="Class / Program (e.g., Basic 1, Gen Arts)">
-                        <select id="sBoarding"><option value="Day">Day Student</option><option value="Boarding">Boarding Student</option></select>
-                    </div>
-                    <div class="grid-2">
-                        <input type="text" id="sHouse" placeholder="House (or N/A)">
-                        <input type="text" id="sGName" placeholder="Guardian Name">
-                    </div>
-                    <div class="grid-2" style="margin-bottom: 15px;">
-                        <input type="text" id="sGContact" placeholder="Guardian Contact">
                         <div>
-                            <label style="font-size:0.8rem; font-weight:bold; display:block; margin-bottom: 5px;">Passport Photo</label>
-                            <input type="file" id="sPhoto" accept="image/*" style="margin-bottom: 0;">
+                            <input type="date" id="attDate" value="">
+                            <input type="number" id="attStuId" placeholder="Student ID">
+                        </div>
+                        <div>
+                            <select id="attStatus">
+                                <option value="Present">Present (Include in Feeding)</option>
+                                <option value="Absent">Absent (Remove from Feeding)</option>
+                            </select>
+                            <button class="btn btn-info" onclick="sendAction('/api/attendance', {student_id: document.getElementById('attStuId').value, record_date: document.getElementById('attDate').value, status: document.getElementById('attStatus').value})">Mark Attendance</button>
                         </div>
                     </div>
-                    <button class="btn btn-success" onclick="enrollStudent()">Register Student</button>
                 </div>
-                <div>
-                    <h3>ID & Directory Tools</h3>
-                    <button class="btn btn-warning" onclick="window.open('/print_ids', '_blank')">🖨️ Generate Batch ID Cards</button>
-                    <hr style="margin:20px 0; border:1px solid #eee;">
-                    <button class="btn" onclick="loadRoster()">View Digital Directory</button>
-                </div>
-            </div>
 
-            <!-- Attendance Section -->
-            <div id="attendance-section" class="card admin-section hidden" style="border: 2px solid var(--info);">
-                <h3>📅 Daily Roll Call & Feeding Optimization</h3>
-                <div class="grid-2">
+                <div id="academics-section" class="card grid-2 admin-section hidden">
                     <div>
-                        <input type="date" id="attDate" value="">
-                        <input type="number" id="attStuId" placeholder="Student ID">
+                        <h3>Record SBA Grade (30/70)</h3>
+                        <div class="grid-2">
+                            <input type="number" id="gStuId" placeholder="Student ID (Required)">
+                            <input type="text" id="gSub" placeholder="Subject">
+                        </div>
+                        <div class="grid-2">
+                            <input type="number" id="gClass" placeholder="Class Score (30%)">
+                            <input type="number" id="gExam" placeholder="Exam Score (70%)">
+                        </div>
+                        <div class="grid-2">
+                            <input type="text" id="gTerm" placeholder="Term (e.g. Term 1)">
+                            <input type="text" id="gYear" placeholder="Year (e.g. 2026)">
+                        </div>
+                        <input type="text" id="gRem" placeholder="Teacher's Remark (e.g. Very impressive)">
+                        <button class="btn" onclick="sendAction('/api/grades', {student_id: document.getElementById('gStuId').value, subject_name: document.getElementById('gSub').value, class_score: document.getElementById('gClass').value, exam_score: document.getElementById('gExam').value, term: document.getElementById('gTerm').value, academic_year: document.getElementById('gYear').value, remarks: document.getElementById('gRem').value})">Save SBA Record</button>
                     </div>
                     <div>
-                        <select id="attStatus">
-                            <option value="Present">Present (Include in Feeding)</option>
-                            <option value="Absent">Absent (Remove from Feeding)</option>
-                        </select>
-                        <button class="btn btn-info" onclick="sendAction('/api/attendance', {student_id: document.getElementById('attStuId').value, record_date: document.getElementById('attDate').value, status: document.getElementById('attStatus').value})">Mark Attendance</button>
+                        <h3>Terminal Reports</h3>
+                        <p style="font-size: 0.85rem; color: #555;">View raw grading data or generate a beautifully formatted, print-ready official report card.</p>
+                        <input type="number" id="repId" placeholder="Student ID">
+                        <button class="btn btn-info" onclick="loadReport()">View Raw Data Table</button>
+                        <button class="btn btn-success" onclick="printReportCard()">🖨️ Generate Official Report Card</button>
                     </div>
                 </div>
-            </div>
 
-            <!-- Academics Section -->
-            <div id="academics-section" class="card grid-2 admin-section hidden">
-                <div>
-                    <h3>Record SBA Grade (30/70)</h3>
+                {% if current_user.role == 'admin' %}
+                <!-- SMS Desk Section -->
+                <div id="sms-section" class="card admin-section hidden" style="border: 2px solid var(--info);">
+                    <h3>📟 SMS Communication Desk</h3>
                     <div class="grid-2">
-                        <input type="number" id="gStuId" placeholder="Student ID (Required)">
-                        <input type="text" id="gSub" placeholder="Subject">
+                        <div>
+                            <label style="font-weight:bold; display:block; margin-bottom:5px;">Target Audience</label>
+                            <select id="smsAudience">
+                                <option value="all">Broadcast to All Parents</option>
+                                <option value="arrears">Only Parents with Unpaid Arrears</option>
+                                <option value="boarding">Parents of Boarding Students</option>
+                            </select>
+                            <p style="font-size:0.8rem; color:#666;">The system will automatically extract contact numbers from the database based on your selection.</p>
+                        </div>
+                        <div>
+                            <label style="font-weight:bold; display:block; margin-bottom:5px;">Message Content</label>
+                            <textarea id="smsBody" placeholder="Enter your text message here..."></textarea>
+                            <button class="btn btn-info" onclick="sendAction('/api/sms/blast', {audience: document.getElementById('smsAudience').value, message: document.getElementById('smsBody').value})">Send SMS Broadcast</button>
+                        </div>
                     </div>
-                    <div class="grid-2">
-                        <input type="number" id="gClass" placeholder="Class Score (30%)">
-                        <input type="number" id="gExam" placeholder="Exam Score (70%)">
-                    </div>
-                    <div class="grid-2">
-                        <input type="text" id="gTerm" placeholder="Term (e.g. Term 1)">
-                        <input type="text" id="gYear" placeholder="Year (e.g. 2026)">
-                    </div>
-                    <input type="text" id="gRem" placeholder="Teacher's Remark (e.g. Very impressive)">
-                    <button class="btn" onclick="sendAction('/api/grades', {student_id: document.getElementById('gStuId').value, subject_name: document.getElementById('gSub').value, class_score: document.getElementById('gClass').value, exam_score: document.getElementById('gExam').value, term: document.getElementById('gTerm').value, academic_year: document.getElementById('gYear').value, remarks: document.getElementById('gRem').value})">Save SBA Record</button>
                 </div>
-                <div>
-                    <h3>Terminal Reports</h3>
-                    <input type="number" id="repId" placeholder="Student ID">
-                    <button class="btn btn-success" onclick="loadReport()">View Terminal Report Card</button>
-                </div>
-            </div>
 
-            <!-- SMS Desk Section -->
-            <div id="sms-section" class="card admin-section hidden" style="border: 2px solid var(--info);">
-                <h3>📟 SMS Communication Desk</h3>
-                <div class="grid-2">
+                <!-- Expanded Staff HR Vault -->
+                <div id="hr-section" class="card grid-2 admin-section hidden">
                     <div>
-                        <label style="font-weight:bold; display:block; margin-bottom:5px;">Target Audience</label>
-                        <select id="smsAudience">
-                            <option value="all">Broadcast to All Parents</option>
-                            <option value="arrears">Only Parents with Unpaid Arrears</option>
-                            <option value="boarding">Parents of Boarding Students</option>
-                        </select>
-                        <p style="font-size:0.8rem; color:#666;">The system will automatically extract contact numbers from the database based on your selection.</p>
+                        <h3>Register Staff Profile</h3>
+                        <div class="grid-2">
+                            <input type="email" id="tEmail" placeholder="Teacher Email">
+                            <input type="password" id="tPass" placeholder="Temporary Password">
+                        </div>
+                        <div class="grid-2">
+                            <input type="text" id="tPhone" placeholder="Phone Number">
+                            <input type="text" id="tSubj" placeholder="Assigned Subject">
+                        </div>
+                        <input type="number" id="tSal" placeholder="Base Salary (GHS)">
+                        <button class="btn btn-success" onclick="registerStaff()">Add to HR Directory</button>
                     </div>
                     <div>
-                        <label style="font-weight:bold; display:block; margin-bottom:5px;">Message Content</label>
-                        <textarea id="smsBody" placeholder="Enter your text message here..."></textarea>
-                        <button class="btn btn-info" onclick="sendAction('/api/sms/blast', {audience: document.getElementById('smsAudience').value, message: document.getElementById('smsBody').value})">Send SMS Broadcast</button>
+                        <h3>Compliance & Payroll Vault</h3>
+                        <p style="font-size: 0.9rem; color: #666;">Maintain digital records of your teaching staff to ensure instant readiness for GES auditing.</p>
+                        <button class="btn btn-info" onclick="loadStaff()">View Staff Directory</button>
                     </div>
                 </div>
-            </div>
+                {% endif %}
 
-            <!-- Staff HR Section -->
-            <div id="hr-section" class="card grid-2 admin-section hidden">
-                <div>
-                    <h3>Register Staff Profile</h3>
-                    <input type="email" id="tEmail" placeholder="Teacher Email">
-                    <input type="password" id="tPass" placeholder="Temporary Password">
-                    <button class="btn" onclick="sendAction('/api/register_staff', {email: document.getElementById('tEmail').value, password: document.getElementById('tPass').value, role: 'teacher'})">Add to HR Directory</button>
+                <!-- Shared Data Viewer -->
+                <div class="card hidden" id="data-viewer" style="border: 2px solid var(--primary);">
+                    <h3 id="viewer-title">Data Explorer</h3>
+                    <div id="table-container"></div>
                 </div>
-                <div>
-                    <h3>Compliance Vault</h3>
-                    <p style="font-size: 0.9rem; color: #666;">Maintain digital records of staff to ensure instant readiness for GES auditing.</p>
-                </div>
-            </div>
-
-            <!-- Shared Data Viewer -->
-            <div class="card hidden" id="data-viewer" style="border: 2px solid var(--primary);">
-                <h3 id="viewer-title">Data Explorer</h3>
-                <div id="table-container"></div>
-            </div>
             {% endif %}
         </main>
 
@@ -921,7 +1063,40 @@ def dashboard():
                 } catch(e) { showToast("Connection failed", true); }
             }
 
-            // --- THE NEW ISSUANCE AND PAYMENT ENGINE ---
+            async function promoteClass() {
+                const fromC = document.getElementById('promoFrom').value;
+                const toC = document.getElementById('promoTo').value;
+                if(!fromC || !toC) { showToast("Enter both classes", true); return; }
+                if(!confirm(`Are you sure you want to promote ALL students currently in ${fromC} to ${toC}?`)) return;
+                
+                try {
+                    const res = await fetch('/api/students/promote', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({from_class: fromC, to_class: toC}) });
+                    const data = await res.json();
+                    if(res.ok) { showToast(data.message); loadRoster(); }
+                    else { showToast(data.error, true); }
+                } catch(e) { showToast("Connection failed", true); }
+            }
+
+            async function registerStaff() {
+                const payload = {
+                    email: document.getElementById('tEmail').value,
+                    password: document.getElementById('tPass').value,
+                    phone: document.getElementById('tPhone').value,
+                    subject: document.getElementById('tSubj').value,
+                    salary: document.getElementById('tSal').value
+                };
+                try {
+                    const res = await fetch('/api/register_staff', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+                    const data = await res.json();
+                    if(res.ok) { 
+                        showToast(data.message); 
+                        document.getElementById('tEmail').value = ''; document.getElementById('tPass').value = ''; 
+                        document.getElementById('tPhone').value = ''; document.getElementById('tSubj').value = ''; document.getElementById('tSal').value = '';
+                        loadStaff(); 
+                    } else { showToast(data.error, true); }
+                } catch(e) { showToast("Connection failed", true); }
+            }
+
             async function issueBill() {
                 const stuId = document.getElementById('bStuId').value;
                 const payload = {
@@ -937,8 +1112,7 @@ def dashboard():
                     const data = await res.json();
                     if(res.ok) {
                         showToast(data.message);
-                        document.getElementById('bAmount').value = '';
-                        document.getElementById('bDesc').value = '';
+                        document.getElementById('bAmount').value = ''; document.getElementById('bDesc').value = '';
                         loadStatement(stuId);
                     } else { showToast(data.error, true); }
                 } catch(e) { showToast("Connection failed", true); }
@@ -956,9 +1130,15 @@ def dashboard():
                     const data = await res.json();
                     if(res.ok) {
                         showToast(data.message);
-                        loadStatement(stuId); // Auto-refresh the ledger to show the new balance
+                        loadStatement(stuId);
                     } else { showToast(data.error, true); }
                 } catch(e) { showToast("Connection failed", true); }
+            }
+
+            function printReportCard() {
+                const id = document.getElementById('repId').value;
+                if (!id) { showToast("Please enter a Student ID", true); return; }
+                window.open('/print_report/' + id, '_blank');
             }
 
             async function loadSchools() {
@@ -1055,6 +1235,10 @@ def dashboard():
                 const res = await fetch('/api/students'); const data = await res.json();
                 renderTable("Student Roster", ['Photo', 'ID', 'First Name', 'Last Name', 'Class/Program', 'Status', 'House', 'Guardian Contact', 'Action'], data.data, ['photo', 'student_id', 'first_name', 'last_name', 'current_class', 'boarding_status', 'house', 'guardian_contact', 'action_roster']);
             }
+            async function loadStaff() {
+                const res = await fetch('/api/staff'); const data = await res.json();
+                renderTable("Staff Directory", ['Teacher Email', 'Phone Number', 'Subject', 'Base Salary (GHS)'], data.data, ['email', 'phone', 'subject', 'base_salary']);
+            }
             async function loadExpenses() {
                 const res = await fetch('/api/expenses'); const data = await res.json();
                 renderTable("Expense Ledger", ['Date', 'Category', 'Description', 'Amount (GHS)'], data.data, ['date', 'category', 'description', 'amount']);
@@ -1065,10 +1249,11 @@ def dashboard():
             }
             async function loadReport() {
                 const id = document.getElementById('repId').value;
+                if(!id) { showToast("Please enter a Student ID", true); return; }
                 const res = await fetch('/api/report_card/' + id);
                 if (!res.ok) { showToast("Not Found", true); return; }
                 const data = await res.json();
-                renderTable("Terminal Report Card", ['Subject', 'Class', 'Exam', 'Total', 'Grade', 'Remarks', 'Term'], data.grades, ['subject_name', 'class_score', 'exam_score', 'total_score', 'waec_grade', 'teacher_remarks', 'term']);
+                renderTable("Raw Grading Data", ['Subject', 'Class', 'Exam', 'Total', 'Grade', 'Remarks', 'Term'], data.grades, ['subject_name', 'class_score', 'exam_score', 'total_score', 'waec_grade', 'teacher_remarks', 'term']);
             }
             async function loadStatement(overrideId) {
                 const id = overrideId || document.getElementById('stateStuId').value;
