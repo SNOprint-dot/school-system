@@ -93,6 +93,7 @@ def initialize_database():
     
     cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS boarding_status VARCHAR(20) DEFAULT 'Day'")
     cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS house VARCHAR(100) DEFAULT 'Unassigned'")
+    cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS current_class VARCHAR(100) DEFAULT 'Unassigned'")
     cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS photo_key VARCHAR(255)")
     
     cur.execute("CREATE TABLE IF NOT EXISTS system_users (user_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, email VARCHAR(100) UNIQUE NOT NULL, password_hash VARCHAR(255) NOT NULL, role VARCHAR(20) NOT NULL, linked_student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE)")
@@ -224,7 +225,7 @@ def restore_backup(school_id):
                 cur.execute("INSERT INTO subjects (subject_id, school_id, subject_name) VALUES (%s, %s, %s) ON CONFLICT (subject_id) DO NOTHING", (r['subject_id'], school_id, r['subject_name']))
         if 'students' in data['data']:
             for r in data['data']['students']:
-                cur.execute("INSERT INTO students (student_id, school_id, first_name, last_name, guardian_name, guardian_contact, boarding_status, house, photo_key, enrollment_date) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (student_id) DO NOTHING", (r['student_id'], school_id, r['first_name'], r['last_name'], r['guardian_name'], r['guardian_contact'], r.get('boarding_status', 'Day'), r.get('house', 'Unassigned'), r.get('photo_key'), r['enrollment_date']))
+                cur.execute("INSERT INTO students (student_id, school_id, first_name, last_name, current_class, guardian_name, guardian_contact, boarding_status, house, photo_key, enrollment_date) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (student_id) DO NOTHING", (r['student_id'], school_id, r['first_name'], r['last_name'], r.get('current_class', 'Unassigned'), r['guardian_name'], r['guardian_contact'], r.get('boarding_status', 'Day'), r.get('house', 'Unassigned'), r.get('photo_key'), r['enrollment_date']))
         if 'fees' in data['data']:
             for r in data['data']['fees']:
                 cur.execute("INSERT INTO fees (fee_id, school_id, student_id, fee_category, description, amount_due, academic_year, term, date_issued) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (fee_id) DO NOTHING", (r['fee_id'], school_id, r['student_id'], r.get('fee_category', 'General'), r['description'], r['amount_due'], r.get('academic_year', 'Unknown'), r.get('term', 'Unknown'), r['date_issued']))
@@ -255,13 +256,13 @@ def manage_students():
                 photo_key = f"student_photos/{current_user.school_id}/{uuid.uuid4().hex}.jpg"
                 s3_client.put_object(Bucket=AWS_BUCKET_NAME, Key=photo_key, Body=base64.b64decode(photo_b64), ContentType='image/jpeg')
             except Exception: pass
-        cur.execute("INSERT INTO students (school_id, first_name, last_name, guardian_name, guardian_contact, boarding_status, house, photo_key) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING student_id", 
-                    (current_user.school_id, data.get('first_name'), data.get('last_name'), data.get('guardian_name'), data.get('guardian_contact'), data.get('boarding_status', 'Day'), data.get('house', 'Unassigned'), photo_key))
+        cur.execute("INSERT INTO students (school_id, first_name, last_name, current_class, guardian_name, guardian_contact, boarding_status, house, photo_key) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING student_id", 
+                    (current_user.school_id, data.get('first_name'), data.get('last_name'), data.get('current_class', 'Unassigned'), data.get('guardian_name'), data.get('guardian_contact'), data.get('boarding_status', 'Day'), data.get('house', 'Unassigned'), photo_key))
         new_id = cur.fetchone()['student_id']
         conn.commit(); cur.close(); conn.close()
         return jsonify({"message": f"Student Enrolled successfully! ID: {new_id}"}), 201
     else:
-        cur.execute("SELECT student_id, first_name, last_name, boarding_status, house, guardian_contact FROM students WHERE school_id = %s ORDER BY student_id DESC", (current_user.school_id,))
+        cur.execute("SELECT student_id, first_name, last_name, current_class, boarding_status, house, guardian_contact FROM students WHERE school_id = %s ORDER BY student_id DESC", (current_user.school_id,))
         students = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": students})
 
 @app.route('/api/students/<int:student_id>', methods=['DELETE'])
@@ -304,13 +305,14 @@ def get_photo(student_id):
 @login_required
 def print_ids():
     conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT student_id, first_name, last_name, boarding_status, house FROM students WHERE school_id = %s ORDER BY student_id", (current_user.school_id,))
+    cur.execute("SELECT student_id, first_name, last_name, current_class, boarding_status, house FROM students WHERE school_id = %s ORDER BY student_id", (current_user.school_id,))
     students = cur.fetchall()
     cur.execute("SELECT school_name FROM institutions WHERE school_id = %s", (current_user.school_id,))
     school_name = cur.fetchone()['school_name']; cur.close(); conn.close()
     html = f"<!DOCTYPE html><html><head><title>Print IDs</title><style>body{{font-family:Arial;background:#f0f0f0;padding:20px;}}.page{{display:grid;grid-template-columns:repeat(2,1fr);gap:15px;max-width:800px;margin:auto;}}.id-card{{background:white;border:2px solid #0f4c81;border-radius:8px;padding:15px;width:350px;height:200px;box-sizing:border-box;position:relative;overflow:hidden;}}.header{{background:#0f4c81;color:white;text-align:center;padding:5px;margin:-15px -15px 10px -15px;border-radius:6px 6px 0 0;font-weight:bold;font-size:14px;}}.photo-box{{width:70px;height:90px;border:1px solid #ccc;float:left;margin-right:15px;background:#eee;}}.details{{float:left;font-size:12px;line-height:1.6;width:calc(100% - 90px);}}.footer{{position:absolute;bottom:0;left:0;width:100%;background:#eee;text-align:center;font-size:10px;padding:5px 0;font-weight:bold;}}@media print{{body{{background:white;padding:0;}}.no-print{{display:none;}}}}</style></head><body><button class='no-print' onclick='window.print()' style='padding:10px;margin-bottom:20px;cursor:pointer;'>🖨️ Print IDs</button><div class='page'>"
     for s in students:
-        html += f"<div class='id-card'><div class='header'>{school_name}</div><div class='photo-box'><img src='/api/photo/{s['student_id']}' style='width:100%;height:100%;object-fit:cover;'></div><div class='details'><strong>Name:</strong> {s['first_name']} {s['last_name']}<br><strong>ID:</strong> {school_name[:3].upper()}-{s['student_id']:04d}<br><strong>Status:</strong> {s['boarding_status']}<br><strong>House:</strong> {s['house']}</div><div class='footer'>VALID FOR CURRENT ACADEMIC YEAR ONLY</div></div>"
+        class_str = s.get('current_class') if s.get('current_class') and s.get('current_class') != 'Unassigned' else 'N/A'
+        html += f"<div class='id-card'><div class='header'>{school_name}</div><div class='photo-box'><img src='/api/photo/{s['student_id']}' style='width:100%;height:100%;object-fit:cover;'></div><div class='details'><strong>Name:</strong> {s['first_name']} {s['last_name']}<br><strong>ID:</strong> {school_name[:3].upper()}-{s['student_id']:04d}<br><strong>Class/Prog:</strong> {class_str}<br><strong>Status:</strong> {s['boarding_status']}</div><div class='footer'>VALID FOR CURRENT ACADEMIC YEAR ONLY</div></div>"
     html += "</div></body></html>"
     return html
 
@@ -409,7 +411,6 @@ def log_payment():
         cur.close()
         conn.close()
 
-# --- THE DEBTORS ENGINE ---
 @app.route('/api/debtors', methods=['GET'])
 @login_required
 def get_debtors():
@@ -708,13 +709,19 @@ def dashboard():
                     <h3>Enroll New Student</h3>
                     <div class="grid-2"><input type="text" id="sFirst" placeholder="First Name"><input type="text" id="sLast" placeholder="Last Name"></div>
                     <div class="grid-2">
+                        <input type="text" id="sClass" placeholder="Class / Program (e.g., Basic 1, Gen Arts)">
                         <select id="sBoarding"><option value="Day">Day Student</option><option value="Boarding">Boarding Student</option></select>
-                        <input type="text" id="sHouse" placeholder="House (e.g. Aggrey House)">
                     </div>
-                    <div class="grid-2"><input type="text" id="sGName" placeholder="Guardian Name"><input type="text" id="sGContact" placeholder="Contact"></div>
-                    <div style="margin-bottom: 15px;">
-                        <label style="font-size:0.8rem; font-weight:bold;">Passport Photo (Auto-Compressing)</label>
-                        <input type="file" id="sPhoto" accept="image/*">
+                    <div class="grid-2">
+                        <input type="text" id="sHouse" placeholder="House (or N/A)">
+                        <input type="text" id="sGName" placeholder="Guardian Name">
+                    </div>
+                    <div class="grid-2" style="margin-bottom: 15px;">
+                        <input type="text" id="sGContact" placeholder="Guardian Contact">
+                        <div>
+                            <label style="font-size:0.8rem; font-weight:bold; display:block; margin-bottom: 5px;">Passport Photo</label>
+                            <input type="file" id="sPhoto" accept="image/*" style="margin-bottom: 0;">
+                        </div>
                     </div>
                     <button class="btn btn-success" onclick="enrollStudent()">Register Student</button>
                 </div>
@@ -894,6 +901,7 @@ def dashboard():
                 const payload = {
                     first_name: document.getElementById('sFirst').value,
                     last_name: document.getElementById('sLast').value,
+                    current_class: document.getElementById('sClass').value,
                     guardian_name: document.getElementById('sGName').value,
                     guardian_contact: document.getElementById('sGContact').value,
                     boarding_status: document.getElementById('sBoarding').value,
@@ -931,7 +939,6 @@ def dashboard():
                         showToast(data.message);
                         document.getElementById('bAmount').value = '';
                         document.getElementById('bDesc').value = '';
-                        // Instantly auto-load the statement so they can visually confirm
                         loadStatement(stuId);
                     } else { showToast(data.error, true); }
                 } catch(e) { showToast("Connection failed", true); }
@@ -1023,8 +1030,7 @@ def dashboard():
                             }
                         } else if (k === 'action_roster') {
                             html += `<td style="padding:10px; border-bottom:1px solid #ddd;">
-                                <button class="btn btn-info" style="padding:4px 8px; font-size:0.8rem; margin:0 2px; width:auto;" onclick="showSection('finance-section'); loadStatement(${row['student_id']});">💰 Ledger</button>
-                                <button class="btn btn-danger" style="padding:4px 8px; font-size:0.8rem; margin:0 2px; width:auto;" onclick="deleteStudent(${row['student_id']})">🗑️</button>
+                                <button class="btn btn-danger" style="padding:4px 8px; font-size:0.8rem; margin:0 2px; width:auto;" onclick="deleteStudent(${row['student_id']})">🗑️ Delete</button>
                             </td>`;
                         } else if (k === 'action_debtor') {
                             html += `<td style="padding:10px; border-bottom:1px solid #ddd;"><button class="btn btn-info" style="padding:4px 8px; font-size:0.8rem; margin:0; width:auto;" onclick="loadStatement(${row['student_id']})">Open Ledger</button></td>`;
@@ -1047,7 +1053,7 @@ def dashboard():
 
             async function loadRoster() {
                 const res = await fetch('/api/students'); const data = await res.json();
-                renderTable("Student Roster", ['Photo', 'ID', 'First Name', 'Last Name', 'Status', 'House', 'Guardian Contact', 'Actions'], data.data, ['photo', 'student_id', 'first_name', 'last_name', 'boarding_status', 'house', 'guardian_contact', 'action_roster']);
+                renderTable("Student Roster", ['Photo', 'ID', 'First Name', 'Last Name', 'Class/Program', 'Status', 'House', 'Guardian Contact', 'Action'], data.data, ['photo', 'student_id', 'first_name', 'last_name', 'current_class', 'boarding_status', 'house', 'guardian_contact', 'action_roster']);
             }
             async function loadExpenses() {
                 const res = await fetch('/api/expenses'); const data = await res.json();
