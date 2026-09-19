@@ -97,8 +97,6 @@ def initialize_database():
     cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS photo_key VARCHAR(255)")
     
     cur.execute("CREATE TABLE IF NOT EXISTS system_users (user_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, email VARCHAR(100) UNIQUE NOT NULL, password_hash VARCHAR(255) NOT NULL, role VARCHAR(20) NOT NULL, linked_student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE)")
-    
-    # Expand HR Vault Fields
     cur.execute("ALTER TABLE system_users ADD COLUMN IF NOT EXISTS phone VARCHAR(20)")
     cur.execute("ALTER TABLE system_users ADD COLUMN IF NOT EXISTS subject VARCHAR(100)")
     cur.execute("ALTER TABLE system_users ADD COLUMN IF NOT EXISTS base_salary DECIMAL(10,2) DEFAULT 0.00")
@@ -176,15 +174,6 @@ def get_schools():
     cur.execute("SELECT school_id, school_name, TO_CHAR(subscription_expiry_date, 'YYYY-MM-DD') as expiry_date, CASE WHEN subscription_expiry_date >= CURRENT_DATE THEN 'Active' ELSE 'Expired' END as status FROM institutions ORDER BY school_id")
     schools = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": schools})
 
-@app.route('/api/superadmin/renew/<int:school_id>', methods=['POST'])
-@login_required
-def renew_school(school_id):
-    if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
-    conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("UPDATE institutions SET subscription_expiry_date = CURRENT_DATE + INTERVAL '1 year' WHERE school_id = %s RETURNING school_name, subscription_expiry_date", (school_id,))
-    updated = cur.fetchone(); conn.commit(); cur.close(); conn.close()
-    return jsonify({"message": f"Contract Renewed! {updated['school_name']} active until {updated['subscription_expiry_date']}"})
-
 @app.route('/api/superadmin/onboard', methods=['POST'])
 @login_required
 def onboard_school():
@@ -198,57 +187,7 @@ def onboard_school():
     except psycopg2.IntegrityError: conn.rollback(); return jsonify({"error": "School name or Admin email already exists!"}), 409
     finally: cur.close(); conn.close()
 
-@app.route('/api/superadmin/backup/<int:school_id>', methods=['GET'])
-@login_required
-def download_backup(school_id):
-    if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
-    conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT school_name FROM institutions WHERE school_id = %s", (school_id,))
-    school = cur.fetchone()
-    if not school: return jsonify({"error": "School not found"}), 404
-    backup = {"school_name": school['school_name'], "export_date": datetime.now().isoformat(), "data": {}}
-    cur.execute("SELECT * FROM subjects WHERE school_id = %s", (school_id,)); backup['data']['subjects'] = cur.fetchall()
-    cur.execute("SELECT * FROM students WHERE school_id = %s", (school_id,)); backup['data']['students'] = cur.fetchall()
-    cur.execute("SELECT * FROM fees WHERE school_id = %s", (school_id,)); backup['data']['fees'] = cur.fetchall()
-    cur.execute("SELECT p.* FROM payments p JOIN fees f ON p.fee_id = f.fee_id WHERE f.school_id = %s", (school_id,)); backup['data']['payments'] = cur.fetchall()
-    cur.execute("SELECT * FROM grades WHERE school_id = %s", (school_id,)); backup['data']['grades'] = cur.fetchall()
-    cur.execute("SELECT * FROM expenses WHERE school_id = %s", (school_id,)); backup['data']['expenses'] = cur.fetchall()
-    cur.close(); conn.close()
-    json_data = json.dumps(backup, default=custom_json_serializer, indent=4)
-    return Response(json_data, mimetype="application/json", headers={"Content-Disposition": f"attachment;filename=Backup_{school['school_name'].replace(' ', '_')}.json"})
-
-@app.route('/api/superadmin/restore/<int:school_id>', methods=['POST'])
-@login_required
-def restore_backup(school_id):
-    if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
-    if 'file' not in request.files: return jsonify({"error": "No file uploaded"}), 400
-    file = request.files['file']
-    try:
-        data = json.load(file)
-        conn = get_db_connection(); cur = conn.cursor()
-        if 'subjects' in data['data']:
-            for r in data['data']['subjects']:
-                cur.execute("INSERT INTO subjects (subject_id, school_id, subject_name) VALUES (%s, %s, %s) ON CONFLICT (subject_id) DO NOTHING", (r['subject_id'], school_id, r['subject_name']))
-        if 'students' in data['data']:
-            for r in data['data']['students']:
-                cur.execute("INSERT INTO students (student_id, school_id, first_name, last_name, current_class, guardian_name, guardian_contact, boarding_status, house, photo_key, enrollment_date) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (student_id) DO NOTHING", (r['student_id'], school_id, r['first_name'], r['last_name'], r.get('current_class', 'Unassigned'), r['guardian_name'], r['guardian_contact'], r.get('boarding_status', 'Day'), r.get('house', 'Unassigned'), r.get('photo_key'), r['enrollment_date']))
-        if 'fees' in data['data']:
-            for r in data['data']['fees']:
-                cur.execute("INSERT INTO fees (fee_id, school_id, student_id, fee_category, description, amount_due, academic_year, term, date_issued) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (fee_id) DO NOTHING", (r['fee_id'], school_id, r['student_id'], r.get('fee_category', 'General'), r['description'], r['amount_due'], r.get('academic_year', 'Unknown'), r.get('term', 'Unknown'), r['date_issued']))
-        if 'payments' in data['data']:
-            for r in data['data']['payments']:
-                cur.execute("INSERT INTO payments (payment_id, fee_id, amount_paid, payment_method, payment_date) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (payment_id) DO NOTHING", (r['payment_id'], r['fee_id'], r['amount_paid'], r['payment_method'], r['payment_date']))
-        if 'grades' in data['data']:
-            for r in data['data']['grades']:
-                cur.execute("INSERT INTO grades (grade_id, school_id, student_id, subject_id, class_score, exam_score, total_score, waec_grade, academic_year, term, teacher_remarks) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (grade_id) DO NOTHING", (r['grade_id'], school_id, r['student_id'], r['subject_id'], r.get('class_score', 0), r.get('exam_score', r.get('score', 0)), r.get('total_score', r.get('score', 0)), r['waec_grade'], r['academic_year'], r['term'], r.get('teacher_remarks', '')))
-        if 'expenses' in data['data']:
-            for r in data['data']['expenses']:
-                cur.execute("INSERT INTO expenses (expense_id, school_id, category, description, amount, date_incurred) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (expense_id) DO NOTHING", (r['expense_id'], school_id, r['category'], r['description'], r['amount'], r['date_incurred']))
-        conn.commit(); cur.close(); conn.close()
-        return jsonify({"message": f"Vault Restoration Complete for {data.get('school_name')}!"}), 200
-    except Exception as e: return jsonify({"error": f"Restoration failed: {str(e)}"}), 500
-
-# --- TENANT ENDPOINTS ---
+# --- TENANT ENDPOINTS (ENROLLMENT & DIRECTORY) ---
 @app.route('/api/students', methods=['GET', 'POST'])
 @login_required
 @require_active_subscription
@@ -271,6 +210,39 @@ def manage_students():
         cur.execute("SELECT student_id, first_name, last_name, current_class, boarding_status, house, guardian_contact FROM students WHERE school_id = %s ORDER BY student_id DESC", (current_user.school_id,))
         students = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": students})
 
+@app.route('/api/students/bulk', methods=['POST'])
+@login_required
+def bulk_enroll():
+    if current_user.role != 'admin': return jsonify({"error": "Admin only"}), 403
+    if 'file' not in request.files: return jsonify({"error": "No file uploaded"}), 400
+    file = request.files['file']
+    try:
+        stream = StringIO(file.stream.read().decode("UTF8"), newline=None)
+        csv_input = csv.reader(stream)
+        next(csv_input, None) 
+        conn = get_db_connection()
+        cur = conn.cursor()
+        count = 0
+        for row in csv_input:
+            if len(row) >= 2: 
+                fname = row[0].strip()[:100]
+                lname = row[1].strip()[:100]
+                c_class = row[2].strip()[:100] if len(row) > 2 and row[2].strip() else 'Unassigned'
+                g_name = row[3].strip()[:100] if len(row) > 3 and row[3].strip() else 'N/A'
+                g_contact = row[4].strip()[:20] if len(row) > 4 and row[4].strip() else ''
+                b_status = row[5].strip()[:20] if len(row) > 5 and row[5].strip() else 'Day'
+                house = row[6].strip()[:100] if len(row) > 6 and row[6].strip() else 'Unassigned'
+                
+                cur.execute("INSERT INTO students (school_id, first_name, last_name, current_class, guardian_name, guardian_contact, boarding_status, house) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                            (current_user.school_id, fname, lname, c_class, g_name, g_contact, b_status, house))
+                count += 1
+        conn.commit()
+        return jsonify({"message": f"Bulk Upload Success! Enrolled {count} students."}), 201
+    except Exception as e:
+        return jsonify({"error": f"Upload failed. Ensure CSV format is correct. Error: {str(e)}"}), 500
+    finally:
+        if 'cur' in locals(): cur.close(); conn.close()
+
 @app.route('/api/students/<int:student_id>', methods=['DELETE'])
 @login_required
 @require_active_subscription
@@ -284,18 +256,15 @@ def delete_student(student_id):
         
         cur.execute("DELETE FROM students WHERE student_id = %s AND school_id = %s", (student_id, current_user.school_id))
         conn.commit()
-        
         if student['photo_key'] and AWS_BUCKET_NAME:
             try: s3_client.delete_object(Bucket=AWS_BUCKET_NAME, Key=student['photo_key'])
             except: pass
-            
         return jsonify({"message": f"Student ID {student_id} permanently deleted."}), 200
     except Exception as e:
         conn.rollback(); return jsonify({"error": f"Database Error: {str(e)}"}), 500
     finally:
         cur.close(); conn.close()
 
-# THE PROMOTION ENGINE
 @app.route('/api/students/promote', methods=['POST'])
 @login_required
 def promote_students():
@@ -305,7 +274,6 @@ def promote_students():
     to_class = str(d.get('to_class') or '').strip()
     if not from_class or not to_class: 
         return jsonify({"error": "You must provide both Current and Next class names."}), 400
-    
     conn = get_db_connection(); cur = conn.cursor()
     try:
         cur.execute("UPDATE students SET current_class = %s WHERE current_class = %s AND school_id = %s RETURNING student_id", (to_class, from_class, current_user.school_id))
@@ -344,10 +312,58 @@ def print_ids():
     html += "</div></body></html>"
     return html
 
-# THE PRINTABLE REPORT CARD GENERATOR
+# --- ACADEMICS & GRADING ENGINE (BUG FIX APPLIED) ---
+@app.route('/api/grades', methods=['POST'])
+@login_required
+def add_grade():
+    d = request.get_json()
+    try:
+        c_val = str(d.get('class_score') or '0').strip()
+        e_val = str(d.get('exam_score') or '0').strip()
+        c_score = int(c_val) if c_val else 0
+        e_score = int(e_val) if e_val else 0
+        stu_id = int(str(d.get('student_id') or '0').strip())
+        if stu_id == 0: raise ValueError
+    except ValueError: 
+        return jsonify({"error": "Scores and Student ID must be valid numbers."}), 400
+    
+    t_score = c_score + e_score
+    waec = get_waec_grade(t_score)
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT student_id FROM students WHERE student_id = %s AND school_id = %s", (stu_id, current_user.school_id))
+        if not cur.fetchone():
+            return jsonify({"error": f"Student ID {stu_id} does not exist! Check the Digital Directory."}), 404
+            
+        subject_name = str(d.get('subject_name') or 'General').strip()[:100]
+        cur.execute("SELECT subject_id FROM subjects WHERE subject_name = %s AND school_id = %s", (subject_name, current_user.school_id))
+        sub = cur.fetchone()
+        if not sub:
+            cur.execute("INSERT INTO subjects (school_id, subject_name) VALUES (%s, %s) RETURNING subject_id", (current_user.school_id, subject_name))
+            sub_id = cur.fetchone()['subject_id']
+        else: 
+            sub_id = sub['subject_id']
+        
+        academic_year = str(d.get('academic_year') or '').strip()[:9]
+        term = str(d.get('term') or '').strip()[:20]
+        remarks = str(d.get('remarks') or '').strip()[:250]
+
+        cur.execute("INSERT INTO grades (school_id, student_id, subject_id, class_score, exam_score, total_score, waec_grade, academic_year, term, teacher_remarks) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", 
+                    (current_user.school_id, stu_id, sub_id, c_score, e_score, t_score, waec, academic_year, term, remarks))
+        conn.commit()
+        return jsonify({"message": f"SBA Recorded! Total: {t_score}% ({waec})"})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": f"Database Error: {str(e)}"}), 400
+    finally:
+        cur.close()
+        conn.close()
+
 @app.route('/print_report/<int:student_id>', methods=['GET'])
 @login_required
 def print_report(student_id):
+    if current_user.role == 'guardian' and current_user.linked_student_id != student_id: return "Access Denied.", 403
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT * FROM students WHERE student_id = %s AND school_id = %s", (student_id, current_user.school_id))
     student = cur.fetchone()
@@ -357,8 +373,7 @@ def print_report(student_id):
     school_name = cur.fetchone()['school_name']
     
     cur.execute("SELECT sub.subject_name, g.class_score, g.exam_score, g.total_score, g.waec_grade, g.teacher_remarks, g.term, g.academic_year FROM grades g JOIN subjects sub ON g.subject_id = sub.subject_id WHERE g.student_id = %s AND g.school_id = %s ORDER BY g.academic_year DESC, g.term DESC, sub.subject_name", (student_id, current_user.school_id))
-    grades = cur.fetchall()
-    cur.close(); conn.close()
+    grades = cur.fetchall(); cur.close(); conn.close()
 
     table_rows = ""
     for g in grades:
@@ -413,9 +428,50 @@ def print_report(student_id):
     """
     return html
 
+@app.route('/api/report_card/<int:student_id>', methods=['GET'])
+@login_required
+def get_report_card(student_id):
+    if current_user.role == 'guardian' and current_user.linked_student_id != student_id: return jsonify({"error": "Access Denied."}), 403
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT sub.subject_name, g.class_score, g.exam_score, g.total_score, g.waec_grade, g.teacher_remarks, g.term FROM grades g JOIN subjects sub ON g.subject_id = sub.subject_id WHERE g.student_id = %s AND g.school_id = %s", (student_id, current_user.school_id))
+    grades = cur.fetchall(); cur.close(); conn.close(); return jsonify({"grades": grades})
+
+# --- FINANCIALS & BULK BILLING ---
+@app.route('/api/fees/bulk_bill', methods=['POST'])
+@login_required
+def bulk_bill():
+    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
+    d = request.get_json()
+    target_class = str(d.get('target_class') or '').strip()
+    amount_due = float(d.get('amount_due') or 0.0)
+    academic_year = str(d.get('academic_year') or '').strip()[:9]
+    term = str(d.get('term') or '').strip()[:20]
+    desc = str(d.get('description') or '').strip()[:250]
+    fee_cat = str(d.get('fee_category') or 'General')[:50]
+    
+    if not target_class or amount_due <= 0:
+        return jsonify({"error": "Class and Amount Due are required."}), 400
+
+    conn = get_db_connection(); cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO fees (school_id, student_id, fee_category, description, amount_due, academic_year, term)
+            SELECT school_id, student_id, %s, %s, %s, %s, %s FROM students
+            WHERE current_class = %s AND school_id = %s
+            RETURNING fee_id
+        """, (fee_cat, desc, amount_due, academic_year, term, target_class, current_user.school_id))
+        billed = cur.fetchall()
+        conn.commit()
+        return jsonify({"message": f"Bulk Bill issued successfully to {len(billed)} students in {target_class}!"}), 201
+    except Exception as e:
+        conn.rollback(); return jsonify({"error": f"Database Error: {str(e)}"}), 400
+    finally:
+        cur.close(); conn.close()
+
 @app.route('/api/analytics', methods=['GET'])
 @login_required
 def get_analytics():
+    if current_user.role != 'admin': return jsonify({"error": "Unauthorized"}), 403
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT COALESCE(SUM(amount_due), 0) as total_due FROM fees WHERE school_id = %s", (current_user.school_id,))
     total_due = float(cur.fetchone()['total_due'])
@@ -528,57 +584,6 @@ def get_debtors():
     cur.close(); conn.close()
     return jsonify({"data": debtors})
 
-@app.route('/api/grades', methods=['POST'])
-@login_required
-def add_grade():
-    d = request.get_json()
-    try:
-        c_score = int(d.get('class_score') or 0)
-        e_score = int(d.get('exam_score') or 0)
-        stu_id = int(d.get('student_id') or 0)
-    except ValueError: 
-        return jsonify({"error": "Scores and ID must be numbers."}), 400
-    
-    t_score = c_score + e_score
-    waec = get_waec_grade(t_score)
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT student_id FROM students WHERE student_id = %s AND school_id = %s", (stu_id, current_user.school_id))
-        if not cur.fetchone():
-            return jsonify({"error": f"Student ID {stu_id} does not exist! Check the Digital Directory."}), 404
-            
-        cur.execute("SELECT subject_id FROM subjects WHERE subject_name = %s AND school_id = %s", (d.get('subject_name'), current_user.school_id))
-        sub = cur.fetchone()
-        if not sub:
-            cur.execute("INSERT INTO subjects (school_id, subject_name) VALUES (%s, %s) RETURNING subject_id", (current_user.school_id, d.get('subject_name')))
-            sub_id = cur.fetchone()['subject_id']
-        else: 
-            sub_id = sub['subject_id']
-        
-        academic_year = str(d.get('academic_year') or '')[:9]
-        term = str(d.get('term') or '')[:20]
-        remarks = str(d.get('remarks') or '')[:250]
-
-        cur.execute("INSERT INTO grades (school_id, student_id, subject_id, class_score, exam_score, total_score, waec_grade, academic_year, term, teacher_remarks) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", 
-                    (current_user.school_id, stu_id, sub_id, c_score, e_score, t_score, waec, academic_year, term, remarks))
-        conn.commit()
-        return jsonify({"message": f"SBA Recorded! Total: {t_score}% ({waec})"})
-    except Exception as e:
-        conn.rollback()
-        return jsonify({"error": f"Database Error: {str(e)}"}), 400
-    finally:
-        cur.close()
-        conn.close()
-
-@app.route('/api/report_card/<int:student_id>', methods=['GET'])
-@login_required
-def get_report_card(student_id):
-    if current_user.role == 'guardian' and current_user.linked_student_id != student_id: return jsonify({"error": "Access Denied."}), 403
-    conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT sub.subject_name, g.class_score, g.exam_score, g.total_score, g.waec_grade, g.teacher_remarks, g.term FROM grades g JOIN subjects sub ON g.subject_id = sub.subject_id WHERE g.student_id = %s AND g.school_id = %s", (student_id, current_user.school_id))
-    grades = cur.fetchall(); cur.close(); conn.close(); return jsonify({"grades": grades})
-
 @app.route('/api/statement/<int:student_id>', methods=['GET'])
 @login_required
 def get_statement(student_id):
@@ -597,11 +602,9 @@ def send_sms_blast():
     audience = data.get('audience')
     message = data.get('message')
 
-    if not message:
-        return jsonify({"error": "Message body cannot be empty."}), 400
+    if not message: return jsonify({"error": "Message body cannot be empty."}), 400
 
-    conn = get_db_connection()
-    cur = conn.cursor()
+    conn = get_db_connection(); cur = conn.cursor()
 
     if audience == 'all':
         cur.execute("SELECT DISTINCT guardian_contact FROM students WHERE school_id = %s AND guardian_contact IS NOT NULL", (current_user.school_id,))
@@ -618,13 +621,10 @@ def send_sms_blast():
     elif audience == 'boarding':
         cur.execute("SELECT DISTINCT guardian_contact FROM students WHERE school_id = %s AND boarding_status = 'Boarding' AND guardian_contact IS NOT NULL", (current_user.school_id,))
     
-    raw_contacts = cur.fetchall()
-    cur.close(); conn.close()
-
+    raw_contacts = cur.fetchall(); cur.close(); conn.close()
     contacts = [row['guardian_contact'].strip() for row in raw_contacts if row['guardian_contact']]
 
-    if not contacts:
-        return jsonify({"error": "No valid phone numbers found for this audience."}), 404
+    if not contacts: return jsonify({"error": "No valid phone numbers found for this audience."}), 404
 
     SMS_API_KEY = os.environ.get('SMS_API_KEY')
     SMS_SENDER_ID = os.environ.get('SMS_SENDER_ID', 'SMS_ADMIN')
@@ -633,23 +633,18 @@ def send_sms_blast():
         try:
             url = "https://sms.arkesel.com/api/v2/sms/send"
             headers = {"api-key": SMS_API_KEY}
-            payload = {
-                "sender": SMS_SENDER_ID,
-                "message": message,
-                "recipients": contacts
-            }
+            payload = {"sender": SMS_SENDER_ID, "message": message, "recipients": contacts}
             response = requests.post(url, json=payload, headers=headers)
             
             if response.status_code in [200, 201]:
                 return jsonify({"message": f"Live SMS Blast sent successfully to {len(contacts)} parents!"}), 200
             else:
                 return jsonify({"error": "Telecom Gateway rejected the request. Verify your API Key."}), 500
-        except Exception as e:
-            return jsonify({"error": f"Connection to Telecom Server failed: {str(e)}"}), 500
+        except Exception as e: return jsonify({"error": f"Connection to Telecom Server failed: {str(e)}"}), 500
     else:
         return jsonify({"message": f"[SIMULATION] SMS processed for {len(contacts)} parents. Add SMS_API_KEY to Render to go live."}), 200
 
-# --- THE HR VAULT ---
+# --- THE HR VAULT & GUARDIAN ACCESS REGISTRATION ---
 @app.route('/api/register_staff', methods=['POST'])
 @login_required
 def register_staff():
@@ -662,10 +657,28 @@ def register_staff():
         cur.execute("INSERT INTO system_users (school_id, email, password_hash, role, phone, subject, base_salary) VALUES (%s, %s, %s, %s, %s, %s, %s)", 
                     (current_user.school_id, d.get('email'), hashed, 'teacher', d.get('phone'), d.get('subject'), base_salary))
         conn.commit(); return jsonify({"message": "Staff Profile Created in HR Vault!"}), 201
-    except Exception as e:
+    except Exception:
         conn.rollback(); return jsonify({"error": "Email exists or invalid data format."}), 409
-    finally:
-        cur.close(); conn.close()
+    finally: cur.close(); conn.close()
+
+@app.route('/api/register_guardian', methods=['POST'])
+@login_required
+def register_guardian():
+    if current_user.role != 'admin': return jsonify({"error": "Admin clearance required."}), 403
+    d = request.get_json()
+    hashed = generate_password_hash(d.get('password'))
+    conn = get_db_connection(); cur = conn.cursor()
+    try:
+        stu_id = int(str(d.get('linked_student_id') or '0').strip())
+        cur.execute("SELECT student_id FROM students WHERE student_id = %s AND school_id = %s", (stu_id, current_user.school_id))
+        if not cur.fetchone(): return jsonify({"error": "Student ID does not exist!"}), 404
+        
+        cur.execute("INSERT INTO system_users (school_id, email, password_hash, role, linked_student_id) VALUES (%s, %s, %s, %s, %s)", 
+                    (current_user.school_id, d.get('email'), hashed, 'guardian', stu_id))
+        conn.commit(); return jsonify({"message": f"Guardian Access created for Student ID {stu_id}!"}), 201
+    except ValueError: return jsonify({"error": "Invalid Student ID."}), 400
+    except Exception: conn.rollback(); return jsonify({"error": "Email already registered."}), 409
+    finally: cur.close(); conn.close()
 
 @app.route('/api/staff', methods=['GET'])
 @login_required
@@ -722,11 +735,14 @@ def dashboard():
                     <button onclick="showSection('attendance-section')">📅 Roll Call</button>
                     <button onclick="showSection('academics-section')">📚 Academics</button>
                     <button onclick="showSection('sms-section')">📟 SMS Desk</button>
-                    <button onclick="showSection('hr-section')">🧑‍🏫 Staff HR</button>
+                    <button onclick="showSection('hr-section')">🧑‍🏫 Staff HR & Parent Access</button>
                 
                 {% elif current_user.role == 'teacher' %}
                     <button onclick="showSection('attendance-section')">📅 Daily Roll Call</button>
                     <button onclick="showSection('academics-section')">📚 SBA Grading</button>
+                
+                {% elif current_user.role == 'guardian' %}
+                    <button onclick="showSection('guardian-section')">👨‍👩‍👧 Guardian Portal</button>
                 {% endif %}
                 
                 <br><br><button class="btn-danger" onclick="logout()">Secure Logout</button>
@@ -745,6 +761,24 @@ def dashboard():
                 <button class="btn" onclick="login()">Login</button>
             </div>
             
+            {% elif current_user.role == 'guardian' %}
+            <!-- Guardian Read-Only Portal -->
+            <div id="guardian-section" class="card admin-section">
+                <h3>👨‍👩‍👧 Guardian Access Portal</h3>
+                <div class="grid-2">
+                    <div style="background: #e9ecef; padding: 20px; border-radius: 8px; text-align: center;">
+                        <h4 style="margin-top:0;">Academic Performance</h4>
+                        <p style="font-size: 0.9rem; color: #555;">View and download your ward's official end-of-term grading report.</p>
+                        <button class="btn btn-success" onclick="window.open('/print_report/{{ current_user.linked_student_id }}', '_blank')">🖨️ View & Print Terminal Report</button>
+                    </div>
+                    <div style="background: #fff3cd; padding: 20px; border-radius: 8px; text-align: center; border: 1px solid var(--warning);">
+                        <h4 style="margin-top:0;">Financial Statement</h4>
+                        <p style="font-size: 0.9rem; color: #555;">Review issued fee bills, recorded payments, and outstanding arrears.</p>
+                        <button class="btn btn-info" onclick="loadStatement({{ current_user.linked_student_id }})">View Financial Ledger</button>
+                    </div>
+                </div>
+            </div>
+
             {% elif current_user.role == 'superadmin' %}
             <div class="card" style="border: 2px solid var(--accent);">
                 <h3>🚀 Onboard New School</h3>
@@ -774,28 +808,45 @@ def dashboard():
                     </div>
                 </div>
 
-                <!-- Financials Section -->
+                <!-- Financials Section (With Automated Bulk Billing) -->
                 <div id="finance-section" class="card admin-section hidden" style="border: 2px solid var(--danger);">
                     <h3>💰 Financial Ledger & Operations</h3>
                     <div class="grid-2">
-                        <div style="background: #f8f9fa; padding: 15px; border-radius: 8px;">
-                            <h4 style="margin-top:0;">1. Issue Segmented Bill</h4>
-                            <input type="number" id="bStuId" placeholder="Student ID (Required)">
-                            <select id="bCat">
-                                <option value="Consolidated Fee">Consolidated Term Fee (All-Inclusive)</option>
-                                <option value="Tuition">Tuition Fee</option>
-                                <option value="PTA Dues">PTA Dues</option>
-                                <option value="Feeding Fee">Feeding Fee</option>
-                                <option value="Exams Fee">Exams Fee</option>
-                                <option value="Arrears (Past Term)">Arrears (Past Term)</option>
-                            </select>
-                            <div class="grid-2">
-                                <input type="text" id="bTerm" placeholder="Term (e.g. Term 1)">
-                                <input type="text" id="bYear" placeholder="Year (e.g. 2026)">
+                        <div>
+                            <div style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                                <h4 style="margin-top:0;">1. Issue Segmented Bill (Individual)</h4>
+                                <input type="number" id="bStuId" placeholder="Student ID (Required)">
+                                <select id="bCat">
+                                    <option value="Consolidated Fee">Consolidated Term Fee</option>
+                                    <option value="Tuition">Tuition Fee</option>
+                                    <option value="PTA Dues">PTA Dues</option>
+                                    <option value="Feeding Fee">Feeding Fee</option>
+                                    <option value="Exams Fee">Exams Fee</option>
+                                    <option value="Arrears (Past Term)">Arrears (Past Term)</option>
+                                </select>
+                                <div class="grid-2">
+                                    <input type="text" id="bTerm" placeholder="Term (e.g. Term 1)">
+                                    <input type="text" id="bYear" placeholder="Year (e.g. 2026)">
+                                </div>
+                                <input type="number" id="bAmount" placeholder="Amount Due (GHS)">
+                                <input type="text" id="bDesc" placeholder="Description / Memo">
+                                <button class="btn btn-success" onclick="issueBill()">Issue Bill & View Ledger</button>
                             </div>
-                            <input type="number" id="bAmount" placeholder="Amount Due (GHS)">
-                            <input type="text" id="bDesc" placeholder="Description / Memo">
-                            <button class="btn btn-success" onclick="issueBill()">Issue Bill & View Ledger</button>
+
+                            <!-- NEW: Bulk Class Billing -->
+                            <div style="background: #e2e3e5; padding: 15px; border-radius: 8px; border: 1px solid #ccc;">
+                                <h4 style="margin-top:0;">⚡ Automated Bulk Class Billing</h4>
+                                <p style="font-size: 0.8rem; color: #555;">Instantly issue the same fee to every student in a specific class.</p>
+                                <input type="text" id="bbClass" placeholder="Target Class (e.g., Basic 3)">
+                                <select id="bbCat"><option value="Consolidated Fee">Consolidated Term Fee</option><option value="Tuition">Tuition Fee</option><option value="PTA Dues">PTA Dues</option></select>
+                                <div class="grid-2">
+                                    <input type="text" id="bbTerm" placeholder="Term">
+                                    <input type="text" id="bbYear" placeholder="Year">
+                                </div>
+                                <input type="number" id="bbAmount" placeholder="Amount Due (GHS)">
+                                <input type="text" id="bbDesc" placeholder="Memo">
+                                <button class="btn btn-primary" onclick="bulkBillClass()">Execute Bulk Billing</button>
+                            </div>
                         </div>
 
                         <div>
@@ -824,10 +875,10 @@ def dashboard():
                     </div>
                 </div>
 
-                <!-- Admissions Section (With Promotion Engine) -->
+                <!-- Admissions Section (With Bulk CSV) -->
                 <div id="admissions-section" class="card grid-2 admin-section hidden">
                     <div>
-                        <h3>Enroll New Student</h3>
+                        <h3>Enroll New Student (Manual)</h3>
                         <div class="grid-2"><input type="text" id="sFirst" placeholder="First Name"><input type="text" id="sLast" placeholder="Last Name"></div>
                         <div class="grid-2">
                             <input type="text" id="sClass" placeholder="Class / Program (e.g., Basic 1)">
@@ -847,12 +898,18 @@ def dashboard():
                         <button class="btn btn-success" onclick="enrollStudent()">Register Student</button>
                     </div>
                     <div>
+                        <div style="background: #e9ecef; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                            <h4 style="margin-top:0;">Bulk CSV Enrollment</h4>
+                            <p style="font-size: 0.8rem; color: #555;">Upload a CSV file to enroll hundreds of students instantly. Columns must be exactly: <i>First Name, Last Name, Class, Guardian Name, Guardian Contact, Boarding Status, House</i>.</p>
+                            <input type="file" id="csvUpload" accept=".csv">
+                            <button class="btn btn-primary" onclick="bulkEnrollCSV()">Upload & Import Roster</button>
+                        </div>
+
                         <h3>ID & Directory Tools</h3>
                         <button class="btn btn-warning" onclick="window.open('/print_ids', '_blank')">🖨️ Generate Batch ID Cards</button>
                         <button class="btn btn-info" onclick="loadRoster()">View Digital Directory</button>
                         <hr style="margin:20px 0; border:1px solid #eee;">
                         
-                        <!-- NEW: Promotion Engine -->
                         <div style="background: #e2e3e5; padding: 15px; border-radius: 8px;">
                             <h4 style="margin-top:0;">End-of-Year Promotion Engine</h4>
                             <p style="font-size:0.8rem; color:#555;">Move an entire class cohort up to the next grade level instantly.</p>
@@ -931,7 +988,7 @@ def dashboard():
                     </div>
                 </div>
 
-                <!-- Expanded Staff HR Vault -->
+                <!-- Expanded Staff HR Vault & Guardian Access -->
                 <div id="hr-section" class="card grid-2 admin-section hidden">
                     <div>
                         <h3>Register Staff Profile</h3>
@@ -945,6 +1002,19 @@ def dashboard():
                         </div>
                         <input type="number" id="tSal" placeholder="Base Salary (GHS)">
                         <button class="btn btn-success" onclick="registerStaff()">Add to HR Directory</button>
+                        
+                        <hr style="margin:20px 0; border:1px solid #eee;">
+                        
+                        <div style="background: #e9ecef; padding: 15px; border-radius: 8px;">
+                            <h4 style="margin-top:0;">Register Guardian Portal Access</h4>
+                            <p style="font-size:0.8rem; color:#555;">Create a secure login for a parent to view only their ward's terminal reports and financial ledgers.</p>
+                            <div class="grid-2">
+                                <input type="email" id="gEmail" placeholder="Parent Email">
+                                <input type="password" id="gPass" placeholder="Password">
+                            </div>
+                            <input type="number" id="gStuId" placeholder="Linked Student ID">
+                            <button class="btn btn-primary" onclick="registerGuardian()">Grant Portal Access</button>
+                        </div>
                     </div>
                     <div>
                         <h3>Compliance & Payroll Vault</h3>
@@ -964,7 +1034,7 @@ def dashboard():
 
         <script>
             function showSection(sectionId) {
-                const sections = ['analytics-section', 'finance-section', 'admissions-section', 'attendance-section', 'academics-section', 'sms-section', 'hr-section'];
+                const sections = ['analytics-section', 'finance-section', 'admissions-section', 'attendance-section', 'academics-section', 'sms-section', 'hr-section', 'guardian-section'];
                 sections.forEach(id => {
                     const el = document.getElementById(id);
                     if(el) el.classList.add('hidden');
@@ -1017,7 +1087,6 @@ def dashboard():
             async function enrollStudent() {
                 const fileInput = document.getElementById('sPhoto');
                 let photo_b64 = null;
-                
                 if (fileInput.files.length > 0) {
                     const file = fileInput.files[0];
                     photo_b64 = await new Promise((resolve) => {
@@ -1039,7 +1108,6 @@ def dashboard():
                         reader.readAsDataURL(file);
                     });
                 }
-                
                 const payload = {
                     first_name: document.getElementById('sFirst').value,
                     last_name: document.getElementById('sLast').value,
@@ -1051,6 +1119,38 @@ def dashboard():
                     photo_b64: photo_b64
                 };
                 sendAction('/api/students', payload);
+            }
+
+            async function bulkEnrollCSV() {
+                const fileInput = document.getElementById('csvUpload');
+                if (!fileInput.files.length) { showToast("Please select a CSV file.", true); return; }
+                const formData = new FormData();
+                formData.append('file', fileInput.files[0]);
+                showToast("Uploading roster, please wait...", false);
+                try {
+                    const res = await fetch('/api/students/bulk', { method: 'POST', body: formData });
+                    const data = await res.json();
+                    if (res.ok) { showToast(data.message); loadRoster(); }
+                    else showToast(data.error, true);
+                } catch(e) { showToast("Upload failed", true); }
+                fileInput.value = ''; 
+            }
+
+            async function bulkBillClass() {
+                const payload = {
+                    target_class: document.getElementById('bbClass').value,
+                    fee_category: document.getElementById('bbCat').value,
+                    amount_due: document.getElementById('bbAmount').value,
+                    academic_year: document.getElementById('bbYear').value,
+                    term: document.getElementById('bbTerm').value,
+                    description: document.getElementById('bbDesc').value
+                };
+                try {
+                    const res = await fetch('/api/fees/bulk_bill', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+                    const data = await res.json();
+                    if(res.ok) { showToast(data.message); document.getElementById('bbAmount').value = ''; document.getElementById('bbDesc').value = ''; } 
+                    else { showToast(data.error, true); }
+                } catch(e) { showToast("Connection failed", true); }
             }
 
             async function deleteStudent(id) {
@@ -1097,6 +1197,22 @@ def dashboard():
                 } catch(e) { showToast("Connection failed", true); }
             }
 
+            async function registerGuardian() {
+                const payload = {
+                    email: document.getElementById('gEmail').value,
+                    password: document.getElementById('gPass').value,
+                    linked_student_id: document.getElementById('gStuId').value
+                };
+                try {
+                    const res = await fetch('/api/register_guardian', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+                    const data = await res.json();
+                    if(res.ok) { 
+                        showToast(data.message); 
+                        document.getElementById('gEmail').value = ''; document.getElementById('gPass').value = ''; document.getElementById('gStuId').value = '';
+                    } else { showToast(data.error, true); }
+                } catch(e) { showToast("Connection failed", true); }
+            }
+
             async function issueBill() {
                 const stuId = document.getElementById('bStuId').value;
                 const payload = {
@@ -1128,10 +1244,8 @@ def dashboard():
                 try {
                     const res = await fetch('/api/fees/pay', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({fee_id: feeId, amount_paid: amount, payment_method: method}) });
                     const data = await res.json();
-                    if(res.ok) {
-                        showToast(data.message);
-                        loadStatement(stuId);
-                    } else { showToast(data.error, true); }
+                    if(res.ok) { showToast(data.message); loadStatement(stuId); } 
+                    else { showToast(data.error, true); }
                 } catch(e) { showToast("Connection failed", true); }
             }
 
@@ -1256,12 +1370,18 @@ def dashboard():
                 renderTable("Raw Grading Data", ['Subject', 'Class', 'Exam', 'Total', 'Grade', 'Remarks', 'Term'], data.grades, ['subject_name', 'class_score', 'exam_score', 'total_score', 'waec_grade', 'teacher_remarks', 'term']);
             }
             async function loadStatement(overrideId) {
-                const id = overrideId || document.getElementById('stateStuId').value;
+                const id = overrideId || (document.getElementById('stateStuId') ? document.getElementById('stateStuId').value : null);
                 if(!id) { showToast("Please enter a Student ID", true); return; }
                 const res = await fetch('/api/statement/' + id);
                 if (!res.ok) { showToast("Ledger Not Found", true); return; }
                 const data = await res.json();
-                renderTable("Financial Ledger (Student ID: " + id + ")", ['Bill Type', 'Year', 'Term', 'Desc', 'Due', 'Paid', 'Balance', 'Action'], data.statement, ['fee_category', 'academic_year', 'term', 'description', 'amount_due', 'total_paid', 'remaining_balance', 'action_pay']);
+                
+                // If guardian, check if element exists, else standard admin action
+                if(document.getElementById('stateStuId')) {
+                    renderTable("Financial Ledger (Student ID: " + id + ")", ['Bill Type', 'Year', 'Term', 'Desc', 'Due', 'Paid', 'Balance', 'Action'], data.statement, ['fee_category', 'academic_year', 'term', 'description', 'amount_due', 'total_paid', 'remaining_balance', 'action_pay']);
+                } else {
+                    renderTable("Financial Ledger (Student ID: " + id + ")", ['Bill Type', 'Year', 'Term', 'Desc', 'Due', 'Paid', 'Balance'], data.statement, ['fee_category', 'academic_year', 'term', 'description', 'amount_due', 'total_paid', 'remaining_balance']);
+                }
             }
 
             let financeChartInstance = null;
