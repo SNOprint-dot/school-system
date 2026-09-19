@@ -8,7 +8,7 @@ import requests
 from io import StringIO
 from functools import wraps
 from datetime import datetime
-from flask import Flask, jsonify, request, render_template, Response, redirect, url_for
+from flask import Flask, jsonify, request, render_template, render_template_string, Response, redirect, url_for
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -39,10 +39,9 @@ def require_active_subscription(f):
         return f(*args, **kwargs)
     return decorated_function
 
-# --- URL ROUTING FIX ---
+# --- URL ROUTING ---
 @app.route('/')
 def index():
-    # Automatically forces users to the dashboard instead of a 404 page
     return redirect(url_for('dashboard'))
 
 # --- AUTH & SECURITY ENGINE ---
@@ -50,12 +49,9 @@ def index():
 def login():
     try:
         data = request.get_json()
-        conn = get_db_connection()
-        cur = conn.cursor()
+        conn = get_db_connection(); cur = conn.cursor()
         cur.execute("SELECT user_id, email, password_hash, role, linked_student_id, school_id FROM system_users WHERE email = %s", (data.get('email'),))
-        user_data = cur.fetchone()
-        cur.close()
-        conn.close()
+        user_data = cur.fetchone(); cur.close(); conn.close()
         
         if user_data and check_password_hash(user_data['password_hash'], data.get('password')):
             user = User(user_data['user_id'], user_data['email'], user_data['role'], user_data['linked_student_id'], user_data['school_id'])
@@ -64,7 +60,6 @@ def login():
             
         return jsonify({"error": "Invalid credentials!"}), 401
     except Exception as e:
-        # Safety net: If the DB fails, it will tell you exactly why instead of crashing
         return jsonify({"error": f"Login Engine Error: {str(e)}"}), 500
 
 @app.route('/api/logout', methods=['POST'])
@@ -107,6 +102,32 @@ def admin_reset_password():
     except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
     finally: cur.close(); conn.close()
 
+@app.route('/api/superadmin/reset_admin', methods=['POST'])
+@login_required
+def superadmin_reset_admin():
+    if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
+    d = request.get_json(); new_hash = generate_password_hash(d.get('new_password')); conn = get_db_connection(); cur = conn.cursor()
+    try:
+        cur.execute("UPDATE system_users SET password_hash = %s WHERE email = %s RETURNING user_id", (new_hash, d.get('admin_email')))
+        if not cur.fetchone(): return jsonify({"error": "Admin email not found in global registry."}), 404
+        conn.commit(); return jsonify({"message": f"Global Override successful for {d.get('admin_email')}!"}), 200
+    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
+    finally: cur.close(); conn.close()
+
+@app.route('/api/superadmin/credentials', methods=['POST'])
+@login_required
+def superadmin_update_credentials():
+    if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
+    d = request.get_json(); new_email = d.get('new_email'); new_pass = d.get('new_password')
+    conn = get_db_connection(); cur = conn.cursor()
+    try:
+        if new_email: cur.execute("UPDATE system_users SET email = %s WHERE user_id = %s", (new_email, current_user.id))
+        if new_pass: cur.execute("UPDATE system_users SET password_hash = %s WHERE user_id = %s", (generate_password_hash(new_pass), current_user.id))
+        conn.commit(); return jsonify({"message": "Master Super Admin credentials updated!"}), 200
+    except psycopg2.IntegrityError: conn.rollback(); return jsonify({"error": "Email already in use."}), 409
+    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
+    finally: cur.close(); conn.close()
+
 @app.route('/api/audit_logs', methods=['GET'])
 @login_required
 def get_audit_logs():
@@ -115,7 +136,7 @@ def get_audit_logs():
     cur.execute("SELECT TO_CHAR(timestamp, 'YYYY-MM-DD HH24:MI:SS') as time, user_email, action, target FROM audit_logs WHERE school_id = %s ORDER BY timestamp DESC LIMIT 200", (current_user.school_id,))
     logs = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": logs})
 
-# --- SUPER ADMIN MASTER SETTINGS ---
+# --- SUPER ADMIN TENANT MANAGEMENT ---
 @app.route('/api/superadmin/schools', methods=['GET'])
 @login_required
 def get_schools():
@@ -163,33 +184,7 @@ def renew_school(school_id):
     updated = cur.fetchone(); conn.commit(); cur.close(); conn.close()
     return jsonify({"message": f"Contract Renewed! {updated['school_name']} active until {updated['subscription_expiry_date']}"})
 
-@app.route('/api/superadmin/reset_admin', methods=['POST'])
-@login_required
-def superadmin_reset_admin():
-    if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
-    d = request.get_json(); new_hash = generate_password_hash(d.get('new_password')); conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("UPDATE system_users SET password_hash = %s WHERE email = %s RETURNING user_id", (new_hash, d.get('admin_email')))
-        if not cur.fetchone(): return jsonify({"error": "Admin email not found in global registry."}), 404
-        conn.commit(); return jsonify({"message": f"Global Override successful. Password reset for {d.get('admin_email')}!"}), 200
-    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
-    finally: cur.close(); conn.close()
-
-@app.route('/api/superadmin/credentials', methods=['POST'])
-@login_required
-def superadmin_update_credentials():
-    if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
-    d = request.get_json(); new_email = d.get('new_email'); new_pass = d.get('new_password')
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        if new_email: cur.execute("UPDATE system_users SET email = %s WHERE user_id = %s", (new_email, current_user.id))
-        if new_pass: cur.execute("UPDATE system_users SET password_hash = %s WHERE user_id = %s", (generate_password_hash(new_pass), current_user.id))
-        conn.commit(); return jsonify({"message": "Master Super Admin credentials updated!"}), 200
-    except psycopg2.IntegrityError: conn.rollback(); return jsonify({"error": "Email already in use."}), 409
-    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
-    finally: cur.close(); conn.close()
-
-# --- CORE TENANT OPERATIONS ---
+# --- CORE OPERATIONS (STUDENTS, FEES, EXPENSES) ---
 @app.route('/api/students', methods=['GET', 'POST'])
 @login_required
 @require_active_subscription
@@ -251,39 +246,15 @@ def promote_students():
     if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
     d = request.get_json()
     from_class = str(d.get('from_class') or '').strip(); to_class = str(d.get('to_class') or '').strip()
-    if not from_class or not to_class: return jsonify({"error": "You must provide both Current and Next class names."}), 400
+    if not from_class or not to_class: return jsonify({"error": "Provide both classes."}), 400
     conn = get_db_connection(); cur = conn.cursor()
     try:
         cur.execute("UPDATE students SET current_class = %s WHERE current_class = %s AND school_id = %s RETURNING student_id", (to_class, from_class, current_user.school_id))
         promoted = cur.fetchall()
         cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Promoted Cohort', f"Moved {len(promoted)} from {from_class} to {to_class}"))
-        conn.commit(); return jsonify({"message": f"Success! Promoted {len(promoted)} students from {from_class} to {to_class}."}), 200
-    except Exception as e: conn.rollback(); return jsonify({"error": f"Database Error: {str(e)}"}), 500
+        conn.commit(); return jsonify({"message": f"Success! Promoted {len(promoted)} students."}), 200
+    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
     finally: cur.close(); conn.close()
-
-@app.route('/api/students/bulk', methods=['POST'])
-@login_required
-def bulk_enroll():
-    if current_user.role != 'admin': return jsonify({"error": "Admin only"}), 403
-    if 'file' not in request.files: return jsonify({"error": "No file uploaded"}), 400
-    file = request.files['file']
-    try:
-        stream = StringIO(file.stream.read().decode("UTF8"), newline=None)
-        csv_input = csv.reader(stream); next(csv_input, None) 
-        conn = get_db_connection(); cur = conn.cursor(); count = 0
-        for row in csv_input:
-            if len(row) >= 2: 
-                fname = row[0].strip()[:100]; lname = row[1].strip()[:100]; c_class = row[2].strip()[:100] if len(row) > 2 and row[2].strip() else 'Unassigned'
-                g_name = row[3].strip()[:100] if len(row) > 3 and row[3].strip() else 'N/A'; g_contact = row[4].strip()[:20] if len(row) > 4 and row[4].strip() else ''
-                b_status = row[5].strip()[:20] if len(row) > 5 and row[5].strip() else 'Day'; house = row[6].strip()[:100] if len(row) > 6 and row[6].strip() else 'Unassigned'
-                cur.execute("INSERT INTO students (school_id, first_name, last_name, current_class, guardian_name, guardian_contact, boarding_status, house) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                            (current_user.school_id, fname, lname, c_class, g_name, g_contact, b_status, house))
-                count += 1
-        cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Bulk CSV Enrollment', f"Enrolled {count} students"))
-        conn.commit(); return jsonify({"message": f"Bulk Upload Success! Enrolled {count} students."}), 201
-    except Exception as e: return jsonify({"error": f"Upload failed. Error: {str(e)}"}), 500
-    finally:
-        if 'cur' in locals(): cur.close(); conn.close()
 
 @app.route('/api/fees/bill', methods=['POST'])
 @login_required
@@ -293,43 +264,11 @@ def bill_student():
         stu_id = int(d.get('student_id') or 0); amt = float(d.get('amount_due') or 0.0)
         cur.execute("SELECT student_id FROM students WHERE student_id = %s AND school_id = %s", (stu_id, current_user.school_id))
         if not cur.fetchone(): return jsonify({"error": f"Student ID {stu_id} does not exist!"}), 404
-        cur.execute("INSERT INTO fees (school_id, student_id, fee_category, description, amount_due, academic_year, term) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING fee_id", 
+        cur.execute("INSERT INTO fees (school_id, student_id, fee_category, description, amount_due, academic_year, term) VALUES (%s, %s, %s, %s, %s, %s, %s)", 
                     (current_user.school_id, stu_id, d.get('fee_category'), str(d.get('description') or '')[:250], amt, str(d.get('academic_year') or '')[:9], str(d.get('term') or '')[:20]))
         cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Issued Bill', f"GHS {amt} to ID {stu_id}"))
         conn.commit(); return jsonify({"message": "Bill issued successfully!"}), 201
     except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 400
-    finally: cur.close(); conn.close()
-
-@app.route('/api/fees/bulk_bill', methods=['POST'])
-@login_required
-def bulk_bill():
-    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
-    d = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("""
-            INSERT INTO fees (school_id, student_id, fee_category, description, amount_due, academic_year, term)
-            SELECT school_id, student_id, %s, %s, %s, %s, %s FROM students
-            WHERE current_class = %s AND school_id = %s
-            RETURNING fee_id
-        """, (d.get('fee_category'), d.get('description'), float(d.get('amount_due')), d.get('academic_year'), d.get('term'), d.get('target_class'), current_user.school_id))
-        billed = cur.fetchall()
-        cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Executed Bulk Billing', f"Issued to {len(billed)} students in {d.get('target_class')}"))
-        conn.commit(); return jsonify({"message": f"Bulk Bill issued to {len(billed)} students!"}), 201
-    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 400
-    finally: cur.close(); conn.close()
-
-@app.route('/api/fees/<int:fee_id>', methods=['DELETE'])
-@login_required
-def reverse_bill(fee_id):
-    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("DELETE FROM fees WHERE fee_id = %s AND school_id = %s RETURNING student_id, amount_due", (fee_id, current_user.school_id))
-        result = cur.fetchone()
-        if not result: return jsonify({"error": "Bill not found."}), 404
-        cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Reversed Bill', f"Fee ID {fee_id} (GHS {result['amount_due']})"))
-        conn.commit(); return jsonify({"message": f"Bill {fee_id} successfully reversed."}), 200
-    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
     finally: cur.close(); conn.close()
 
 @app.route('/api/fees/pay', methods=['POST'])
@@ -388,139 +327,7 @@ def get_statement(student_id):
     cur.execute(query, (student_id, current_user.school_id))
     statement = cur.fetchall(); cur.close(); conn.close(); return jsonify({"statement": statement}), 200
 
-@app.route('/api/analytics', methods=['GET'])
-@login_required
-def get_analytics():
-    if current_user.role != 'admin': return jsonify({"error": "Unauthorized"}), 403
-    conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT COALESCE(SUM(amount_due), 0) as total_due FROM fees WHERE school_id = %s", (current_user.school_id,))
-    total_due = float(cur.fetchone()['total_due'])
-    cur.execute("SELECT COALESCE(SUM(p.amount_paid), 0) as total_paid FROM payments p JOIN fees f ON p.fee_id = f.fee_id WHERE f.school_id = %s", (current_user.school_id,))
-    total_paid = float(cur.fetchone()['total_paid'])
-    cur.execute("SELECT COALESCE(SUM(amount), 0) as total_expenses FROM expenses WHERE school_id = %s", (current_user.school_id,))
-    total_exp = float(cur.fetchone()['total_expenses'])
-    cur.execute("SELECT waec_grade, COUNT(*) as count FROM grades WHERE school_id = %s GROUP BY waec_grade ORDER BY waec_grade", (current_user.school_id,))
-    performance = cur.fetchall(); cur.close(); conn.close()
-    return jsonify({"financials": {"due": total_due, "paid": total_paid, "outstanding": total_due - total_paid, "expenses": total_exp, "net_margin": total_paid - total_exp}, "performance": performance})
-
-@app.route('/api/expenses', methods=['POST', 'GET'])
-@login_required
-def manage_expenses():
-    conn = get_db_connection(); cur = conn.cursor()
-    if request.method == 'POST':
-        d = request.get_json()
-        cur.execute("INSERT INTO expenses (school_id, category, description, amount) VALUES (%s, %s, %s, %s)", (current_user.school_id, d.get('category'), d.get('description'), d.get('amount')))
-        cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Logged Expense', f"GHS {d.get('amount')} for {d.get('category')}"))
-        conn.commit(); cur.close(); conn.close(); return jsonify({"message": "Expense logged securely."}), 201
-    else:
-        cur.execute("SELECT expense_id, category, description, amount, TO_CHAR(date_incurred, 'YYYY-MM-DD') as date FROM expenses WHERE school_id = %s ORDER BY date_incurred DESC", (current_user.school_id,))
-        e = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": e})
-
-@app.route('/api/attendance', methods=['POST'])
-@login_required
-def log_attendance():
-    d = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("INSERT INTO attendance (school_id, student_id, record_date, status) VALUES (%s, %s, %s, %s) ON CONFLICT (student_id, record_date) DO UPDATE SET status = EXCLUDED.status", (current_user.school_id, d.get('student_id'), d.get('record_date'), d.get('status')))
-        conn.commit(); return jsonify({"message": f"Attendance recorded for {d.get('record_date')}"})
-    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
-    finally: cur.close(); conn.close()
-
-@app.route('/api/grades', methods=['POST'])
-@login_required
-def add_grade():
-    d = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
-    try:
-        c_score = int(str(d.get('class_score') or '0').strip()); e_score = int(str(d.get('exam_score') or '0').strip())
-        stu_id = int(str(d.get('student_id') or '0').strip()); t_score = c_score + e_score; waec = get_waec_grade(t_score)
-        
-        cur.execute("SELECT subject_id FROM subjects WHERE subject_name = %s AND school_id = %s", (d.get('subject_name'), current_user.school_id))
-        sub = cur.fetchone()
-        if not sub:
-            cur.execute("INSERT INTO subjects (school_id, subject_name) VALUES (%s, %s) RETURNING subject_id", (current_user.school_id, d.get('subject_name')))
-            sub_id = cur.fetchone()['subject_id']
-        else: sub_id = sub['subject_id']
-        
-        cur.execute("INSERT INTO grades (school_id, student_id, subject_id, class_score, exam_score, total_score, waec_grade, academic_year, term, teacher_remarks) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", 
-                    (current_user.school_id, stu_id, sub_id, c_score, e_score, t_score, waec, d.get('academic_year'), d.get('term'), d.get('remarks')))
-        conn.commit(); return jsonify({"message": f"SBA Recorded! Total: {t_score}% ({waec})"})
-    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 400
-    finally: cur.close(); conn.close()
-
-@app.route('/api/report_card/<int:student_id>', methods=['GET'])
-@login_required
-def get_report_card(student_id):
-    if current_user.role == 'guardian' and current_user.linked_student_id != student_id: return jsonify({"error": "Access Denied."}), 403
-    conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT sub.subject_name, g.class_score, g.exam_score, g.total_score, g.waec_grade, g.teacher_remarks, g.term FROM grades g JOIN subjects sub ON g.subject_id = sub.subject_id WHERE g.student_id = %s AND g.school_id = %s", (student_id, current_user.school_id))
-    grades = cur.fetchall(); cur.close(); conn.close(); return jsonify({"grades": grades})
-
-@app.route('/api/sms/blast', methods=['POST'])
-@login_required
-def send_sms_blast():
-    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
-    d = request.get_json(); audience = d.get('audience'); message = d.get('message')
-    if not message: return jsonify({"error": "Message body cannot be empty."}), 400
-    conn = get_db_connection(); cur = conn.cursor()
-    if audience == 'all': cur.execute("SELECT DISTINCT guardian_contact FROM students WHERE school_id = %s AND guardian_contact IS NOT NULL", (current_user.school_id,))
-    elif audience == 'arrears': cur.execute("SELECT DISTINCT s.guardian_contact FROM students s JOIN fees f ON s.student_id = f.student_id LEFT JOIN payments p ON f.fee_id = p.fee_id WHERE s.school_id = %s AND s.guardian_contact IS NOT NULL GROUP BY s.guardian_contact, f.fee_id, f.amount_due HAVING (f.amount_due - COALESCE(SUM(p.amount_paid), 0)) > 0", (current_user.school_id,))
-    else: cur.execute("SELECT DISTINCT guardian_contact FROM students WHERE school_id = %s AND boarding_status = 'Boarding' AND guardian_contact IS NOT NULL", (current_user.school_id,))
-    raw_contacts = cur.fetchall(); cur.close(); conn.close()
-    contacts = [r['guardian_contact'].strip() for r in raw_contacts if r['guardian_contact']]
-    if not contacts: return jsonify({"error": "No numbers found."}), 404
-    
-    api_key = os.environ.get('SMS_API_KEY'); sender = os.environ.get('SMS_SENDER_ID', 'SMS_ADMIN')
-    if api_key:
-        try:
-            res = requests.post("https://sms.arkesel.com/api/v2/sms/send", json={"sender": sender, "message": message, "recipients": contacts}, headers={"api-key": api_key})
-            if res.status_code in [200, 201]: return jsonify({"message": f"Broadcast sent to {len(contacts)} parents!"})
-            return jsonify({"error": "Gateway rejected broadcast."}), 500
-        except Exception as e: return jsonify({"error": str(e)}), 500
-    return jsonify({"message": f"[SIMULATION] SMS sent to {len(contacts)} contacts."})
-
-@app.route('/api/register_staff', methods=['POST'])
-@login_required
-def register_staff():
-    if current_user.role != 'admin': return jsonify({"error": "Admin clearance required."}), 403
-    d = request.get_json(); hashed = generate_password_hash(d.get('password')); conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("INSERT INTO system_users (school_id, email, password_hash, role, phone, subject, base_salary) VALUES (%s, %s, %s, %s, %s, %s, %s)", 
-                    (current_user.school_id, d.get('email'), hashed, 'teacher', d.get('phone'), d.get('subject'), float(d.get('salary') or 0.0)))
-        conn.commit(); return jsonify({"message": "Staff Profile Created!"}), 201
-    except Exception: conn.rollback(); return jsonify({"error": "Email exists or format invalid."}), 409
-    finally: cur.close(); conn.close()
-
-@app.route('/api/register_guardian', methods=['POST'])
-@login_required
-def register_guardian():
-    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
-    d = request.get_json(); hashed = generate_password_hash(d.get('password')); conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("INSERT INTO system_users (school_id, email, password_hash, role, linked_student_id) VALUES (%s, %s, %s, %s, %s)", 
-                    (current_user.school_id, d.get('email'), hashed, 'guardian', int(d.get('linked_student_id'))))
-        conn.commit(); return jsonify({"message": "Guardian Access granted!"}), 201
-    except Exception: conn.rollback(); return jsonify({"error": "Error granting access."}), 409
-    finally: cur.close(); conn.close()
-
-@app.route('/api/staff', methods=['GET'])
-@login_required
-def get_staff():
-    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
-    conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT email, phone, subject, base_salary FROM system_users WHERE school_id = %s AND role = 'teacher'", (current_user.school_id,))
-    staff = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": staff})
-
-@app.route('/api/settings', methods=['POST'])
-@login_required
-def update_settings():
-    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
-    d = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("UPDATE institutions SET address = %s, phone = %s WHERE school_id = %s", (d.get('address'), d.get('phone'), current_user.school_id))
-        conn.commit(); return jsonify({"message": "Profile updated!"})
-    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
-    finally: cur.close(); conn.close()
-
+# --- STATIC DOCUMENTS & IMAGES ---
 @app.route('/api/photo/<int:student_id>', methods=['GET'])
 def get_photo(student_id):
     conn = get_db_connection(); cur = conn.cursor()
@@ -591,117 +398,6 @@ def print_report(student_id):
     html = f"""<!DOCTYPE html><html><head><title>Report | {student['first_name']} {student['last_name']}</title><style>:root {{ --primary: {primary_color}; }} body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #eee; padding: 20px; color: #333; }} .page {{ background: white; max-width: 900px; margin: auto; padding: 40px; border-radius: 8px; }} .header {{ display: flex; justify-content: space-between; border-bottom: 3px solid var(--primary); padding-bottom: 20px; margin-bottom: 30px; }} table {{ width: 100%; border-collapse: collapse; margin-bottom: 40px; }} th, td {{ border: 1px solid #ddd; padding: 12px; text-align: left; }} th {{ background: var(--primary); color: white; }} tr:nth-child(even) {{ background-color: #f9f9f9; }} .signatures {{ display: flex; justify-content: space-between; margin-top: 80px; }} .sig-line {{ border-top: 2px solid #333; width: 250px; text-align: center; padding-top: 10px; font-weight: bold; }} @media print {{ body {{ background: white; padding: 0; }} .page {{ box-shadow: none; max-width: 100%; padding: 0; }} .no-print {{ display: none; }} }}</style></head><body><div style="text-align: center;"><button class="no-print" onclick="window.print()" style="padding:10px 20px; cursor:pointer; background:#28a745; color:white; border:none; border-radius:6px; font-weight:bold; margin-bottom:20px;">🖨️ Print Report</button></div><div class="page"><div class="header"><div style="display:flex; gap: 20px;"><img src="/api/logo/{current_user.school_id}" style="width:90px; height:90px; object-fit:contain;"><div><h1 style="color:var(--primary); margin:0; text-transform:uppercase;">{inst['school_name']}</h1><p style="margin:5px 0;">{inst['address']} | Tel: {inst['phone']}</p><h2 style="margin: 0; color: #555;">TERMINAL REPORT</h2></div></div><img src="/api/photo/{student['student_id']}" style="width:110px; height:130px; object-fit:cover; border:2px solid var(--primary);"></div><p><strong>NAME:</strong> {student['first_name'].upper()} {student['last_name'].upper()} &nbsp;&nbsp;|&nbsp;&nbsp; <strong>CLASS:</strong> {student['current_class']} &nbsp;&nbsp;|&nbsp;&nbsp; <strong>STATUS:</strong> {student['boarding_status']}</p><table><tr><th>Subject</th><th>Class (30%)</th><th>Exam (70%)</th><th>Total (100%)</th><th>Grade</th><th>Remarks</th><th>Term</th></tr>{rows}</table><div class="signatures"><div class="sig-line">Class Teacher's Signature</div><div class="sig-line">Headmaster's Signature</div></div></div></body></html>"""
     return html
 
-@app.route('/api/transport', methods=['GET', 'POST'])
-@login_required
-def manage_transport():
-    conn = get_db_connection(); cur = conn.cursor()
-    if request.method == 'POST':
-        d = request.get_json(); cur.execute("INSERT INTO transport_routes (school_id, route_name, driver_name, fare) VALUES (%s, %s, %s, %s)", (current_user.school_id, d.get('route_name'), d.get('driver_name'), d.get('fare')))
-        conn.commit(); cur.close(); conn.close(); return jsonify({"message": "Transport Route added!"}), 201
-    else:
-        cur.execute("SELECT route_id, route_name, driver_name, fare FROM transport_routes WHERE school_id = %s", (current_user.school_id,))
-        routes = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": routes})
-
-@app.route('/api/inventory', methods=['GET', 'POST'])
-@login_required
-def manage_inventory():
-    conn = get_db_connection(); cur = conn.cursor()
-    if request.method == 'POST':
-        d = request.get_json(); cur.execute("INSERT INTO inventory_items (school_id, item_name, price, stock) VALUES (%s, %s, %s, %s)", (current_user.school_id, d.get('item_name'), d.get('price'), d.get('stock')))
-        conn.commit(); cur.close(); conn.close(); return jsonify({"message": "Item added to Store Catalog!"}), 201
-    else:
-        cur.execute("SELECT item_id, item_name, price, stock FROM inventory_items WHERE school_id = %s", (current_user.school_id,))
-        items = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": items})
-
-@app.route('/api/inventory/sell', methods=['POST'])
-@login_required
-def sell_inventory():
-    d = request.get_json(); item_id = int(d.get('item_id')); qty = int(d.get('quantity')); stu_id = int(d.get('student_id'))
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("SELECT item_name, price, stock FROM inventory_items WHERE item_id = %s AND school_id = %s", (item_id, current_user.school_id))
-        item = cur.fetchone()
-        if not item or item['stock'] < qty: return jsonify({"error": "Insufficient stock!"}), 400
-        total = float(item['price']) * qty
-        cur.execute("UPDATE inventory_items SET stock = stock - %s WHERE item_id = %s", (qty, item_id))
-        cur.execute("INSERT INTO inventory_sales (school_id, student_id, item_name, quantity, total_cost) VALUES (%s, %s, %s, %s, %s)", (current_user.school_id, stu_id, item['item_name'], qty, total))
-        conn.commit(); return jsonify({"message": f"Sale Successful! Total: GHS {total}"}), 200
-    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
-    finally: cur.close(); conn.close()
-
-@app.route('/api/exeats', methods=['GET', 'POST', 'PUT'])
-@login_required
-def manage_exeats():
-    conn = get_db_connection(); cur = conn.cursor()
-    if request.method == 'POST':
-        d = request.get_json(); stu_id = int(d.get('student_id'))
-        try:
-            cur.execute("SELECT first_name, guardian_contact FROM students WHERE student_id = %s AND school_id = %s", (stu_id, current_user.school_id))
-            stu = cur.fetchone()
-            cur.execute("INSERT INTO exeats (school_id, student_id, exeat_type, reason, expected_return) VALUES (%s, %s, %s, %s, %s)", (current_user.school_id, stu_id, d.get('exeat_type'), d.get('reason'), d.get('expected_return')))
-            conn.commit(); return jsonify({"message": "Exeat issued successfully."}), 201
-        except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
-        finally: cur.close(); conn.close()
-    elif request.method == 'PUT':
-        d = request.get_json(); cur.execute("UPDATE exeats SET status = 'Returned' WHERE exeat_id = %s AND school_id = %s", (d.get('exeat_id'), current_user.school_id))
-        conn.commit(); cur.close(); conn.close(); return jsonify({"message": "Exeat marked as Returned."})
-    else:
-        cur.execute("SELECT e.exeat_id, e.student_id, s.first_name, s.last_name, e.exeat_type, e.reason, TO_CHAR(e.expected_return, 'YYYY-MM-DD') as date, e.status FROM exeats e JOIN students s ON e.student_id = s.student_id WHERE e.school_id = %s ORDER BY e.issue_date DESC", (current_user.school_id,))
-        exs = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": exs})
-
-@app.route('/api/sickbay', methods=['GET', 'POST'])
-@login_required
-def manage_sickbay():
-    conn = get_db_connection(); cur = conn.cursor()
-    if request.method == 'POST':
-        d = request.get_json(); cur.execute("INSERT INTO sick_bay_logs (school_id, student_id, symptoms, treatment) VALUES (%s, %s, %s, %s)", (current_user.school_id, int(d.get('student_id')), d.get('symptoms'), d.get('treatment')))
-        conn.commit(); cur.close(); conn.close(); return jsonify({"message": "Medical visit recorded."}), 201
-    else:
-        cur.execute("SELECT sb.log_id, sb.student_id, s.first_name, s.last_name, sb.symptoms, sb.treatment, TO_CHAR(sb.log_date, 'YYYY-MM-DD HH24:MI') as time FROM sick_bay_logs sb JOIN students s ON sb.student_id = s.student_id WHERE sb.school_id = %s ORDER BY sb.log_date DESC", (current_user.school_id,))
-        logs = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": logs})
-
-@app.route('/api/calendar', methods=['GET', 'POST'])
-@login_required
-def manage_calendar():
-    conn = get_db_connection(); cur = conn.cursor()
-    if request.method == 'POST':
-        d = request.get_json(); cur.execute("INSERT INTO academic_calendar (school_id, event_title, event_date, description) VALUES (%s, %s, %s, %s)", (current_user.school_id, d.get('title'), d.get('date'), d.get('desc')))
-        conn.commit(); cur.close(); conn.close(); return jsonify({"message": "Calendar event added!"}), 201
-    else:
-        cur.execute("SELECT event_title, TO_CHAR(event_date, 'YYYY-MM-DD') as date, description FROM academic_calendar WHERE school_id = %s ORDER BY event_date ASC", (current_user.school_id,))
-        evs = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": evs})
-
-@app.route('/api/lesson_plans', methods=['GET', 'POST', 'PUT'])
-@login_required
-def manage_lesson_plans():
-    conn = get_db_connection(); cur = conn.cursor()
-    if request.method == 'POST':
-        d = request.get_json()
-        cur.execute("INSERT INTO lesson_plans (school_id, teacher_email, subject, class_name, week_number, topic, plan_content) VALUES (%s, %s, %s, %s, %s, %s, %s)", (current_user.school_id, current_user.email, d.get('subject'), d.get('class_name'), int(d.get('week_number') or 1), d.get('topic'), d.get('plan_content')))
-        conn.commit(); cur.close(); conn.close(); return jsonify({"message": "Lesson Plan submitted for Headmaster approval!"}), 201
-    elif request.method == 'PUT':
-        d = request.get_json(); cur.execute("UPDATE lesson_plans SET status = %s, admin_remarks = %s WHERE plan_id = %s AND school_id = %s", (d.get('status'), d.get('remarks'), d.get('plan_id'), current_user.school_id))
-        conn.commit(); cur.close(); conn.close(); return jsonify({"message": "Lesson plan review updated."}), 200
-    else:
-        if current_user.role == 'teacher': cur.execute("SELECT plan_id, subject, class_name, week_number, topic, status, admin_remarks, TO_CHAR(submitted_at, 'YYYY-MM-DD') as date FROM lesson_plans WHERE school_id = %s AND teacher_email = %s ORDER BY submitted_at DESC", (current_user.school_id, current_user.email))
-        else: cur.execute("SELECT plan_id, teacher_email, subject, class_name, week_number, topic, plan_content, status, admin_remarks, TO_CHAR(submitted_at, 'YYYY-MM-DD') as date FROM lesson_plans WHERE school_id = %s ORDER BY submitted_at DESC", (current_user.school_id,))
-        plans = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": plans})
-
-@app.route('/api/cbt/quiz', methods=['GET', 'POST'])
-@login_required
-def manage_cbt():
-    conn = get_db_connection(); cur = conn.cursor()
-    if request.method == 'POST':
-        d = request.get_json()
-        cur.execute("INSERT INTO cbt_quizzes (school_id, subject_name, class_name, title, academic_year, term) VALUES (%s, %s, %s, %s, %s, %s) RETURNING quiz_id", (current_user.school_id, d.get('subject'), d.get('class_name'), d.get('title'), d.get('academic_year'), d.get('term')))
-        quiz_id = cur.fetchone()['quiz_id']
-        for q in d.get('questions', []):
-            cur.execute("INSERT INTO cbt_questions (quiz_id, question_text, opt_a, opt_b, opt_c, opt_d, correct_opt) VALUES (%s, %s, %s, %s, %s, %s, %s)", (quiz_id, q.get('text'), q.get('a'), q.get('b'), q.get('c'), q.get('d'), q.get('ans').upper()))
-        conn.commit(); cur.close(); conn.close(); return jsonify({"message": "CBT Quiz published successfully!"}), 201
-    else:
-        cur.execute("SELECT quiz_id, subject_name, class_name, title, academic_year, term, TO_CHAR(created_at, 'YYYY-MM-DD') as date FROM cbt_quizzes WHERE school_id = %s ORDER BY created_at DESC", (current_user.school_id,))
-        quizzes = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": quizzes})
-
 @app.route('/print_transcript/<int:student_id>', methods=['GET'])
 @login_required
 def print_transcript(student_id):
@@ -719,13 +415,247 @@ def print_transcript(student_id):
     html = f"""<!DOCTYPE html><html><head><title>Transcript | {student['first_name']} {student['last_name']}</title><style>body {{ font-family: 'Times New Roman', Times, serif; background: #eee; padding: 20px; }} .sheet {{ background: white; max-width: 900px; margin: auto; padding: 50px; border: 3px double #333; position: relative; box-shadow: 0 0 10px rgba(0,0,0,0.1); }} .header {{ text-align: center; border-bottom: 2px solid #333; padding-bottom: 20px; margin-bottom: 30px; }} table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }} th, td {{ border: 1px solid #333; padding: 8px 12px; font-size: 13px; text-align: left; }} th {{ background: #f2f2f2; text-transform: uppercase; }} .stamp-box {{ margin-top: 60px; display: flex; justify-content: space-between; }} .stamp {{ border-top: 1px solid #333; width: 220px; text-align: center; padding-top: 5px; font-weight: bold; font-size: 12px; }}</style></head><body><div style="text-align:center; margin-bottom:20px;"><button onclick="window.print()" style="padding:10px 20px; font-weight:bold; cursor:pointer;">🖨️ Print Transcript</button></div><div class="sheet"><div class="header"><h1 style="margin:0; text-transform:uppercase; font-size:26px; color:{primary_color};">{inst['school_name']}</h1><p style="margin:5px 0;">{inst['address']} | Tel: {inst['phone']}</p><h2 style="margin-top:15px; font-size:18px; text-decoration:underline;">OFFICIAL ACADEMIC TRANSCRIPT</h2></div><p><strong>Candidate:</strong> {student['first_name'].upper()} {student['last_name'].upper()} &nbsp;&nbsp;|&nbsp;&nbsp; <strong>Student ID:</strong> {inst['school_name'][:3].upper()}-{student['student_id']:04d} &nbsp;&nbsp;|&nbsp;&nbsp; <strong>Class:</strong> {student['current_class']}</p><table><tr><th>Academic Year</th><th>Term</th><th>Subject</th><th>Class (30)</th><th>Exam (70)</th><th>Total</th><th>Grade</th></tr>{rows}</table><div class="stamp-box"><div class="stamp">Academic Registrar</div><div class="stamp">Head of Institution / Stamp</div></div></div></body></html>"""
     return html
 
-# --- FRONTEND CLIENT ROUTE ---
+# --- EMBEDDED RESILIENT DASHBOARD HTML ---
+FALLBACK_DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"><title>{{ school_name }} | ERP Portal</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root { --primary: {{ primary_color }}; --secondary: #f4f7fa; --accent: #28a745; --danger: #dc3545; --info: #17a2b8; --warning: #ffc107; }
+        body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--secondary); margin: 0; display: flex; color: #333; }
+        .sidebar { width: 260px; background: var(--primary); color: white; min-height: 100vh; padding: 20px; box-sizing: border-box; position: fixed; overflow-y: auto; }
+        .sidebar button { background: transparent; color: rgba(255,255,255,0.85); border: none; padding: 10px 14px; width: 100%; text-align: left; margin-bottom: 5px; border-radius: 6px; cursor: pointer; font-size: 0.95rem; font-weight: 500; }
+        .sidebar button:hover { background: rgba(255,255,255,0.15); color: white; }
+        .main-content { margin-left: 260px; flex: 1; padding: 35px; box-sizing: border-box; min-height: 100vh; }
+        .card { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.04); margin-bottom: 25px; }
+        h3 { margin-top: 0; color: var(--primary); border-bottom: 2px solid #f0f0f0; padding-bottom: 8px; }
+        input, select, textarea { width: 100%; padding: 10px; margin-bottom: 12px; border: 1px solid #ced4da; border-radius: 6px; box-sizing: border-box; }
+        .btn { background: var(--primary); color: white; border: none; padding: 10px 16px; border-radius: 6px; cursor: pointer; font-weight: bold; width: 100%; margin-bottom: 8px; }
+        .btn-success { background: var(--accent); } .btn-danger { background: var(--danger); } .btn-info { background: var(--info); } .btn-warning { background: var(--warning); color: #333;}
+        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        #toast { display: none; position: fixed; bottom: 30px; right: 30px; padding: 15px 25px; color: white; background: var(--accent); border-radius: 8px; z-index: 1000; font-weight: bold; }
+        .hidden { display: none !important; }
+    </style>
+</head>
+<body>
+    <div id="toast">Message</div>
+    <div class="sidebar">
+        <h2 style="font-size: 1.1rem; margin-top:0;">{{ school_name }}</h2>
+        {% if current_user.is_authenticated %}
+            <div style="font-size:0.8rem; color:rgba(255,255,255,0.6); margin-bottom:15px;">ROLE: {{ current_user.role|upper }}</div>
+            {% if current_user.role == 'superadmin' %}
+                <button onclick="window.location.reload()">🏢 Global Tenants</button>
+                <button onclick="showSection('sa-settings-section')">⚙️ Master Settings</button>
+            {% elif current_user.role == 'admin' %}
+                <button onclick="showSection('admissions-section')">🎓 Admissions & IDs</button>
+                <button onclick="secureSection('finance-section')">💰 Financials & MoMo</button>
+                <button onclick="secureSection('settings-section')">⚙️ Vault Settings</button>
+            {% elif current_user.role == 'guardian' %}
+                <button onclick="showSection('guardian-section')">👨‍👩‍👧 Guardian Portal</button>
+            {% endif %}
+            <button class="btn-danger" style="margin-top:30px;" onclick="logout()">🛑 Logout</button>
+        {% endif %}
+    </div>
+
+    <main class="main-content">
+        {% if not current_user.is_authenticated %}
+        <div class="card" style="max-width: 400px; margin: 60px auto;">
+            <h3>System Login</h3>
+            <input type="email" id="email" placeholder="Email Address">
+            <input type="password" id="pass" placeholder="Password">
+            <button class="btn" onclick="login()">Sign In</button>
+        </div>
+        {% elif current_user.role == 'superadmin' %}
+        <div id="sa-settings-section" class="card hidden">
+            <h3>⚙️ Master Settings</h3>
+            <div class="grid-2"><input type="email" id="saNewEmail" placeholder="New Email"><input type="password" id="saNewPass" placeholder="New Password"></div>
+            <button class="btn" style="background:#333;" onclick="updateSACredentials()">Update Master Credentials</button>
+        </div>
+        <div class="card" style="border: 2px solid var(--accent);">
+            <h3>🚀 Provision New School Tenant</h3>
+            <div class="grid-2">
+                <div><input type="text" id="onboardSchool" placeholder="Official School Name"><input type="email" id="onboardEmail" placeholder="Administrator Email"></div>
+                <div><input type="password" id="onboardPass" placeholder="Temporary Password"><button class="btn btn-success" onclick="onboardNewSchool()">Provision SaaS Tenant</button></div>
+            </div>
+        </div>
+        <div class="card">
+            <h3>Global Server Tenants</h3>
+            <button class="btn" onclick="loadSchools()">🔄 Refresh Server Data</button>
+            <div id="school-container"></div>
+        </div>
+        {% elif current_user.role == 'admin' %}
+        <div id="admissions-section" class="card">
+            <h3>🎓 Admissions & Student Directory</h3>
+            <div class="grid-2">
+                <input type="text" id="sFirst" placeholder="First Name">
+                <input type="text" id="sLast" placeholder="Last Name">
+            </div>
+            <div class="grid-2">
+                <input type="text" id="sClass" placeholder="Class / Program">
+                <input type="text" id="sGContact" placeholder="Guardian Phone">
+            </div>
+            <button class="btn btn-success" onclick="enrollStudent()">Register Student</button>
+            <hr style="margin:20px 0;">
+            <div class="grid-2">
+                <div>
+                    <input type="number" id="trStuId" placeholder="Student ID">
+                    <button class="btn btn-info" onclick="generateTranscript()">📜 Generate Official Transcript</button>
+                </div>
+                <div>
+                    <button class="btn btn-warning" onclick="window.open('/print_ids', '_blank')">🖨️ Batch Student IDs (with QR)</button>
+                </div>
+            </div>
+        </div>
+        <div id="finance-section" class="card hidden">
+            <h3>💰 Financials & MoMo Gateway</h3>
+            <div class="grid-2">
+                <input type="number" id="bStuId" placeholder="Student ID">
+                <input type="number" id="bAmount" placeholder="Amount Due (GHS)">
+            </div>
+            <button class="btn btn-success" onclick="issueBill()">Issue Bill</button>
+            <hr>
+            <input type="number" id="stateStuId" placeholder="Target Student ID">
+            <button class="btn btn-primary" onclick="loadStatement()">Open Secure Ledger</button>
+            <button class="btn btn-warning" onclick="loadDebtors()">Scan Database for Debtors</button>
+        </div>
+        <div id="settings-section" class="card hidden">
+            <h3>⚙️ Security & Settings</h3>
+            <div class="grid-2">
+                <input type="password" id="myOldPass" placeholder="Current Password">
+                <input type="password" id="myNewPass" placeholder="New Password">
+            </div>
+            <button class="btn" style="background:#333;" onclick="changeMyPassword()">Update Password</button>
+        </div>
+        {% elif current_user.role == 'guardian' %}
+        <div id="guardian-section" class="card">
+            <h3>Guardian Portal</h3>
+            <div class="grid-2">
+                <button class="btn btn-success" onclick="window.open('/print_report/{{ current_user.linked_student_id }}', '_blank')">🖨️ Terminal Report Card</button>
+                <button class="btn btn-info" onclick="window.open('/print_transcript/{{ current_user.linked_student_id }}', '_blank')">📜 Full Official Transcript</button>
+            </div>
+            <hr style="margin:20px 0;">
+            <h4>Pay Fees via Mobile Money</h4>
+            <div class="grid-2">
+                <input type="number" id="momoFeeId" placeholder="Fee ID">
+                <input type="number" id="momoAmount" placeholder="Amount (GHS)">
+            </div>
+            <input type="text" id="momoPhone" placeholder="MoMo Phone Number">
+            <button class="btn btn-warning" onclick="initiateMoMo()">Authorize MoMo Payment</button>
+        </div>
+        {% endif %}
+        
+        <div class="card hidden" id="data-viewer" style="border: 2px solid var(--primary); margin-top:20px;">
+            <div style="background: var(--primary); padding: 15px; display:flex; justify-content:space-between; align-items:center;">
+                <h3 id="viewer-title" style="margin:0; color:white;">Data Explorer</h3>
+            </div>
+            <div id="table-container" style="padding: 15px; overflow-x: auto;"></div>
+        </div>
+    </main>
+
+    <script>
+        let unlockedSections = {};
+        function showToast(msg) {
+            const t = document.getElementById('toast'); t.innerText = msg; t.style.display = 'block';
+            setTimeout(() => t.style.display = 'none', 4000);
+        }
+        function showSection(id) {
+            document.querySelectorAll('.card').forEach(c => { if(c.id && c.id !== 'data-viewer') c.classList.add('hidden'); });
+            const target = document.getElementById(id); if(target) target.classList.remove('hidden');
+        }
+        async function secureSection(sectionId) {
+            if (unlockedSections[sectionId]) { showSection(sectionId); return; }
+            const pass = prompt("SECURE VAULT: Enter password to proceed.");
+            if (!pass) return;
+            try {
+                const res = await fetch('/api/verify_password', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({password: pass}) });
+                if(res.ok) { unlockedSections[sectionId] = true; showSection(sectionId); showToast("Vault Unlocked"); } 
+                else { const data = await res.json(); showToast(data.error, true); }
+            } catch(e) { showToast("Connection failed", true); }
+        }
+        async function login() {
+            const res = await fetch('/api/login', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email:document.getElementById('email').value, password:document.getElementById('pass').value}) });
+            const d = await res.json();
+            if(res.ok) window.location.reload(); else showToast(d.error);
+        }
+        async function logout() { await fetch('/api/logout', {method:'POST'}); window.location.reload(); }
+        async function sendAction(endpoint, payload) {
+            const res = await fetch(endpoint, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+            const d = await res.json(); showToast(d.message || d.error);
+        }
+        async function enrollStudent() {
+            const payload = {
+                first_name: document.getElementById('sFirst').value, last_name: document.getElementById('sLast').value,
+                current_class: document.getElementById('sClass').value, guardian_name: 'Guardian', guardian_contact: document.getElementById('sGContact').value
+            };
+            sendAction('/api/students', payload);
+        }
+        async function issueBill() {
+            const payload = { student_id: document.getElementById('bStuId').value, amount_due: document.getElementById('bAmount').value, fee_category: 'Tuition', academic_year: '2026', term: 'Term 1', description: 'Academic Bill' };
+            sendAction('/api/fees/bill', payload);
+        }
+        async function initiateMoMo() {
+            const res = await fetch('/api/momo/initialize', {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({fee_id: document.getElementById('momoFeeId').value, amount: document.getElementById('momoAmount').value, phone: document.getElementById('momoPhone').value})
+            });
+            const d = await res.json();
+            if(d.status === 'paystack_redirect') window.location.href = d.auth_url;
+            else showToast(d.message || d.error);
+        }
+        function generateTranscript() {
+            const id = document.getElementById('trStuId').value;
+            if(!id) return showToast("Enter Student ID");
+            window.open('/print_transcript/' + id, '_blank');
+        }
+        function renderTable(title, headers, rows, keys) {
+            const viewer = document.getElementById('data-viewer'); document.getElementById('viewer-title').innerText = title; const container = document.getElementById('table-container');
+            if (!rows || rows.length === 0) { container.innerHTML = 'No records found.'; viewer.classList.remove('hidden'); return; }
+            let html = '<table style="width:100%; border-collapse: collapse;"><tr>';
+            headers.forEach(h => html += `<th style="padding:10px; border-bottom: 2px solid #ddd; text-align:left;">${h}</th>`); html += '</tr>';
+            rows.forEach(row => {
+                html += '<tr>';
+                keys.forEach(k => { html += `<td style="padding:10px; border-bottom:1px solid #eee;">${row[k]}</td>`; });
+                html += '</tr>';
+            });
+            container.innerHTML = html + '</table>'; viewer.classList.remove('hidden');
+        }
+        async function loadStatement() {
+            const id = document.getElementById('stateStuId').value;
+            const res = await fetch('/api/statement/' + id); const data = await res.json();
+            renderTable("Financial Ledger", ['Bill Type', 'Desc', 'Due', 'Paid', 'Balance'], data.statement, ['fee_category', 'description', 'amount_due', 'total_paid', 'remaining_balance']);
+        }
+        async function loadDebtors() {
+            const res = await fetch('/api/debtors'); const data = await res.json();
+            renderTable("Debtors", ['ID', 'First Name', 'Last Name', 'Total Owed'], data.data, ['student_id', 'first_name', 'last_name', 'arrears']);
+        }
+        async function loadSchools() {
+            const res = await fetch('/api/superadmin/schools'); const data = await res.json();
+            renderTable("Global Tenants", ['ID', 'School Name', 'Expiry', 'Status'], data.data, ['school_id', 'school_name', 'expiry_date', 'status']);
+        }
+        async function onboardNewSchool() {
+            const res = await fetch('/api/superadmin/onboard', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({school_name: document.getElementById('onboardSchool').value, admin_email: document.getElementById('onboardEmail').value, admin_password: document.getElementById('onboardPass').value}) });
+            const data = await res.json(); if (res.ok) { showToast(data.message); loadSchools(); } else { showToast(data.error, true); }
+        }
+        async function updateSACredentials() {
+            const res = await fetch('/api/superadmin/credentials', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({new_email: document.getElementById('saNewEmail').value, new_password: document.getElementById('saNewPass').value}) });
+            const data = await res.json(); if (res.ok) { showToast(data.message); } else { showToast(data.error, true); }
+        }
+        async function changeMyPassword() {
+            const res = await fetch('/api/change_password', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({current_password: document.getElementById('myOldPass').value, new_password: document.getElementById('myNewPass').value}) });
+            const data = await res.json(); if (res.ok) { showToast(data.message); } else { showToast(data.error, true); }
+        }
+    </script>
+</body>
+</html>"""
+
+# --- DASHBOARD ROUTE (RESILIENT LOADER) ---
 @app.route('/dashboard')
 def dashboard():
+    school_name = "Global ERP Engine"
+    primary_color = "#0f4c81"
     try:
-        school_name = "Global ERP Engine"
-        primary_color = "#0f4c81"
-        if current_user.is_authenticated and current_user.school_id:
+        if current_user.is_authenticated and getattr(current_user, 'school_id', None):
             conn = get_db_connection()
             cur = conn.cursor()
             cur.execute("SELECT school_name, primary_color FROM institutions WHERE school_id = %s", (current_user.school_id,))
@@ -735,10 +665,15 @@ def dashboard():
             if inst:
                 school_name = inst['school_name']
                 primary_color = inst['primary_color'] or "#0f4c81"
+    except Exception:
+        pass
+        
+    try:
+        # Tries loading from templates/dashboard.html first
         return render_template('dashboard.html', school_name=school_name, primary_color=primary_color)
-    except Exception as e:
-        # Safety net: If reading from the database for the dashboard fails, display exact error
-        return f"<h1>Dashboard Error</h1><p>The server encountered an issue loading the dashboard data: {str(e)}</p>", 500
+    except Exception:
+        # Automatically falls back to embedded dashboard if template file is missing on Render
+        return render_template_string(FALLBACK_DASHBOARD_HTML, school_name=school_name, primary_color=primary_color)
 
 # --- BOOT SEQUENCE ---
 with app.app_context():
@@ -747,6 +682,10 @@ with app.app_context():
         print("SaaS Database Engine synchronized successfully on boot.")
     except Exception as e:
         print(f"Boot synchronization skipped: {e}")
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=automated_weekly_backup, trigger="cron", day_of_week='sun', hour=23, minute=59)
+scheduler.start()
 
 if __name__ == '__main__':
     app.run(debug=False, host='0.0.0.0', port=5000)
