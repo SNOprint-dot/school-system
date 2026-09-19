@@ -154,7 +154,7 @@ scheduler = BackgroundScheduler()
 scheduler.add_job(func=automated_weekly_backup, trigger="cron", day_of_week='sun', hour=23, minute=59)
 scheduler.start()
 
-# --- AUTH, SECURITY & SUPER ADMIN ---
+# --- AUTH & SECURITY ENGINE ---
 @app.route('/api/login', methods=['POST'])
 def login():
     data = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
@@ -169,6 +169,18 @@ def login():
 @login_required
 def logout():
     logout_user(); return jsonify({"message": "Logged out safely."})
+
+@app.route('/api/verify_password', methods=['POST'])
+@login_required
+def verify_password():
+    """Secondary authentication lock for sensitive tabs"""
+    d = request.get_json()
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT password_hash FROM system_users WHERE user_id = %s", (current_user.id,))
+    user = cur.fetchone(); cur.close(); conn.close()
+    if user and check_password_hash(user['password_hash'], d.get('password')):
+        return jsonify({"message": "Vault unlocked."}), 200
+    return jsonify({"error": "Incorrect password. Access denied."}), 403
 
 @app.route('/api/change_password', methods=['POST'])
 @login_required
@@ -204,6 +216,22 @@ def admin_reset_password():
         conn.rollback(); return jsonify({"error": str(e)}), 500
     finally: cur.close(); conn.close()
 
+@app.route('/api/superadmin/reset_admin', methods=['POST'])
+@login_required
+def superadmin_reset_admin():
+    if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
+    d = request.get_json()
+    new_hash = generate_password_hash(d.get('new_password'))
+    conn = get_db_connection(); cur = conn.cursor()
+    try:
+        cur.execute("UPDATE system_users SET password_hash = %s WHERE email = %s RETURNING user_id", (new_hash, d.get('admin_email')))
+        if not cur.fetchone(): return jsonify({"error": "Admin email not found in global registry."}), 404
+        conn.commit(); return jsonify({"message": f"Global Override successful. Password reset for {d.get('admin_email')}!"}), 200
+    except Exception as e:
+        conn.rollback(); return jsonify({"error": str(e)}), 500
+    finally: cur.close(); conn.close()
+
+# --- SUPER ADMIN TENANT MANAGEMENT ---
 @app.route('/api/superadmin/schools', methods=['GET'])
 @login_required
 def get_schools():
@@ -875,13 +903,17 @@ def dashboard():
                 
                 {% elif current_user.role == 'admin' %}
                     <button onclick="showSection('analytics-section')">📊 Corporate Dashboard</button>
-                    <button onclick="showSection('finance-section')">💰 Financials & Billing</button>
+                    <!-- SECURE SECTIONS WITH VAULT LOCK -->
+                    <button onclick="secureSection('finance-section')">💰 Financials & Billing</button>
+                    
                     <button onclick="showSection('admissions-section')">🎓 Admissions & Directory</button>
                     <button onclick="showSection('attendance-section')">📅 Roll Call & Feeding</button>
                     <button onclick="showSection('academics-section')">📚 Academic Reporting</button>
                     <button onclick="showSection('sms-section')">📟 Live SMS Gateway</button>
                     <button onclick="showSection('hr-section')">🧑‍🏫 Staff HR & Parent Access</button>
-                    <button onclick="showSection('settings-section')">⚙️ Security & Settings</button>
+                    
+                    <!-- SECURE SETTINGS -->
+                    <button onclick="secureSection('settings-section')">⚙️ Security & Settings</button>
                 
                 {% elif current_user.role == 'teacher' %}
                     <button onclick="showSection('attendance-section')">📅 Daily Roll Call</button>
@@ -967,6 +999,17 @@ def dashboard():
                 </div>
             </div>
 
+            <!-- NEW: Super Admin Master Reset Tool -->
+            <div class="card" style="border: 2px solid var(--danger);">
+                <h3>🔑 Super Admin Master Override</h3>
+                <p style="font-size:0.9rem; color:#555;">Force reset a locked-out School Admin's password globally across all databases.</p>
+                <div class="grid-2">
+                    <input type="email" id="saResetEmail" placeholder="Target Admin Email Address">
+                    <input type="password" id="saResetPass" placeholder="Assign New Temporary Password">
+                </div>
+                <button class="btn btn-danger" onclick="saResetAdmin()">Execute Global Override</button>
+            </div>
+
             <div class="card">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 20px;">
                     <h3 style="margin:0; border:none;">Global Server Tenants</h3>
@@ -992,9 +1035,9 @@ def dashboard():
                     </div>
                 </div>
 
-                <!-- Financials Section -->
+                <!-- Financials Section (Vault Locked) -->
                 <div id="finance-section" class="card admin-section hidden" style="border-top: 5px solid var(--danger);">
-                    <h3>💰 Financial Ledger & Billing Operations</h3>
+                    <h3>💰 Financial Ledger & Billing Operations (SECURED)</h3>
                     <div class="grid-2">
                         <div>
                             <div style="background: #f8f9fa; padding: 20px; border-radius: 12px; margin-bottom: 20px; border: 1px solid #eee;">
@@ -1248,10 +1291,10 @@ def dashboard():
                 {% endif %}
             {% endif %}
 
-            <!-- UNIVERSAL SETTINGS & SECURITY TAB (Visible to ALL logged-in users) -->
+            <!-- UNIVERSAL SETTINGS & SECURITY TAB (Visible to ALL logged-in users, Vault Locked) -->
             {% if current_user.is_authenticated and current_user.role != 'superadmin' %}
             <div id="settings-section" class="card admin-section hidden" style="border-top: 5px solid #333;">
-                <h3>🔒 Security & Access Management</h3>
+                <h3>🔒 Security & Access Management (SECURED)</h3>
                 
                 <div class="grid-2">
                     <div style="background: #fff; padding: 25px; border-radius: 12px; border: 1px solid #ccc; box-shadow: 0 4px 10px rgba(0,0,0,0.05);">
@@ -1303,6 +1346,23 @@ def dashboard():
         </main>
 
         <script>
+            let unlockedSections = {};
+            let inactivityTimeout;
+
+            // Security Auto-Logout Timer (15 mins)
+            function resetTimer() {
+                clearTimeout(inactivityTimeout);
+                if(document.getElementById('email') == null) {
+                    inactivityTimeout = setTimeout(() => {
+                        alert("Security Alert: Your session has expired due to 15 minutes of inactivity.");
+                        logout();
+                    }, 15 * 60 * 1000);
+                }
+            }
+            window.onload = () => { loadDashboardData(); resetTimer(); };
+            document.onmousemove = resetTimer;
+            document.onkeypress = resetTimer;
+
             function showSection(sectionId) {
                 const sections = ['analytics-section', 'finance-section', 'admissions-section', 'attendance-section', 'academics-section', 'sms-section', 'hr-section', 'guardian-section', 'settings-section'];
                 sections.forEach(id => {
@@ -1316,6 +1376,31 @@ def dashboard():
                 if (sectionId === 'analytics-section') loadDashboardData();
             }
 
+            // --- THE VAULT LOCK ENGINE ---
+            async function secureSection(sectionId) {
+                if (unlockedSections[sectionId]) {
+                    showSection(sectionId);
+                    return;
+                }
+                const pass = prompt("SECURE VAULT: Please enter your personal password to access this restricted section.");
+                if (!pass) return;
+                
+                try {
+                    const res = await fetch('/api/verify_password', {
+                        method: 'POST', headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({password: pass})
+                    });
+                    if(res.ok) {
+                        unlockedSections[sectionId] = true;
+                        showSection(sectionId);
+                        showToast("Vault Unlocked Successfully");
+                    } else {
+                        const data = await res.json();
+                        showToast(data.error, true);
+                    }
+                } catch(e) { showToast("Connection failed", true); }
+            }
+
             function showToast(message, isError=false) {
                 const toast = document.getElementById('toast');
                 toast.innerText = message;
@@ -1324,6 +1409,7 @@ def dashboard():
                 setTimeout(() => { toast.style.display = 'none'; }, 5000);
             }
 
+            // CSV EXPORT ENGINE
             function downloadCSV(csv, filename) {
                 let csvFile = new Blob([csv], {type: "text/csv"});
                 let downloadLink = document.createElement("a");
@@ -1376,6 +1462,7 @@ def dashboard():
                 } catch(e) { showToast("Connection failed", true); }
             }
 
+            // --- CREDENTIAL MANAGEMENT ---
             async function changeMyPassword() {
                 const oldP = document.getElementById('myOldPass').value;
                 const newP = document.getElementById('myNewPass').value;
@@ -1397,6 +1484,19 @@ def dashboard():
                     const res = await fetch('/api/admin/reset_password', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({target_email: email, new_password: newP}) });
                     const data = await res.json();
                     if(res.ok) { showToast(data.message); document.getElementById('resetTargetEmail').value = ''; document.getElementById('resetNewPass').value = ''; } 
+                    else { showToast(data.error, true); }
+                } catch(e) { showToast("Connection failed", true); }
+            }
+
+            async function saResetAdmin() {
+                const email = document.getElementById('saResetEmail').value;
+                const newP = document.getElementById('saResetPass').value;
+                if(!email || !newP) { showToast("Provide Target Email and New Password.", true); return; }
+                if(!confirm(`Are you sure you want to FORCE RESET the admin password for ${email}?`)) return;
+                try {
+                    const res = await fetch('/api/superadmin/reset_admin', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({admin_email: email, new_password: newP}) });
+                    const data = await res.json();
+                    if(res.ok) { showToast(data.message); document.getElementById('saResetEmail').value = ''; document.getElementById('saResetPass').value = ''; } 
                     else { showToast(data.error, true); }
                 } catch(e) { showToast("Connection failed", true); }
             }
