@@ -8,7 +8,7 @@ import requests
 from io import StringIO
 from functools import wraps
 from datetime import datetime
-from flask import Flask, jsonify, request, render_template, render_template_string, Response, redirect, url_for
+from flask import Flask, jsonify, request, render_template_string, Response, redirect, url_for
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -39,9 +39,10 @@ def require_active_subscription(f):
         return f(*args, **kwargs)
     return decorated_function
 
-# --- URL ROUTING ---
+# --- URL ROUTING FIX ---
 @app.route('/')
 def index():
+    # Automatically forces users to the dashboard
     return redirect(url_for('dashboard'))
 
 # --- AUTH & SECURITY ENGINE ---
@@ -49,9 +50,12 @@ def index():
 def login():
     try:
         data = request.get_json()
-        conn = get_db_connection(); cur = conn.cursor()
+        conn = get_db_connection()
+        cur = conn.cursor()
         cur.execute("SELECT user_id, email, password_hash, role, linked_student_id, school_id FROM system_users WHERE email = %s", (data.get('email'),))
-        user_data = cur.fetchone(); cur.close(); conn.close()
+        user_data = cur.fetchone()
+        cur.close()
+        conn.close()
         
         if user_data and check_password_hash(user_data['password_hash'], data.get('password')):
             user = User(user_data['user_id'], user_data['email'], user_data['role'], user_data['linked_student_id'], user_data['school_id'])
@@ -102,32 +106,6 @@ def admin_reset_password():
     except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
     finally: cur.close(); conn.close()
 
-@app.route('/api/superadmin/reset_admin', methods=['POST'])
-@login_required
-def superadmin_reset_admin():
-    if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
-    d = request.get_json(); new_hash = generate_password_hash(d.get('new_password')); conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("UPDATE system_users SET password_hash = %s WHERE email = %s RETURNING user_id", (new_hash, d.get('admin_email')))
-        if not cur.fetchone(): return jsonify({"error": "Admin email not found in global registry."}), 404
-        conn.commit(); return jsonify({"message": f"Global Override successful for {d.get('admin_email')}!"}), 200
-    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
-    finally: cur.close(); conn.close()
-
-@app.route('/api/superadmin/credentials', methods=['POST'])
-@login_required
-def superadmin_update_credentials():
-    if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
-    d = request.get_json(); new_email = d.get('new_email'); new_pass = d.get('new_password')
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        if new_email: cur.execute("UPDATE system_users SET email = %s WHERE user_id = %s", (new_email, current_user.id))
-        if new_pass: cur.execute("UPDATE system_users SET password_hash = %s WHERE user_id = %s", (generate_password_hash(new_pass), current_user.id))
-        conn.commit(); return jsonify({"message": "Master Super Admin credentials updated!"}), 200
-    except psycopg2.IntegrityError: conn.rollback(); return jsonify({"error": "Email already in use."}), 409
-    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
-    finally: cur.close(); conn.close()
-
 @app.route('/api/audit_logs', methods=['GET'])
 @login_required
 def get_audit_logs():
@@ -136,7 +114,7 @@ def get_audit_logs():
     cur.execute("SELECT TO_CHAR(timestamp, 'YYYY-MM-DD HH24:MI:SS') as time, user_email, action, target FROM audit_logs WHERE school_id = %s ORDER BY timestamp DESC LIMIT 200", (current_user.school_id,))
     logs = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": logs})
 
-# --- SUPER ADMIN TENANT MANAGEMENT ---
+# --- SUPER ADMIN MASTER SETTINGS ---
 @app.route('/api/superadmin/schools', methods=['GET'])
 @login_required
 def get_schools():
@@ -184,7 +162,33 @@ def renew_school(school_id):
     updated = cur.fetchone(); conn.commit(); cur.close(); conn.close()
     return jsonify({"message": f"Contract Renewed! {updated['school_name']} active until {updated['subscription_expiry_date']}"})
 
-# --- CORE OPERATIONS (STUDENTS, FEES, EXPENSES) ---
+@app.route('/api/superadmin/reset_admin', methods=['POST'])
+@login_required
+def superadmin_reset_admin():
+    if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
+    d = request.get_json(); new_hash = generate_password_hash(d.get('new_password')); conn = get_db_connection(); cur = conn.cursor()
+    try:
+        cur.execute("UPDATE system_users SET password_hash = %s WHERE email = %s RETURNING user_id", (new_hash, d.get('admin_email')))
+        if not cur.fetchone(): return jsonify({"error": "Admin email not found in global registry."}), 404
+        conn.commit(); return jsonify({"message": f"Global Override successful. Password reset for {d.get('admin_email')}!"}), 200
+    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
+    finally: cur.close(); conn.close()
+
+@app.route('/api/superadmin/credentials', methods=['POST'])
+@login_required
+def superadmin_update_credentials():
+    if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
+    d = request.get_json(); new_email = d.get('new_email'); new_pass = d.get('new_password')
+    conn = get_db_connection(); cur = conn.cursor()
+    try:
+        if new_email: cur.execute("UPDATE system_users SET email = %s WHERE user_id = %s", (new_email, current_user.id))
+        if new_pass: cur.execute("UPDATE system_users SET password_hash = %s WHERE user_id = %s", (generate_password_hash(new_pass), current_user.id))
+        conn.commit(); return jsonify({"message": "Master Super Admin credentials updated!"}), 200
+    except psycopg2.IntegrityError: conn.rollback(); return jsonify({"error": "Email already in use."}), 409
+    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
+    finally: cur.close(); conn.close()
+
+# --- CORE TENANT OPERATIONS ---
 @app.route('/api/students', methods=['GET', 'POST'])
 @login_required
 @require_active_subscription
@@ -240,6 +244,30 @@ def update_delete_student(student_id):
         except Exception as e: conn.rollback(); return jsonify({"error": f"Database Error: {str(e)}"}), 500
         finally: cur.close(); conn.close()
 
+@app.route('/api/students/bulk', methods=['POST'])
+@login_required
+def bulk_enroll():
+    if current_user.role != 'admin': return jsonify({"error": "Admin only"}), 403
+    if 'file' not in request.files: return jsonify({"error": "No file uploaded"}), 400
+    file = request.files['file']
+    try:
+        stream = StringIO(file.stream.read().decode("UTF8"), newline=None)
+        csv_input = csv.reader(stream); next(csv_input, None) 
+        conn = get_db_connection(); cur = conn.cursor(); count = 0
+        for row in csv_input:
+            if len(row) >= 2: 
+                fname = row[0].strip()[:100]; lname = row[1].strip()[:100]; c_class = row[2].strip()[:100] if len(row) > 2 and row[2].strip() else 'Unassigned'
+                g_name = row[3].strip()[:100] if len(row) > 3 and row[3].strip() else 'N/A'; g_contact = row[4].strip()[:20] if len(row) > 4 and row[4].strip() else ''
+                b_status = row[5].strip()[:20] if len(row) > 5 and row[5].strip() else 'Day'; house = row[6].strip()[:100] if len(row) > 6 and row[6].strip() else 'Unassigned'
+                cur.execute("INSERT INTO students (school_id, first_name, last_name, current_class, guardian_name, guardian_contact, boarding_status, house) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                            (current_user.school_id, fname, lname, c_class, g_name, g_contact, b_status, house))
+                count += 1
+        cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Bulk CSV Enrollment', f"Enrolled {count} students"))
+        conn.commit(); return jsonify({"message": f"Bulk Upload Success! Enrolled {count} students."}), 201
+    except Exception as e: return jsonify({"error": f"Upload failed. Ensure CSV format is correct. Error: {str(e)}"}), 500
+    finally:
+        if 'cur' in locals(): cur.close(); conn.close()
+
 @app.route('/api/students/promote', methods=['POST'])
 @login_required
 def promote_students():
@@ -269,6 +297,38 @@ def bill_student():
         cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Issued Bill', f"GHS {amt} to ID {stu_id}"))
         conn.commit(); return jsonify({"message": "Bill issued successfully!"}), 201
     except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 400
+    finally: cur.close(); conn.close()
+
+@app.route('/api/fees/bulk_bill', methods=['POST'])
+@login_required
+def bulk_bill():
+    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
+    d = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO fees (school_id, student_id, fee_category, description, amount_due, academic_year, term)
+            SELECT school_id, student_id, %s, %s, %s, %s, %s FROM students
+            WHERE current_class = %s AND school_id = %s
+            RETURNING fee_id
+        """, (d.get('fee_category'), d.get('description'), float(d.get('amount_due')), d.get('academic_year'), d.get('term'), d.get('target_class'), current_user.school_id))
+        billed = cur.fetchall()
+        cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Executed Bulk Billing', f"Issued to {len(billed)} students in {d.get('target_class')}"))
+        conn.commit(); return jsonify({"message": f"Bulk Bill issued to {len(billed)} students!"}), 201
+    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 400
+    finally: cur.close(); conn.close()
+
+@app.route('/api/fees/<int:fee_id>', methods=['DELETE'])
+@login_required
+def reverse_bill(fee_id):
+    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
+    conn = get_db_connection(); cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM fees WHERE fee_id = %s AND school_id = %s RETURNING student_id, amount_due", (fee_id, current_user.school_id))
+        result = cur.fetchone()
+        if not result: return jsonify({"error": "Bill not found."}), 404
+        cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Reversed Bill', f"Fee ID {fee_id} (GHS {result['amount_due']})"))
+        conn.commit(); return jsonify({"message": f"Bill {fee_id} successfully reversed."}), 200
+    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
     finally: cur.close(); conn.close()
 
 @app.route('/api/fees/pay', methods=['POST'])
@@ -327,7 +387,252 @@ def get_statement(student_id):
     cur.execute(query, (student_id, current_user.school_id))
     statement = cur.fetchall(); cur.close(); conn.close(); return jsonify({"statement": statement}), 200
 
-# --- STATIC DOCUMENTS & IMAGES ---
+@app.route('/api/analytics', methods=['GET'])
+@login_required
+def get_analytics():
+    if current_user.role != 'admin': return jsonify({"error": "Unauthorized"}), 403
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT COALESCE(SUM(amount_due), 0) as total_due FROM fees WHERE school_id = %s", (current_user.school_id,))
+    total_due = float(cur.fetchone()['total_due'])
+    cur.execute("SELECT COALESCE(SUM(p.amount_paid), 0) as total_paid FROM payments p JOIN fees f ON p.fee_id = f.fee_id WHERE f.school_id = %s", (current_user.school_id,))
+    total_paid = float(cur.fetchone()['total_paid'])
+    cur.execute("SELECT COALESCE(SUM(amount), 0) as total_expenses FROM expenses WHERE school_id = %s", (current_user.school_id,))
+    total_exp = float(cur.fetchone()['total_expenses'])
+    cur.execute("SELECT waec_grade, COUNT(*) as count FROM grades WHERE school_id = %s GROUP BY waec_grade ORDER BY waec_grade", (current_user.school_id,))
+    performance = cur.fetchall(); cur.close(); conn.close()
+    return jsonify({"financials": {"due": total_due, "paid": total_paid, "outstanding": total_due - total_paid, "expenses": total_exp, "net_margin": total_paid - total_exp}, "performance": performance})
+
+@app.route('/api/expenses', methods=['POST', 'GET'])
+@login_required
+def manage_expenses():
+    conn = get_db_connection(); cur = conn.cursor()
+    if request.method == 'POST':
+        d = request.get_json()
+        cur.execute("INSERT INTO expenses (school_id, category, description, amount) VALUES (%s, %s, %s, %s)", (current_user.school_id, d.get('category'), d.get('description'), d.get('amount')))
+        cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Logged Expense', f"GHS {d.get('amount')} for {d.get('category')}"))
+        conn.commit(); cur.close(); conn.close(); return jsonify({"message": "Expense logged securely."}), 201
+    else:
+        cur.execute("SELECT expense_id, category, description, amount, TO_CHAR(date_incurred, 'YYYY-MM-DD') as date FROM expenses WHERE school_id = %s ORDER BY date_incurred DESC", (current_user.school_id,))
+        e = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": e})
+
+@app.route('/api/attendance', methods=['POST'])
+@login_required
+def log_attendance():
+    d = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO attendance (school_id, student_id, record_date, status) VALUES (%s, %s, %s, %s) ON CONFLICT (student_id, record_date) DO UPDATE SET status = EXCLUDED.status", (current_user.school_id, d.get('student_id'), d.get('record_date'), d.get('status')))
+        conn.commit(); return jsonify({"message": f"Attendance recorded for {d.get('record_date')}"})
+    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
+    finally: cur.close(); conn.close()
+
+@app.route('/api/transport', methods=['GET', 'POST'])
+@login_required
+def manage_transport():
+    conn = get_db_connection(); cur = conn.cursor()
+    if request.method == 'POST':
+        if current_user.role != 'admin': return jsonify({"error": "Admin only"}), 403
+        d = request.get_json(); cur.execute("INSERT INTO transport_routes (school_id, route_name, driver_name, fare) VALUES (%s, %s, %s, %s)", (current_user.school_id, d.get('route_name'), d.get('driver_name'), d.get('fare')))
+        conn.commit(); cur.close(); conn.close(); return jsonify({"message": "Transport Route added!"}), 201
+    else:
+        cur.execute("SELECT route_id, route_name, driver_name, fare FROM transport_routes WHERE school_id = %s", (current_user.school_id,))
+        routes = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": routes})
+
+@app.route('/api/inventory', methods=['GET', 'POST'])
+@login_required
+def manage_inventory():
+    conn = get_db_connection(); cur = conn.cursor()
+    if request.method == 'POST':
+        if current_user.role != 'admin': return jsonify({"error": "Admin only"}), 403
+        d = request.get_json(); cur.execute("INSERT INTO inventory_items (school_id, item_name, price, stock) VALUES (%s, %s, %s, %s)", (current_user.school_id, d.get('item_name'), d.get('price'), d.get('stock')))
+        conn.commit(); cur.close(); conn.close(); return jsonify({"message": "Item added to Store Catalog!"}), 201
+    else:
+        cur.execute("SELECT item_id, item_name, price, stock FROM inventory_items WHERE school_id = %s", (current_user.school_id,))
+        items = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": items})
+
+@app.route('/api/inventory/sell', methods=['POST'])
+@login_required
+def sell_inventory():
+    if current_user.role != 'admin': return jsonify({"error": "Admin only"}), 403
+    d = request.get_json(); item_id = int(d.get('item_id')); qty = int(d.get('quantity')); stu_id = int(d.get('student_id'))
+    conn = get_db_connection(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT item_name, price, stock FROM inventory_items WHERE item_id = %s AND school_id = %s", (item_id, current_user.school_id))
+        item = cur.fetchone()
+        if not item or item['stock'] < qty: return jsonify({"error": "Insufficient stock!"}), 400
+        total = float(item['price']) * qty
+        cur.execute("UPDATE inventory_items SET stock = stock - %s WHERE item_id = %s", (qty, item_id))
+        cur.execute("INSERT INTO inventory_sales (school_id, student_id, item_name, quantity, total_cost) VALUES (%s, %s, %s, %s, %s)", (current_user.school_id, stu_id, item['item_name'], qty, total))
+        cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Store POS Sale', f"Sold {qty} {item['item_name']} to ID {stu_id}"))
+        conn.commit(); return jsonify({"message": f"Sale Successful! Total: GHS {total}"}), 200
+    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
+    finally: cur.close(); conn.close()
+
+@app.route('/api/exeats', methods=['GET', 'POST', 'PUT'])
+@login_required
+def manage_exeats():
+    conn = get_db_connection(); cur = conn.cursor()
+    if request.method == 'POST':
+        if current_user.role != 'admin': return jsonify({"error": "Admin only"}), 403
+        d = request.get_json(); stu_id = int(d.get('student_id'))
+        try:
+            cur.execute("SELECT first_name, guardian_contact FROM students WHERE student_id = %s AND school_id = %s", (stu_id, current_user.school_id))
+            stu = cur.fetchone()
+            if not stu: return jsonify({"error": "Student ID not found."}), 404
+            cur.execute("INSERT INTO exeats (school_id, student_id, exeat_type, reason, expected_return) VALUES (%s, %s, %s, %s, %s)", (current_user.school_id, stu_id, d.get('exeat_type'), d.get('reason'), d.get('expected_return')))
+            cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Issued Exeat', f"To ID {stu_id} for {d.get('reason')}"))
+            conn.commit()
+            
+            api_key = os.environ.get('SMS_API_KEY'); sender = os.environ.get('SMS_SENDER_ID', 'SMS_ADMIN')
+            if api_key and stu['guardian_contact']:
+                try: requests.post("https://sms.arkesel.com/api/v2/sms/send", json={"sender": sender, "message": f"ALERT: Your ward {stu['first_name']} has been issued an Exeat ({d.get('exeat_type')}) for: {d.get('reason')}. Expected return: {d.get('expected_return')}.", "recipients": [stu['guardian_contact']]}, headers={"api-key": api_key})
+                except Exception: pass
+            return jsonify({"message": "Exeat issued securely."}), 201
+        except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
+        finally: cur.close(); conn.close()
+    elif request.method == 'PUT':
+        if current_user.role != 'admin': return jsonify({"error": "Admin only"}), 403
+        d = request.get_json()
+        cur.execute("UPDATE exeats SET status = 'Returned' WHERE exeat_id = %s AND school_id = %s", (d.get('exeat_id'), current_user.school_id))
+        conn.commit(); cur.close(); conn.close(); return jsonify({"message": "Exeat marked as Returned."})
+    else:
+        cur.execute("SELECT e.exeat_id, e.student_id, s.first_name, s.last_name, e.exeat_type, e.reason, TO_CHAR(e.expected_return, 'YYYY-MM-DD') as date, e.status FROM exeats e JOIN students s ON e.student_id = s.student_id WHERE e.school_id = %s ORDER BY e.issue_date DESC", (current_user.school_id,))
+        exs = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": exs})
+
+@app.route('/api/sickbay', methods=['GET', 'POST'])
+@login_required
+def manage_sickbay():
+    conn = get_db_connection(); cur = conn.cursor()
+    if request.method == 'POST':
+        if current_user.role != 'admin': return jsonify({"error": "Admin only"}), 403
+        d = request.get_json(); stu_id = int(d.get('student_id'))
+        try:
+            cur.execute("INSERT INTO sick_bay_logs (school_id, student_id, symptoms, treatment) VALUES (%s, %s, %s, %s)", (current_user.school_id, stu_id, d.get('symptoms'), d.get('treatment')))
+            cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Sick Bay Log', f"ID {stu_id}: {d.get('symptoms')}"))
+            conn.commit(); return jsonify({"message": "Medical visit recorded."}), 201
+        except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
+        finally: cur.close(); conn.close()
+    else:
+        cur.execute("SELECT sb.log_id, sb.student_id, s.first_name, s.last_name, sb.symptoms, sb.treatment, TO_CHAR(sb.log_date, 'YYYY-MM-DD HH24:MI') as time FROM sick_bay_logs sb JOIN students s ON sb.student_id = s.student_id WHERE sb.school_id = %s ORDER BY sb.log_date DESC", (current_user.school_id,))
+        logs = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": logs})
+
+@app.route('/api/calendar', methods=['GET', 'POST'])
+@login_required
+def manage_calendar():
+    conn = get_db_connection(); cur = conn.cursor()
+    if request.method == 'POST':
+        if current_user.role != 'admin': return jsonify({"error": "Admin only"}), 403
+        d = request.get_json()
+        cur.execute("INSERT INTO academic_calendar (school_id, event_title, event_date, description) VALUES (%s, %s, %s, %s)", (current_user.school_id, d.get('title'), d.get('date'), d.get('desc')))
+        conn.commit(); cur.close(); conn.close(); return jsonify({"message": "Calendar event added!"}), 201
+    else:
+        cur.execute("SELECT event_title, TO_CHAR(event_date, 'YYYY-MM-DD') as date, description FROM academic_calendar WHERE school_id = %s ORDER BY event_date ASC", (current_user.school_id,))
+        evs = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": evs})
+
+@app.route('/api/lesson_plans', methods=['GET', 'POST', 'PUT'])
+@login_required
+def manage_lesson_plans():
+    conn = get_db_connection(); cur = conn.cursor()
+    if request.method == 'POST':
+        if current_user.role != 'teacher': return jsonify({"error": "Teachers only"}), 403
+        d = request.get_json()
+        cur.execute("INSERT INTO lesson_plans (school_id, teacher_email, subject, class_name, week_number, topic, plan_content) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (current_user.school_id, current_user.email, d.get('subject'), d.get('class_name'), int(d.get('week_number') or 1), d.get('topic'), d.get('plan_content')))
+        conn.commit(); cur.close(); conn.close(); return jsonify({"message": "Lesson Plan submitted for Headmaster approval!"}), 201
+    elif request.method == 'PUT':
+        if current_user.role != 'admin': return jsonify({"error": "Admin only"}), 403
+        d = request.get_json()
+        cur.execute("UPDATE lesson_plans SET status = %s, admin_remarks = %s WHERE plan_id = %s AND school_id = %s", (d.get('status'), d.get('remarks'), d.get('plan_id'), current_user.school_id))
+        cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Reviewed Lesson Plan', f"Plan ID {d.get('plan_id')} ({d.get('status')})"))
+        conn.commit(); cur.close(); conn.close(); return jsonify({"message": "Lesson plan review updated."}), 200
+    else:
+        if current_user.role == 'teacher': cur.execute("SELECT plan_id, subject, class_name, week_number, topic, status, admin_remarks, TO_CHAR(submitted_at, 'YYYY-MM-DD') as date FROM lesson_plans WHERE school_id = %s AND teacher_email = %s ORDER BY submitted_at DESC", (current_user.school_id, current_user.email))
+        else: cur.execute("SELECT plan_id, teacher_email, subject, class_name, week_number, topic, plan_content, status, admin_remarks, TO_CHAR(submitted_at, 'YYYY-MM-DD') as date FROM lesson_plans WHERE school_id = %s ORDER BY submitted_at DESC", (current_user.school_id,))
+        plans = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": plans})
+
+@app.route('/api/cbt/quiz', methods=['GET', 'POST'])
+@login_required
+def manage_cbt():
+    conn = get_db_connection(); cur = conn.cursor()
+    if request.method == 'POST':
+        if current_user.role not in ['admin', 'teacher']: return jsonify({"error": "Unauthorized"}), 403
+        d = request.get_json()
+        cur.execute("INSERT INTO cbt_quizzes (school_id, subject_name, class_name, title, academic_year, term) VALUES (%s, %s, %s, %s, %s, %s) RETURNING quiz_id",
+                    (current_user.school_id, d.get('subject'), d.get('class_name'), d.get('title'), d.get('academic_year'), d.get('term')))
+        quiz_id = cur.fetchone()['quiz_id']
+        for q in d.get('questions', []):
+            cur.execute("INSERT INTO cbt_questions (quiz_id, question_text, opt_a, opt_b, opt_c, opt_d, correct_opt) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        (quiz_id, q.get('text'), q.get('a'), q.get('b'), q.get('c'), q.get('d'), q.get('ans').upper()))
+        conn.commit(); cur.close(); conn.close(); return jsonify({"message": "CBT Quiz published successfully!"}), 201
+    else:
+        cur.execute("SELECT quiz_id, subject_name, class_name, title, academic_year, term, TO_CHAR(created_at, 'YYYY-MM-DD') as date FROM cbt_quizzes WHERE school_id = %s ORDER BY created_at DESC", (current_user.school_id,))
+        quizzes = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": quizzes})
+
+@app.route('/api/sms/blast', methods=['POST'])
+@login_required
+def send_sms_blast():
+    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
+    d = request.get_json(); audience = d.get('audience'); message = d.get('message')
+    if not message: return jsonify({"error": "Message body cannot be empty."}), 400
+    conn = get_db_connection(); cur = conn.cursor()
+    if audience == 'all': cur.execute("SELECT DISTINCT guardian_contact FROM students WHERE school_id = %s AND guardian_contact IS NOT NULL", (current_user.school_id,))
+    elif audience == 'arrears': cur.execute("SELECT DISTINCT s.guardian_contact FROM students s JOIN fees f ON s.student_id = f.student_id LEFT JOIN payments p ON f.fee_id = p.fee_id WHERE s.school_id = %s AND s.guardian_contact IS NOT NULL GROUP BY s.guardian_contact, f.fee_id, f.amount_due HAVING (f.amount_due - COALESCE(SUM(p.amount_paid), 0)) > 0", (current_user.school_id,))
+    else: cur.execute("SELECT DISTINCT guardian_contact FROM students WHERE school_id = %s AND boarding_status = 'Boarding' AND guardian_contact IS NOT NULL", (current_user.school_id,))
+    raw_contacts = cur.fetchall(); cur.close(); conn.close()
+    contacts = [r['guardian_contact'].strip() for r in raw_contacts if r['guardian_contact']]
+    if not contacts: return jsonify({"error": "No numbers found."}), 404
+    
+    api_key = os.environ.get('SMS_API_KEY'); sender = os.environ.get('SMS_SENDER_ID', 'SMS_ADMIN')
+    if api_key:
+        try:
+            res = requests.post("https://sms.arkesel.com/api/v2/sms/send", json={"sender": sender, "message": message, "recipients": contacts}, headers={"api-key": api_key})
+            if res.status_code in [200, 201]: return jsonify({"message": f"Broadcast sent to {len(contacts)} parents!"})
+            return jsonify({"error": "Gateway rejected broadcast."}), 500
+        except Exception as e: return jsonify({"error": str(e)}), 500
+    return jsonify({"message": f"[SIMULATION] SMS sent to {len(contacts)} contacts."})
+
+@app.route('/api/register_staff', methods=['POST'])
+@login_required
+def register_staff():
+    if current_user.role != 'admin': return jsonify({"error": "Admin clearance required."}), 403
+    d = request.get_json(); hashed = generate_password_hash(d.get('password')); conn = get_db_connection(); cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO system_users (school_id, email, password_hash, role, phone, subject, base_salary) VALUES (%s, %s, %s, %s, %s, %s, %s)", 
+                    (current_user.school_id, d.get('email'), hashed, 'teacher', d.get('phone'), d.get('subject'), float(d.get('salary') or 0.0)))
+        conn.commit(); return jsonify({"message": "Staff Profile Created in HR Vault!"}), 201
+    except Exception: conn.rollback(); return jsonify({"error": "Email exists or format invalid."}), 409
+    finally: cur.close(); conn.close()
+
+@app.route('/api/register_guardian', methods=['POST'])
+@login_required
+def register_guardian():
+    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
+    d = request.get_json(); hashed = generate_password_hash(d.get('password')); conn = get_db_connection(); cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO system_users (school_id, email, password_hash, role, linked_student_id) VALUES (%s, %s, %s, %s, %s)", 
+                    (current_user.school_id, d.get('email'), hashed, 'guardian', int(d.get('linked_student_id'))))
+        conn.commit(); return jsonify({"message": "Guardian Access granted!"}), 201
+    except Exception: conn.rollback(); return jsonify({"error": "Error granting access."}), 409
+    finally: cur.close(); conn.close()
+
+@app.route('/api/staff', methods=['GET'])
+@login_required
+def get_staff():
+    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT email, phone, subject, base_salary FROM system_users WHERE school_id = %s AND role = 'teacher'", (current_user.school_id,))
+    staff = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": staff})
+
+@app.route('/api/settings', methods=['POST'])
+@login_required
+def update_settings():
+    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
+    d = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
+    try:
+        cur.execute("UPDATE institutions SET address = %s, phone = %s WHERE school_id = %s", (d.get('address'), d.get('phone'), current_user.school_id))
+        conn.commit(); return jsonify({"message": "Profile updated!"})
+    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
+    finally: cur.close(); conn.close()
+
 @app.route('/api/photo/<int:student_id>', methods=['GET'])
 def get_photo(student_id):
     conn = get_db_connection(); cur = conn.cursor()
@@ -415,241 +720,7 @@ def print_transcript(student_id):
     html = f"""<!DOCTYPE html><html><head><title>Transcript | {student['first_name']} {student['last_name']}</title><style>body {{ font-family: 'Times New Roman', Times, serif; background: #eee; padding: 20px; }} .sheet {{ background: white; max-width: 900px; margin: auto; padding: 50px; border: 3px double #333; position: relative; box-shadow: 0 0 10px rgba(0,0,0,0.1); }} .header {{ text-align: center; border-bottom: 2px solid #333; padding-bottom: 20px; margin-bottom: 30px; }} table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }} th, td {{ border: 1px solid #333; padding: 8px 12px; font-size: 13px; text-align: left; }} th {{ background: #f2f2f2; text-transform: uppercase; }} .stamp-box {{ margin-top: 60px; display: flex; justify-content: space-between; }} .stamp {{ border-top: 1px solid #333; width: 220px; text-align: center; padding-top: 5px; font-weight: bold; font-size: 12px; }}</style></head><body><div style="text-align:center; margin-bottom:20px;"><button onclick="window.print()" style="padding:10px 20px; font-weight:bold; cursor:pointer;">🖨️ Print Transcript</button></div><div class="sheet"><div class="header"><h1 style="margin:0; text-transform:uppercase; font-size:26px; color:{primary_color};">{inst['school_name']}</h1><p style="margin:5px 0;">{inst['address']} | Tel: {inst['phone']}</p><h2 style="margin-top:15px; font-size:18px; text-decoration:underline;">OFFICIAL ACADEMIC TRANSCRIPT</h2></div><p><strong>Candidate:</strong> {student['first_name'].upper()} {student['last_name'].upper()} &nbsp;&nbsp;|&nbsp;&nbsp; <strong>Student ID:</strong> {inst['school_name'][:3].upper()}-{student['student_id']:04d} &nbsp;&nbsp;|&nbsp;&nbsp; <strong>Class:</strong> {student['current_class']}</p><table><tr><th>Academic Year</th><th>Term</th><th>Subject</th><th>Class (30)</th><th>Exam (70)</th><th>Total</th><th>Grade</th></tr>{rows}</table><div class="stamp-box"><div class="stamp">Academic Registrar</div><div class="stamp">Head of Institution / Stamp</div></div></div></body></html>"""
     return html
 
-# --- EMBEDDED RESILIENT DASHBOARD HTML ---
-FALLBACK_DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8"><title>{{ school_name }} | ERP Portal</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        :root { --primary: {{ primary_color }}; --secondary: #f4f7fa; --accent: #28a745; --danger: #dc3545; --info: #17a2b8; --warning: #ffc107; }
-        body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--secondary); margin: 0; display: flex; color: #333; }
-        .sidebar { width: 260px; background: var(--primary); color: white; min-height: 100vh; padding: 20px; box-sizing: border-box; position: fixed; overflow-y: auto; }
-        .sidebar button { background: transparent; color: rgba(255,255,255,0.85); border: none; padding: 10px 14px; width: 100%; text-align: left; margin-bottom: 5px; border-radius: 6px; cursor: pointer; font-size: 0.95rem; font-weight: 500; }
-        .sidebar button:hover { background: rgba(255,255,255,0.15); color: white; }
-        .main-content { margin-left: 260px; flex: 1; padding: 35px; box-sizing: border-box; min-height: 100vh; }
-        .card { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.04); margin-bottom: 25px; }
-        h3 { margin-top: 0; color: var(--primary); border-bottom: 2px solid #f0f0f0; padding-bottom: 8px; }
-        input, select, textarea { width: 100%; padding: 10px; margin-bottom: 12px; border: 1px solid #ced4da; border-radius: 6px; box-sizing: border-box; }
-        .btn { background: var(--primary); color: white; border: none; padding: 10px 16px; border-radius: 6px; cursor: pointer; font-weight: bold; width: 100%; margin-bottom: 8px; }
-        .btn-success { background: var(--accent); } .btn-danger { background: var(--danger); } .btn-info { background: var(--info); } .btn-warning { background: var(--warning); color: #333;}
-        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-        #toast { display: none; position: fixed; bottom: 30px; right: 30px; padding: 15px 25px; color: white; background: var(--accent); border-radius: 8px; z-index: 1000; font-weight: bold; }
-        .hidden { display: none !important; }
-    </style>
-</head>
-<body>
-    <div id="toast">Message</div>
-    <div class="sidebar">
-        <h2 style="font-size: 1.1rem; margin-top:0;">{{ school_name }}</h2>
-        {% if current_user.is_authenticated %}
-            <div style="font-size:0.8rem; color:rgba(255,255,255,0.6); margin-bottom:15px;">ROLE: {{ current_user.role|upper }}</div>
-            {% if current_user.role == 'superadmin' %}
-                <button onclick="window.location.reload()">🏢 Global Tenants</button>
-                <button onclick="showSection('sa-settings-section')">⚙️ Master Settings</button>
-            {% elif current_user.role == 'admin' %}
-                <button onclick="showSection('admissions-section')">🎓 Admissions & IDs</button>
-                <button onclick="secureSection('finance-section')">💰 Financials & MoMo</button>
-                <button onclick="secureSection('settings-section')">⚙️ Vault Settings</button>
-            {% elif current_user.role == 'guardian' %}
-                <button onclick="showSection('guardian-section')">👨‍👩‍👧 Guardian Portal</button>
-            {% endif %}
-            <button class="btn-danger" style="margin-top:30px;" onclick="logout()">🛑 Logout</button>
-        {% endif %}
-    </div>
-
-    <main class="main-content">
-        {% if not current_user.is_authenticated %}
-        <div class="card" style="max-width: 400px; margin: 60px auto;">
-            <h3>System Login</h3>
-            <input type="email" id="email" placeholder="Email Address">
-            <input type="password" id="pass" placeholder="Password">
-            <button class="btn" onclick="login()">Sign In</button>
-        </div>
-        {% elif current_user.role == 'superadmin' %}
-        <div id="sa-settings-section" class="card hidden">
-            <h3>⚙️ Master Settings</h3>
-            <div class="grid-2"><input type="email" id="saNewEmail" placeholder="New Email"><input type="password" id="saNewPass" placeholder="New Password"></div>
-            <button class="btn" style="background:#333;" onclick="updateSACredentials()">Update Master Credentials</button>
-        </div>
-        <div class="card" style="border: 2px solid var(--accent);">
-            <h3>🚀 Provision New School Tenant</h3>
-            <div class="grid-2">
-                <div><input type="text" id="onboardSchool" placeholder="Official School Name"><input type="email" id="onboardEmail" placeholder="Administrator Email"></div>
-                <div><input type="password" id="onboardPass" placeholder="Temporary Password"><button class="btn btn-success" onclick="onboardNewSchool()">Provision SaaS Tenant</button></div>
-            </div>
-        </div>
-        <div class="card">
-            <h3>Global Server Tenants</h3>
-            <button class="btn" onclick="loadSchools()">🔄 Refresh Server Data</button>
-            <div id="school-container"></div>
-        </div>
-        {% elif current_user.role == 'admin' %}
-        <div id="admissions-section" class="card">
-            <h3>🎓 Admissions & Student Directory</h3>
-            <div class="grid-2">
-                <input type="text" id="sFirst" placeholder="First Name">
-                <input type="text" id="sLast" placeholder="Last Name">
-            </div>
-            <div class="grid-2">
-                <input type="text" id="sClass" placeholder="Class / Program">
-                <input type="text" id="sGContact" placeholder="Guardian Phone">
-            </div>
-            <button class="btn btn-success" onclick="enrollStudent()">Register Student</button>
-            <hr style="margin:20px 0;">
-            <div class="grid-2">
-                <div>
-                    <input type="number" id="trStuId" placeholder="Student ID">
-                    <button class="btn btn-info" onclick="generateTranscript()">📜 Generate Official Transcript</button>
-                </div>
-                <div>
-                    <button class="btn btn-warning" onclick="window.open('/print_ids', '_blank')">🖨️ Batch Student IDs (with QR)</button>
-                </div>
-            </div>
-        </div>
-        <div id="finance-section" class="card hidden">
-            <h3>💰 Financials & MoMo Gateway</h3>
-            <div class="grid-2">
-                <input type="number" id="bStuId" placeholder="Student ID">
-                <input type="number" id="bAmount" placeholder="Amount Due (GHS)">
-            </div>
-            <button class="btn btn-success" onclick="issueBill()">Issue Bill</button>
-            <hr>
-            <input type="number" id="stateStuId" placeholder="Target Student ID">
-            <button class="btn btn-primary" onclick="loadStatement()">Open Secure Ledger</button>
-            <button class="btn btn-warning" onclick="loadDebtors()">Scan Database for Debtors</button>
-        </div>
-        <div id="settings-section" class="card hidden">
-            <h3>⚙️ Security & Settings</h3>
-            <div class="grid-2">
-                <input type="password" id="myOldPass" placeholder="Current Password">
-                <input type="password" id="myNewPass" placeholder="New Password">
-            </div>
-            <button class="btn" style="background:#333;" onclick="changeMyPassword()">Update Password</button>
-        </div>
-        {% elif current_user.role == 'guardian' %}
-        <div id="guardian-section" class="card">
-            <h3>Guardian Portal</h3>
-            <div class="grid-2">
-                <button class="btn btn-success" onclick="window.open('/print_report/{{ current_user.linked_student_id }}', '_blank')">🖨️ Terminal Report Card</button>
-                <button class="btn btn-info" onclick="window.open('/print_transcript/{{ current_user.linked_student_id }}', '_blank')">📜 Full Official Transcript</button>
-            </div>
-            <hr style="margin:20px 0;">
-            <h4>Pay Fees via Mobile Money</h4>
-            <div class="grid-2">
-                <input type="number" id="momoFeeId" placeholder="Fee ID">
-                <input type="number" id="momoAmount" placeholder="Amount (GHS)">
-            </div>
-            <input type="text" id="momoPhone" placeholder="MoMo Phone Number">
-            <button class="btn btn-warning" onclick="initiateMoMo()">Authorize MoMo Payment</button>
-        </div>
-        {% endif %}
-        
-        <div class="card hidden" id="data-viewer" style="border: 2px solid var(--primary); margin-top:20px;">
-            <div style="background: var(--primary); padding: 15px; display:flex; justify-content:space-between; align-items:center;">
-                <h3 id="viewer-title" style="margin:0; color:white;">Data Explorer</h3>
-            </div>
-            <div id="table-container" style="padding: 15px; overflow-x: auto;"></div>
-        </div>
-    </main>
-
-    <script>
-        let unlockedSections = {};
-        function showToast(msg) {
-            const t = document.getElementById('toast'); t.innerText = msg; t.style.display = 'block';
-            setTimeout(() => t.style.display = 'none', 4000);
-        }
-        function showSection(id) {
-            document.querySelectorAll('.card').forEach(c => { if(c.id && c.id !== 'data-viewer') c.classList.add('hidden'); });
-            const target = document.getElementById(id); if(target) target.classList.remove('hidden');
-        }
-        async function secureSection(sectionId) {
-            if (unlockedSections[sectionId]) { showSection(sectionId); return; }
-            const pass = prompt("SECURE VAULT: Enter password to proceed.");
-            if (!pass) return;
-            try {
-                const res = await fetch('/api/verify_password', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({password: pass}) });
-                if(res.ok) { unlockedSections[sectionId] = true; showSection(sectionId); showToast("Vault Unlocked"); } 
-                else { const data = await res.json(); showToast(data.error, true); }
-            } catch(e) { showToast("Connection failed", true); }
-        }
-        async function login() {
-            const res = await fetch('/api/login', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email:document.getElementById('email').value, password:document.getElementById('pass').value}) });
-            const d = await res.json();
-            if(res.ok) window.location.reload(); else showToast(d.error);
-        }
-        async function logout() { await fetch('/api/logout', {method:'POST'}); window.location.reload(); }
-        async function sendAction(endpoint, payload) {
-            const res = await fetch(endpoint, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
-            const d = await res.json(); showToast(d.message || d.error);
-        }
-        async function enrollStudent() {
-            const payload = {
-                first_name: document.getElementById('sFirst').value, last_name: document.getElementById('sLast').value,
-                current_class: document.getElementById('sClass').value, guardian_name: 'Guardian', guardian_contact: document.getElementById('sGContact').value
-            };
-            sendAction('/api/students', payload);
-        }
-        async function issueBill() {
-            const payload = { student_id: document.getElementById('bStuId').value, amount_due: document.getElementById('bAmount').value, fee_category: 'Tuition', academic_year: '2026', term: 'Term 1', description: 'Academic Bill' };
-            sendAction('/api/fees/bill', payload);
-        }
-        async function initiateMoMo() {
-            const res = await fetch('/api/momo/initialize', {
-                method:'POST', headers:{'Content-Type':'application/json'},
-                body: JSON.stringify({fee_id: document.getElementById('momoFeeId').value, amount: document.getElementById('momoAmount').value, phone: document.getElementById('momoPhone').value})
-            });
-            const d = await res.json();
-            if(d.status === 'paystack_redirect') window.location.href = d.auth_url;
-            else showToast(d.message || d.error);
-        }
-        function generateTranscript() {
-            const id = document.getElementById('trStuId').value;
-            if(!id) return showToast("Enter Student ID");
-            window.open('/print_transcript/' + id, '_blank');
-        }
-        function renderTable(title, headers, rows, keys) {
-            const viewer = document.getElementById('data-viewer'); document.getElementById('viewer-title').innerText = title; const container = document.getElementById('table-container');
-            if (!rows || rows.length === 0) { container.innerHTML = 'No records found.'; viewer.classList.remove('hidden'); return; }
-            let html = '<table style="width:100%; border-collapse: collapse;"><tr>';
-            headers.forEach(h => html += `<th style="padding:10px; border-bottom: 2px solid #ddd; text-align:left;">${h}</th>`); html += '</tr>';
-            rows.forEach(row => {
-                html += '<tr>';
-                keys.forEach(k => { html += `<td style="padding:10px; border-bottom:1px solid #eee;">${row[k]}</td>`; });
-                html += '</tr>';
-            });
-            container.innerHTML = html + '</table>'; viewer.classList.remove('hidden');
-        }
-        async function loadStatement() {
-            const id = document.getElementById('stateStuId').value;
-            const res = await fetch('/api/statement/' + id); const data = await res.json();
-            renderTable("Financial Ledger", ['Bill Type', 'Desc', 'Due', 'Paid', 'Balance'], data.statement, ['fee_category', 'description', 'amount_due', 'total_paid', 'remaining_balance']);
-        }
-        async function loadDebtors() {
-            const res = await fetch('/api/debtors'); const data = await res.json();
-            renderTable("Debtors", ['ID', 'First Name', 'Last Name', 'Total Owed'], data.data, ['student_id', 'first_name', 'last_name', 'arrears']);
-        }
-        async function loadSchools() {
-            const res = await fetch('/api/superadmin/schools'); const data = await res.json();
-            renderTable("Global Tenants", ['ID', 'School Name', 'Expiry', 'Status'], data.data, ['school_id', 'school_name', 'expiry_date', 'status']);
-        }
-        async function onboardNewSchool() {
-            const res = await fetch('/api/superadmin/onboard', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({school_name: document.getElementById('onboardSchool').value, admin_email: document.getElementById('onboardEmail').value, admin_password: document.getElementById('onboardPass').value}) });
-            const data = await res.json(); if (res.ok) { showToast(data.message); loadSchools(); } else { showToast(data.error, true); }
-        }
-        async function updateSACredentials() {
-            const res = await fetch('/api/superadmin/credentials', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({new_email: document.getElementById('saNewEmail').value, new_password: document.getElementById('saNewPass').value}) });
-            const data = await res.json(); if (res.ok) { showToast(data.message); } else { showToast(data.error, true); }
-        }
-        async function changeMyPassword() {
-            const res = await fetch('/api/change_password', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({current_password: document.getElementById('myOldPass').value, new_password: document.getElementById('myNewPass').value}) });
-            const data = await res.json(); if (res.ok) { showToast(data.message); } else { showToast(data.error, true); }
-        }
-    </script>
-</body>
-</html>"""
-
-# --- DASHBOARD ROUTE (RESILIENT LOADER) ---
+# --- DASHBOARD & FALLBACK ENGINE ---
 @app.route('/dashboard')
 def dashboard():
     school_name = "Global ERP Engine"
@@ -667,13 +738,372 @@ def dashboard():
                 primary_color = inst['primary_color'] or "#0f4c81"
     except Exception:
         pass
-        
-    try:
-        # Tries loading from templates/dashboard.html first
-        return render_template('dashboard.html', school_name=school_name, primary_color=primary_color)
-    except Exception:
-        # Automatically falls back to embedded dashboard if template file is missing on Render
-        return render_template_string(FALLBACK_DASHBOARD_HTML, school_name=school_name, primary_color=primary_color)
+
+    # The entire front-end dashboard is embedded directly as a string 
+    # to prevent GitHub template folder dependency crashes
+    html_template = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8"><title>{{ school_name }} | ERP Portal</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <style>
+            :root { --primary: {{ primary_color }}; --secondary: #f4f7fa; --accent: #28a745; --danger: #dc3545; --info: #17a2b8; --warning: #ffc107; }
+            body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--secondary); margin: 0; display: flex; color: #333; }
+            .sidebar { width: 260px; background: var(--primary); color: white; min-height: 100vh; padding: 20px; box-sizing: border-box; position: fixed; overflow-y: auto; }
+            .sidebar button { background: transparent; color: rgba(255,255,255,0.85); border: none; padding: 10px 14px; width: 100%; text-align: left; margin-bottom: 5px; border-radius: 6px; cursor: pointer; font-size: 0.95rem; font-weight: 500; }
+            .sidebar button:hover { background: rgba(255,255,255,0.15); color: white; }
+            .main-content { margin-left: 260px; flex: 1; padding: 35px; box-sizing: border-box; min-height: 100vh; }
+            .card { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.04); margin-bottom: 25px; }
+            h3 { margin-top: 0; color: var(--primary); border-bottom: 2px solid #f0f0f0; padding-bottom: 8px; }
+            input, select, textarea { width: 100%; padding: 10px; margin-bottom: 12px; border: 1px solid #ced4da; border-radius: 6px; box-sizing: border-box; }
+            .btn { background: var(--primary); color: white; border: none; padding: 10px 16px; border-radius: 6px; cursor: pointer; font-weight: bold; width: 100%; margin-bottom: 8px; }
+            .btn-success { background: var(--accent); } .btn-danger { background: var(--danger); } .btn-info { background: var(--info); } .btn-warning { background: var(--warning); color: #333;}
+            .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+            #toast { display: none; position: fixed; bottom: 30px; right: 30px; padding: 15px 25px; color: white; background: var(--accent); border-radius: 8px; z-index: 1000; font-weight: bold; }
+            .hidden { display: none !important; }
+        </style>
+    </head>
+    <body>
+        <div id="toast">Message</div>
+        <div class="sidebar">
+            <h2 style="font-size: 1.1rem; margin-top:0;">{{ school_name }}</h2>
+            {% if current_user.is_authenticated %}
+                <div style="font-size:0.8rem; color:rgba(255,255,255,0.6); margin-bottom:15px;">ROLE: {{ current_user.role|upper }}</div>
+                {% if current_user.role == 'superadmin' %}
+                    <button onclick="window.location.reload()">🏢 Global Tenants</button>
+                    <button onclick="showSection('sa-settings-section')">⚙️ Master Settings</button>
+                {% elif current_user.role == 'admin' %}
+                    <button onclick="showSection('admissions-section')">🎓 Admissions & IDs</button>
+                    <button onclick="secureSection('finance-section')">💰 Financials & MoMo</button>
+                    <button onclick="showSection('transport-section')">🚌 Transport Logistics</button>
+                    <button onclick="showSection('store-section')">📦 Store & Uniforms</button>
+                    <button onclick="showSection('exeat-section')">🎫 Exeat Desk</button>
+                    <button onclick="showSection('sickbay-section')">🏥 Sick Bay Log</button>
+                    <button onclick="showSection('lesson-section')">📚 GES Lesson Plans</button>
+                    <button onclick="showSection('cbt-section')">💻 CBT Testing</button>
+                    <button onclick="secureSection('settings-section')">⚙️ Vault Settings</button>
+                {% elif current_user.role == 'teacher' %}
+                    <button onclick="showSection('lesson-section')">📚 Submit Lesson Notes</button>
+                    <button onclick="showSection('cbt-section')">💻 CBT Assessment</button>
+                    <button onclick="showSection('settings-section')">⚙️ Account Security</button>
+                {% elif current_user.role == 'guardian' %}
+                    <button onclick="showSection('guardian-section')">👨‍👩‍👧 Guardian Portal</button>
+                {% endif %}
+                <button class="btn-danger" style="margin-top:30px;" onclick="logout()">🛑 Logout</button>
+            {% endif %}
+        </div>
+
+        <main class="main-content">
+            {% if not current_user.is_authenticated %}
+            <div class="card" style="max-width: 400px; margin: 60px auto;">
+                <h3>System Login</h3>
+                <input type="email" id="email" placeholder="Email Address">
+                <input type="password" id="pass" placeholder="Password">
+                <button class="btn" onclick="login()">Sign In</button>
+            </div>
+            {% elif current_user.role == 'guardian' %}
+            <div id="guardian-section" class="card">
+                <h3>Guardian Portal</h3>
+                <div class="grid-2">
+                    <button class="btn btn-success" onclick="window.open('/print_report/{{ current_user.linked_student_id }}', '_blank')">🖨️ Terminal Report Card</button>
+                    <button class="btn btn-info" onclick="window.open('/print_transcript/{{ current_user.linked_student_id }}', '_blank')">📜 Full Official Transcript</button>
+                </div>
+                <hr style="margin:20px 0; border:1px solid #eee;">
+                <h4>Pay Fees via Mobile Money</h4>
+                <div class="grid-2">
+                    <input type="number" id="momoFeeId" placeholder="Target Fee ID">
+                    <input type="number" id="momoAmount" placeholder="Amount (GHS)">
+                </div>
+                <input type="text" id="momoPhone" placeholder="MoMo Phone Number (e.g. 0244123456)">
+                <button class="btn btn-warning" onclick="initiateMoMo()">Authorize MoMo Payment</button>
+            </div>
+            {% elif current_user.role == 'superadmin' %}
+            <div id="sa-settings-section" class="card hidden">
+                <h3>⚙️ Master Settings</h3>
+                <div class="grid-2"><input type="email" id="saNewEmail" placeholder="New Email"><input type="password" id="saNewPass" placeholder="New Password"></div>
+                <button class="btn" style="background:#333;" onclick="updateSACredentials()">Update Master Credentials</button>
+            </div>
+            <div class="card" style="border: 2px solid var(--accent);">
+                <h3>🚀 Provision New School Tenant</h3>
+                <div class="grid-2">
+                    <div><input type="text" id="onboardSchool" placeholder="Official School Name"><input type="email" id="onboardEmail" placeholder="Administrator Email"></div>
+                    <div><input type="password" id="onboardPass" placeholder="Temporary Password"><button class="btn btn-success" onclick="onboardNewSchool()">Provision SaaS Tenant</button></div>
+                </div>
+            </div>
+            <div id="branding-div" class="card hidden" style="border: 2px solid var(--warning); background: #fffdf5;">
+                <h3>🎨 White-Label Branding Engine</h3>
+                <input type="hidden" id="brandSchoolId">
+                <div class="grid-2">
+                    <div><label>Primary Theme Color</label><input type="color" id="brandColor" style="height: 50px; cursor:pointer;"></div>
+                    <div><label>School Crest / Logo Upload</label><input type="file" id="brandLogo" accept="image/png, image/jpeg" style="background:white;"></div>
+                </div>
+                <div style="display:flex; gap: 10px; margin-top: 10px;">
+                    <button class="btn btn-warning" style="color:#333;" onclick="saveBranding()">Apply Theme & Refresh</button>
+                    <button class="btn" style="background:#666;" onclick="document.getElementById('branding-div').classList.add('hidden')">Cancel</button>
+                </div>
+            </div>
+            <div class="card">
+                <h3>Global Server Tenants</h3>
+                <button class="btn" onclick="loadSchools()">🔄 Refresh Server Data</button>
+                <div id="school-container"></div>
+            </div>
+            {% elif current_user.role == 'admin' %}
+            
+            <div id="settings-section" class="card hidden" style="border-top: 5px solid #333;">
+                <h3>🔒 Security & Access Management (SECURED)</h3>
+                <div class="grid-2">
+                    <div style="background: #fff; padding: 25px; border-radius: 12px; border: 1px solid #ccc;">
+                        <h4 style="margin-top:0;">Change Personal Password</h4>
+                        <input type="password" id="myOldPass" placeholder="Current Password">
+                        <input type="password" id="myNewPass" placeholder="New Secure Password">
+                        <button class="btn" style="background:#333;" onclick="changeMyPassword()">Update My Password</button>
+                    </div>
+                    <div style="background: #f8d7da; padding: 25px; border-radius: 12px; border: 1px solid var(--danger);">
+                        <h4 style="margin-top:0; color: #721c24;">Master Credential Override</h4>
+                        <input type="email" id="resetTargetEmail" placeholder="Target User Email">
+                        <input type="password" id="resetNewPass" placeholder="Assign New Temporary Password">
+                        <button class="btn btn-danger" onclick="adminResetPassword()">Execute Force Reset</button>
+                    </div>
+                </div>
+                <div style="background: #fff; padding: 25px; border-radius: 12px; border: 1px solid #ccc; margin-top: 20px;">
+                    <h4 style="margin-top:0;">📜 Security Audit Trail</h4>
+                    <button class="btn btn-primary" onclick="loadAuditLogs()">View Master Audit Logs</button>
+                </div>
+            </div>
+
+            <div id="lesson-section" class="card hidden">
+                <h3>📚 GES Lesson Plan Inspection Vault</h3>
+                <button class="btn btn-info" style="width:auto; margin-bottom:15px;" onclick="loadLessonPlans()">Refresh Submitted Notes</button>
+                <div id="plan-container"></div>
+            </div>
+
+            <div id="cbt-section" class="card hidden">
+                <h3>💻 Computer-Based Testing (CBT) Engine</h3>
+                <div style="background:#f8f9fa; padding:15px; border-radius:8px; margin-bottom:20px;">
+                    <h4>Publish New Multiple-Choice Test</h4>
+                    <div class="grid-2">
+                        <input type="text" id="cbtSubject" placeholder="Subject">
+                        <input type="text" id="cbtClass" placeholder="Class">
+                    </div>
+                    <input type="text" id="cbtTitle" placeholder="Assessment Title (e.g. Midterm Objective Quiz)">
+                    <div class="grid-2">
+                        <input type="text" id="cbtYear" placeholder="Academic Year (e.g. 2026)">
+                        <input type="text" id="cbtTerm" placeholder="Term">
+                    </div>
+                    <textarea id="cbtQText" placeholder="Sample Question: What is the capital of Ghana?"></textarea>
+                    <div class="grid-2">
+                        <input type="text" id="cbtOptA" placeholder="Option A: Kumasi">
+                        <input type="text" id="cbtOptB" placeholder="Option B: Accra">
+                        <input type="text" id="cbtOptC" placeholder="Option C: Cape Coast">
+                        <input type="text" id="cbtOptD" placeholder="Option D: Takoradi">
+                    </div>
+                    <input type="text" id="cbtCorrect" placeholder="Correct Option Letter (A, B, C, or D)">
+                    <button class="btn btn-success" onclick="publishQuiz()">Publish Test & Synchronize</button>
+                </div>
+            </div>
+
+            <div id="admissions-section" class="card">
+                <h3>🎓 Admissions & Student Tools</h3>
+                <div class="grid-2">
+                    <div>
+                        <input type="number" id="trStuId" placeholder="Student ID for Transcript">
+                        <button class="btn btn-info" onclick="generateTranscript()">📜 Generate Official Transcript</button>
+                    </div>
+                    <div>
+                        <button class="btn btn-warning" onclick="window.open('/print_ids', '_blank')">🖨️ Batch Student IDs (with QR)</button>
+                    </div>
+                </div>
+                <hr style="margin:20px 0;">
+                <div class="grid-2">
+                    <input type="text" id="sFirst" placeholder="First Name">
+                    <input type="text" id="sLast" placeholder="Last Name">
+                </div>
+                <div class="grid-2">
+                    <input type="text" id="sClass" placeholder="Class / Program">
+                    <input type="text" id="sGContact" placeholder="Guardian Phone">
+                </div>
+                <button class="btn btn-success" onclick="enrollStudent()">Register Student</button>
+            </div>
+
+            <div id="finance-section" class="card hidden">
+                <h3>💰 Financials & MoMo Gateway</h3>
+                <div class="grid-2">
+                    <input type="number" id="bStuId" placeholder="Student ID">
+                    <input type="number" id="bAmount" placeholder="Amount Due (GHS)">
+                </div>
+                <button class="btn btn-success" onclick="sendAction('/api/fees/bill', {student_id: document.getElementById('bStuId').value, amount_due: document.getElementById('bAmount').value, fee_category: 'Tuition', academic_year: '2026', term: 'Term 1', description: 'Academic Bill'})">Issue Bill</button>
+                <hr>
+                <input type="number" id="stateStuId" placeholder="Target Student ID">
+                <button class="btn btn-primary" onclick="loadStatement()">Open Secure Ledger</button>
+                <button class="btn btn-warning" onclick="loadDebtors()">Scan Database for Debtors</button>
+            </div>
+            
+            <div id="transport-section" class="card hidden">
+                <h3>🚌 Bus Routes</h3>
+                <input type="text" id="trName" placeholder="Route Name">
+                <input type="text" id="trDriver" placeholder="Driver">
+                <input type="number" id="trFare" placeholder="Fare (GHS)">
+                <button class="btn" onclick="sendAction('/api/transport', {route_name: document.getElementById('trName').value, driver_name: document.getElementById('trDriver').value, fare: document.getElementById('trFare').value})">Save Route</button>
+            </div>
+
+            <div id="store-section" class="card hidden">
+                <h3>📦 Store POS</h3>
+                <input type="text" id="invName" placeholder="Item Name">
+                <input type="number" id="invPrice" placeholder="Price">
+                <input type="number" id="invStock" placeholder="Stock Qty">
+                <button class="btn" onclick="sendAction('/api/inventory', {item_name: document.getElementById('invName').value, price: document.getElementById('invPrice').value, stock: document.getElementById('invStock').value})">Add Item</button>
+            </div>
+
+            <div id="exeat-section" class="card hidden">
+                <h3>🎫 Exeat Permission</h3>
+                <input type="number" id="exStuId" placeholder="Student ID">
+                <input type="text" id="exReason" placeholder="Reason">
+                <input type="date" id="exReturn">
+                <button class="btn btn-warning" onclick="sendAction('/api/exeats', {student_id: document.getElementById('exStuId').value, exeat_type: 'Weekend', reason: document.getElementById('exReason').value, expected_return: document.getElementById('exReturn').value})">Issue Exeat</button>
+            </div>
+
+            <div id="sickbay-section" class="card hidden">
+                <h3>🏥 Sick Bay Entry</h3>
+                <input type="number" id="sbStuId" placeholder="Student ID">
+                <input type="text" id="sbSymp" placeholder="Symptoms">
+                <input type="text" id="sbTreat" placeholder="Treatment">
+                <button class="btn btn-danger" onclick="sendAction('/api/sickbay', {student_id: document.getElementById('sbStuId').value, symptoms: document.getElementById('sbSymp').value, treatment: document.getElementById('sbTreat').value})">Log Treatment</button>
+            </div>
+            {% endif %}
+            
+            <div class="card hidden" id="data-viewer" style="border: 2px solid var(--primary); margin-top:20px;">
+                <div style="background: var(--primary); padding: 15px; display:flex; justify-content:space-between; align-items:center;">
+                    <h3 id="viewer-title" style="margin:0; color:white;">Data Explorer</h3>
+                </div>
+                <div id="table-container" style="padding: 15px; overflow-x: auto;"></div>
+            </div>
+        </main>
+
+        <script>
+            let unlockedSections = {};
+            function showToast(msg) {
+                const t = document.getElementById('toast'); t.innerText = msg; t.style.display = 'block';
+                setTimeout(() => t.style.display = 'none', 4000);
+            }
+            function showSection(id) {
+                document.querySelectorAll('.card').forEach(c => { if(c.id && c.id !== 'data-viewer') c.classList.add('hidden'); });
+                const target = document.getElementById(id); if(target) target.classList.remove('hidden');
+            }
+            async function secureSection(sectionId) {
+                if (unlockedSections[sectionId]) { showSection(sectionId); return; }
+                const pass = prompt("SECURE VAULT: Enter password to proceed.");
+                if (!pass) return;
+                try {
+                    const res = await fetch('/api/verify_password', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({password: pass}) });
+                    if(res.ok) { unlockedSections[sectionId] = true; showSection(sectionId); showToast("Vault Unlocked"); } 
+                    else { const data = await res.json(); showToast(data.error, true); }
+                } catch(e) { showToast("Connection failed", true); }
+            }
+            async function login() {
+                const res = await fetch('/api/login', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email:document.getElementById('email').value, password:document.getElementById('pass').value}) });
+                const d = await res.json();
+                if(res.ok) window.location.reload(); else showToast(d.error);
+            }
+            async function logout() { await fetch('/api/logout', {method:'POST'}); window.location.reload(); }
+            async function sendAction(endpoint, payload) {
+                const res = await fetch(endpoint, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+                const d = await res.json(); showToast(d.message || d.error);
+            }
+            async function enrollStudent() {
+                const payload = {
+                    first_name: document.getElementById('sFirst').value, last_name: document.getElementById('sLast').value,
+                    current_class: document.getElementById('sClass').value, guardian_name: 'Guardian', guardian_contact: document.getElementById('sGContact').value
+                };
+                sendAction('/api/students', payload);
+            }
+            async function issueBill() {
+                const payload = { student_id: document.getElementById('bStuId').value, amount_due: document.getElementById('bAmount').value, fee_category: 'Tuition', academic_year: '2026', term: 'Term 1', description: 'Academic Bill' };
+                sendAction('/api/fees/bill', payload);
+            }
+            async function initiateMoMo() {
+                const res = await fetch('/api/momo/initialize', {
+                    method:'POST', headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify({fee_id: document.getElementById('momoFeeId').value, amount: document.getElementById('momoAmount').value, phone: document.getElementById('momoPhone').value})
+                });
+                const d = await res.json();
+                if(d.status === 'paystack_redirect') window.location.href = d.auth_url;
+                else showToast(d.message || d.error);
+            }
+            function generateTranscript() {
+                const id = document.getElementById('trStuId').value;
+                if(!id) return showToast("Enter Student ID");
+                window.open('/print_transcript/' + id, '_blank');
+            }
+            async function publishQuiz() {
+                const payload = {
+                    subject: document.getElementById('cbtSubject').value, class_name: document.getElementById('cbtClass').value, title: document.getElementById('cbtTitle').value,
+                    academic_year: document.getElementById('cbtYear').value, term: document.getElementById('cbtTerm').value,
+                    questions: [{text: document.getElementById('cbtQText').value, a: document.getElementById('cbtOptA').value, b: document.getElementById('cbtOptB').value, c: document.getElementById('cbtOptC').value, d: document.getElementById('cbtOptD').value, ans: document.getElementById('cbtCorrect').value}]
+                };
+                sendAction('/api/cbt/quiz', payload);
+            }
+            async function loadLessonPlans() {
+                const res = await fetch('/api/lesson_plans'); const d = await res.json();
+                let html = '<table style="width:100%; border-collapse:collapse;"><tr><th>Teacher</th><th>Subject</th><th>Topic</th><th>Status</th><th>Action</th></tr>';
+                d.data.forEach(p => { html += `<tr><td>${p.teacher_email}</td><td>${p.subject}</td><td>${p.topic}</td><td><b>${p.status}</b></td><td><button onclick="reviewPlan(${p.plan_id}, 'Approved')">Approve</button></td></tr>`; });
+                document.getElementById('plan-container').innerHTML = html + '</table>';
+            }
+            async function reviewPlan(id, status) {
+                const res = await fetch('/api/lesson_plans', { method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({plan_id: id, status: status, remarks:'Inspected and approved by Headmaster.'}) });
+                const d = await res.json(); showToast(d.message); loadLessonPlans();
+            }
+            
+            function renderTable(title, headers, rows, keys) {
+                const viewer = document.getElementById('data-viewer'); document.getElementById('viewer-title').innerText = title; const container = document.getElementById('table-container');
+                if (!rows || rows.length === 0) { container.innerHTML = 'No records found.'; viewer.classList.remove('hidden'); return; }
+                let html = '<table style="width:100%; border-collapse: collapse;"><tr>';
+                headers.forEach(h => html += `<th style="padding:10px; border-bottom: 2px solid #ddd; text-align:left;">${h}</th>`); html += '</tr>';
+                rows.forEach(row => {
+                    html += '<tr>';
+                    keys.forEach(k => { html += `<td style="padding:10px; border-bottom:1px solid #eee;">${row[k]}</td>`; });
+                    html += '</tr>';
+                });
+                container.innerHTML = html + '</table>'; viewer.classList.remove('hidden');
+            }
+            async function loadStatement() {
+                const id = document.getElementById('stateStuId').value;
+                const res = await fetch('/api/statement/' + id); const data = await res.json();
+                renderTable("Financial Ledger", ['Bill Type', 'Desc', 'Due', 'Paid', 'Balance'], data.statement, ['fee_category', 'description', 'amount_due', 'total_paid', 'remaining_balance']);
+            }
+            async function loadDebtors() {
+                const res = await fetch('/api/debtors'); const data = await res.json();
+                renderTable("Debtors", ['ID', 'First Name', 'Last Name', 'Total Owed'], data.data, ['student_id', 'first_name', 'last_name', 'arrears']);
+            }
+            async function loadAuditLogs() {
+                const res = await fetch('/api/audit_logs'); const data = await res.json();
+                renderTable("Audit Logs", ['Time', 'User', 'Action', 'Target'], data.data, ['time', 'user_email', 'action', 'target']);
+            }
+            async function loadSchools() {
+                const res = await fetch('/api/superadmin/schools'); const data = await res.json();
+                renderTable("Global Tenants", ['ID', 'School Name', 'Expiry', 'Status'], data.data, ['school_id', 'school_name', 'expiry_date', 'status']);
+            }
+            async function onboardNewSchool() {
+                const res = await fetch('/api/superadmin/onboard', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({school_name: document.getElementById('onboardSchool').value, admin_email: document.getElementById('onboardEmail').value, admin_password: document.getElementById('onboardPass').value}) });
+                const data = await res.json(); if (res.ok) { showToast(data.message); loadSchools(); } else { showToast(data.error, true); }
+            }
+            async function updateSACredentials() {
+                const res = await fetch('/api/superadmin/credentials', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({new_email: document.getElementById('saNewEmail').value, new_password: document.getElementById('saNewPass').value}) });
+                const data = await res.json(); if (res.ok) { showToast(data.message); } else { showToast(data.error, true); }
+            }
+            async function changeMyPassword() {
+                const res = await fetch('/api/change_password', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({current_password: document.getElementById('myOldPass').value, new_password: document.getElementById('myNewPass').value}) });
+                const data = await res.json(); if (res.ok) { showToast(data.message); } else { showToast(data.error, true); }
+            }
+            async function adminResetPassword() {
+                const res = await fetch('/api/admin/reset_password', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({target_email: document.getElementById('resetTargetEmail').value, new_password: document.getElementById('resetNewPass').value}) });
+                const data = await res.json(); if (res.ok) { showToast(data.message); } else { showToast(data.error, true); }
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return render_template_string(html_template, school_name=school_name, primary_color=primary_color)
 
 # --- BOOT SEQUENCE ---
 with app.app_context():
