@@ -92,7 +92,6 @@ def initialize_database():
     cur.execute("ALTER TABLE institutions ADD COLUMN IF NOT EXISTS address VARCHAR(255) DEFAULT 'Ghana'")
     cur.execute("ALTER TABLE institutions ADD COLUMN IF NOT EXISTS phone VARCHAR(50) DEFAULT '0000000000'")
     
-    # NEW: White-Label Branding Fields
     cur.execute("ALTER TABLE institutions ADD COLUMN IF NOT EXISTS primary_color VARCHAR(20) DEFAULT '#0f4c81'")
     cur.execute("ALTER TABLE institutions ADD COLUMN IF NOT EXISTS logo_key VARCHAR(255)")
     
@@ -193,7 +192,6 @@ def onboard_school():
     except psycopg2.IntegrityError: conn.rollback(); return jsonify({"error": "School name or Admin email already exists!"}), 409
     finally: cur.close(); conn.close()
 
-# NEW: Tenant Branding API
 @app.route('/api/superadmin/branding/<int:school_id>', methods=['POST'])
 @login_required
 def update_branding(school_id):
@@ -863,6 +861,9 @@ def dashboard():
             #toast { display: none; position: fixed; bottom: 30px; right: 30px; padding: 15px 25px; color: white; background: var(--accent); border-radius: 8px; z-index: 1000; font-weight: bold; box-shadow: 0 10px 30px rgba(0,0,0,0.2); animation: fadein 0.5s;}
             .hidden { display: none !important; }
             
+            .table-row { transition: background 0.2s ease; }
+            .table-row:hover { background-color: #f8f9fa !important; }
+            
             @keyframes fadein { from {bottom: 0; opacity: 0;} to {bottom: 30px; opacity: 1;} }
         </style>
     </head>
@@ -903,8 +904,8 @@ def dashboard():
                     <button onclick="showSection('guardian-section')">👨‍👩‍👧 Guardian Portal</button>
                 {% endif %}
                 
-                <div style="position: absolute; bottom: 30px; width: calc(100% - 40px);">
-                    <button class="btn-danger" style="color:white;" onclick="logout()">🔒 Secure Logout</button>
+                <div style="margin-top: 40px; padding-bottom: 20px;">
+                    <button class="btn-danger" style="color:white; box-shadow: 0 4px 15px rgba(220,53,69,0.3);" onclick="logout()">🔒 Secure Logout</button>
                 </div>
             {% else %}
                 <button class="btn-success" style="color:white;" onclick="sendAction('/api/setup_db', {}, true)">1. Sync System Core</button>
@@ -957,7 +958,6 @@ def dashboard():
                 </div>
             </div>
             
-            <!-- NEW: Hidden Branding Modal Panel for Superadmin -->
             <div id="branding-div" class="card hidden" style="border: 2px solid var(--warning); background: #fffdf5;">
                 <h3>🎨 White-Label Branding Engine</h3>
                 <p style="font-size:0.9rem; color:#555;">Customize the theme color and official crest for <strong id="brandSchoolName"></strong>.</p>
@@ -1307,7 +1307,7 @@ def dashboard():
                 setTimeout(() => { toast.style.display = 'none'; }, 5000);
             }
 
-            // CSV EXPORT ENGINE
+            // CSV EXPORT ENGINE (Fixed string syntax)
             function downloadCSV(csv, filename) {
                 let csvFile = new Blob([csv], {type: "text/csv"});
                 let downloadLink = document.createElement("a");
@@ -1330,7 +1330,7 @@ def dashboard():
                     }
                     if(row.length > 0) csv.push(row.join(","));
                 }
-                downloadCSV(csv.join("\\n"), filename);
+                downloadCSV(csv.join(String.fromCharCode(10)), filename);
             }
 
             async function login() {
@@ -1471,7 +1471,7 @@ def dashboard():
                 const fromC = document.getElementById('promoFrom').value;
                 const toC = document.getElementById('promoTo').value;
                 if(!fromC || !toC) { showToast("Enter both classes", true); return; }
-                if(!confirm(`Are you sure you want to promote ALL students currently in ${fromC} to ${toC}?`)) return;
+                if(!confirm("Are you sure you want to promote ALL students currently in " + fromC + " to " + toC + "?")) return;
                 
                 try {
                     const res = await fetch('/api/students/promote', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({from_class: fromC, to_class: toC}) });
@@ -1540,7 +1540,7 @@ def dashboard():
 
             async function processPayment(feeId, balance, stuId) {
                 if(balance <= 0) { showToast("This bill is fully paid.", true); return; }
-                const amount = prompt("Enter payment amount (GHS) for Fee ID " + feeId + ":\\nOutstanding Balance: GHS " + balance);
+                const amount = prompt("Enter payment amount (GHS) for Fee ID " + feeId + ". Outstanding Balance: GHS " + balance);
                 if(!amount || isNaN(amount) || amount <= 0) return;
                 const method = prompt("Enter payment method (Cash / MoMo):", "Cash");
                 if(!method) return;
@@ -1653,7 +1653,7 @@ def dashboard():
                 headers.forEach(h => html += `<th style="background:#f8f9fa; color:var(--primary); padding:15px; text-align:left; border-bottom: 2px solid #ddd; font-weight:bold;">${h}</th>`);
                 html += '</tr>';
                 rows.forEach(row => {
-                    html += '<tr style="transition: background 0.2s;" onmouseover="this.style.background=\'#f8f9fa\'" onmouseout="this.style.background=\'white\'">';
+                    html += '<tr class="table-row">';
                     keys.forEach(k => {
                         let val = row[k];
                         if (k === 'photo') {
