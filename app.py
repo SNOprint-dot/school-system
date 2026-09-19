@@ -1,18 +1,20 @@
 import os
+import psycopg2
 import csv
 import json
-import psycopg2
+import decimal
+import boto3
 import base64
 import uuid
 import requests
 from io import StringIO
 from functools import wraps
 from datetime import datetime, date
-from flask import Flask, jsonify, request, render_template_string, Response, redirect, url_for
+from flask import Flask, jsonify, request, render_template_string, Response
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user, UserMixin
 from werkzeug.security import generate_password_hash, check_password_hash
-from apscheduler.schedulers.background import BackgroundScheduler
 from db_config import get_db_connection
+from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'super-secure-enterprise-key')
@@ -20,9 +22,14 @@ app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'super-secure-enterprise
 login_manager = LoginManager()
 login_manager.init_app(app)
 
-PAYSTACK_SECRET_KEY = os.environ.get('PAYSTACK_SECRET_KEY')
+# --- CLOUD STORAGE SETTINGS ---
 AWS_BUCKET_NAME = os.environ.get('AWS_BUCKET_NAME')
-s3_client = boto3.client('s3', aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'), aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'), region_name=os.environ.get('AWS_REGION', 'eu-north-1')) if os.environ.get('AWS_ACCESS_KEY_ID') else None
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
+    aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
+    region_name=os.environ.get('AWS_REGION', 'eu-north-1')
+)
 
 def custom_json_serializer(obj):
     if isinstance(obj, (datetime, date)): return obj.isoformat()
@@ -50,13 +57,12 @@ class User(UserMixin):
 
     @staticmethod
     def get(user_id):
-        try:
-            conn = get_db_connection(); cur = conn.cursor()
-            cur.execute("SELECT user_id, email, role, linked_student_id, school_id FROM system_users WHERE user_id = %s", (int(user_id),))
-            user_data = cur.fetchone(); cur.close(); conn.close()
-            if user_data: return User(user_data['user_id'], user_data['email'], user_data['role'], user_data['linked_student_id'], user_data['school_id'])
-            return None
-        except: return None
+        conn = get_db_connection(); cur = conn.cursor()
+        cur.execute("SELECT user_id, email, role, linked_student_id, school_id FROM system_users WHERE user_id = %s", (user_id,))
+        user_data = cur.fetchone()
+        cur.close(); conn.close()
+        if user_data: return User(user_data['user_id'], user_data['email'], user_data['role'], user_data['linked_student_id'], user_data['school_id'])
+        return None
 
 @login_manager.user_loader
 def load_user(user_id): return User.get(user_id)
@@ -72,34 +78,56 @@ def require_active_subscription(f):
         return f(*args, **kwargs)
     return decorated_function
 
-# --- DATABASE ENGINE ---
+# --- CORE DATABASE ENGINE ---
 def initialize_database():
     conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS institutions (school_id SERIAL PRIMARY KEY, school_name VARCHAR(150) NOT NULL UNIQUE, subscription_expiry_date DATE NOT NULL, address VARCHAR(255) DEFAULT 'Ghana', phone VARCHAR(50) DEFAULT '0000000000', primary_color VARCHAR(20) DEFAULT '#0f4c81', logo_key VARCHAR(255))")
-    cur.execute("CREATE TABLE IF NOT EXISTS students (student_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, first_name VARCHAR(100) NOT NULL, last_name VARCHAR(100) NOT NULL, guardian_name VARCHAR(100) NOT NULL, guardian_contact VARCHAR(20) NOT NULL, enrollment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP, boarding_status VARCHAR(20) DEFAULT 'Day', house VARCHAR(100) DEFAULT 'Unassigned', current_class VARCHAR(100) DEFAULT 'Unassigned', transport_route VARCHAR(100) DEFAULT 'None', photo_key VARCHAR(255))")
-    cur.execute("CREATE TABLE IF NOT EXISTS system_users (user_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, email VARCHAR(100) UNIQUE NOT NULL, password_hash VARCHAR(255) NOT NULL, role VARCHAR(20) NOT NULL, linked_student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, phone VARCHAR(20), subject VARCHAR(100), base_salary DECIMAL(10,2) DEFAULT 0.00)")
+    cur.execute("CREATE TABLE IF NOT EXISTS institutions (school_id SERIAL PRIMARY KEY, school_name VARCHAR(150) NOT NULL UNIQUE, subscription_expiry_date DATE NOT NULL)")
+    cur.execute("ALTER TABLE institutions ADD COLUMN IF NOT EXISTS address VARCHAR(255) DEFAULT 'Ghana'")
+    cur.execute("ALTER TABLE institutions ADD COLUMN IF NOT EXISTS phone VARCHAR(50) DEFAULT '0000000000'")
+    cur.execute("ALTER TABLE institutions ADD COLUMN IF NOT EXISTS primary_color VARCHAR(20) DEFAULT '#0f4c81'")
+    cur.execute("ALTER TABLE institutions ADD COLUMN IF NOT EXISTS logo_key VARCHAR(255)")
+    
+    cur.execute("CREATE TABLE IF NOT EXISTS students (student_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, first_name VARCHAR(100) NOT NULL, last_name VARCHAR(100) NOT NULL, guardian_name VARCHAR(100) NOT NULL, guardian_contact VARCHAR(20) NOT NULL, enrollment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS boarding_status VARCHAR(20) DEFAULT 'Day'")
+    cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS house VARCHAR(100) DEFAULT 'Unassigned'")
+    cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS current_class VARCHAR(100) DEFAULT 'Unassigned'")
+    cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS transport_route VARCHAR(100) DEFAULT 'None'")
+    cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS photo_key VARCHAR(255)")
+    
+    cur.execute("CREATE TABLE IF NOT EXISTS system_users (user_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, email VARCHAR(100) UNIQUE NOT NULL, password_hash VARCHAR(255) NOT NULL, role VARCHAR(20) NOT NULL, linked_student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE)")
+    cur.execute("ALTER TABLE system_users ADD COLUMN IF NOT EXISTS phone VARCHAR(20)")
+    cur.execute("ALTER TABLE system_users ADD COLUMN IF NOT EXISTS subject VARCHAR(100)")
+    cur.execute("ALTER TABLE system_users ADD COLUMN IF NOT EXISTS base_salary DECIMAL(10,2) DEFAULT 0.00")
+    
     cur.execute("CREATE TABLE IF NOT EXISTS audit_logs (log_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, user_email VARCHAR(100), action VARCHAR(255), target VARCHAR(255), timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cur.execute("CREATE TABLE IF NOT EXISTS subjects (subject_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, subject_name VARCHAR(100) NOT NULL)")
     cur.execute("CREATE TABLE IF NOT EXISTS grades (grade_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, subject_id INTEGER REFERENCES subjects(subject_id) ON DELETE CASCADE, class_score INTEGER NOT NULL, exam_score INTEGER NOT NULL, total_score INTEGER NOT NULL, waec_grade VARCHAR(2) NOT NULL, academic_year VARCHAR(9) NOT NULL, term VARCHAR(20) NOT NULL, teacher_remarks VARCHAR(255))")
-    cur.execute("CREATE TABLE IF NOT EXISTS fees (fee_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, description VARCHAR(255) NOT NULL, amount_due DECIMAL(10, 2) NOT NULL, date_issued TIMESTAMP DEFAULT CURRENT_TIMESTAMP, fee_category VARCHAR(50) DEFAULT 'General', academic_year VARCHAR(9) DEFAULT 'Unknown', term VARCHAR(20) DEFAULT 'Unknown')")
+    cur.execute("CREATE TABLE IF NOT EXISTS fees (fee_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, description VARCHAR(255) NOT NULL, amount_due DECIMAL(10, 2) NOT NULL, date_issued TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    cur.execute("ALTER TABLE fees ADD COLUMN IF NOT EXISTS fee_category VARCHAR(50) DEFAULT 'General'")
+    cur.execute("ALTER TABLE fees ADD COLUMN IF NOT EXISTS academic_year VARCHAR(9) DEFAULT 'Unknown'")
+    cur.execute("ALTER TABLE fees ADD COLUMN IF NOT EXISTS term VARCHAR(20) DEFAULT 'Unknown'")
     cur.execute("CREATE TABLE IF NOT EXISTS payments (payment_id SERIAL PRIMARY KEY, fee_id INTEGER REFERENCES fees(fee_id) ON DELETE CASCADE, amount_paid DECIMAL(10, 2) NOT NULL, payment_method VARCHAR(50) NOT NULL, payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cur.execute("CREATE TABLE IF NOT EXISTS expenses (expense_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, category VARCHAR(50) NOT NULL, description VARCHAR(255) NOT NULL, amount DECIMAL(10, 2) NOT NULL, date_incurred TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cur.execute("CREATE TABLE IF NOT EXISTS attendance (attendance_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, record_date DATE NOT NULL, status VARCHAR(20) NOT NULL, UNIQUE(student_id, record_date))")
     
-    # Advanced Modules
+    # --- NEW MODULE TABLES ---
     cur.execute("CREATE TABLE IF NOT EXISTS transport_routes (route_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, route_name VARCHAR(100) NOT NULL, driver_name VARCHAR(100), fare DECIMAL(10, 2) DEFAULT 0.00)")
     cur.execute("CREATE TABLE IF NOT EXISTS inventory_items (item_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, item_name VARCHAR(100) NOT NULL, price DECIMAL(10, 2) NOT NULL, stock INTEGER DEFAULT 0)")
     cur.execute("CREATE TABLE IF NOT EXISTS inventory_sales (sale_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, item_name VARCHAR(100), quantity INTEGER, total_cost DECIMAL(10, 2), sale_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cur.execute("CREATE TABLE IF NOT EXISTS exeats (exeat_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, exeat_type VARCHAR(50), reason VARCHAR(255), expected_return DATE, status VARCHAR(20) DEFAULT 'Active', issue_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cur.execute("CREATE TABLE IF NOT EXISTS sick_bay_logs (log_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, student_id INTEGER REFERENCES students(student_id) ON DELETE CASCADE, symptoms VARCHAR(255), treatment VARCHAR(255), log_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     cur.execute("CREATE TABLE IF NOT EXISTS academic_calendar (event_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, event_title VARCHAR(150), event_date DATE, description VARCHAR(255))")
-    cur.execute("CREATE TABLE IF NOT EXISTS lesson_plans (plan_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, teacher_email VARCHAR(100), subject VARCHAR(100), class_name VARCHAR(100), week_number INTEGER, topic VARCHAR(255), plan_content TEXT, status VARCHAR(20) DEFAULT 'Pending', admin_remarks VARCHAR(255), submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-    cur.execute("CREATE TABLE IF NOT EXISTS cbt_quizzes (quiz_id SERIAL PRIMARY KEY, school_id INTEGER REFERENCES institutions(school_id) ON DELETE CASCADE, subject_name VARCHAR(100), class_name VARCHAR(100), title VARCHAR(150), academic_year VARCHAR(9), term VARCHAR(20), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-    cur.execute("CREATE TABLE IF NOT EXISTS cbt_questions (question_id SERIAL PRIMARY KEY, quiz_id INTEGER REFERENCES cbt_quizzes(quiz_id) ON DELETE CASCADE, question_text TEXT NOT NULL, opt_a VARCHAR(255), opt_b VARCHAR(255), opt_c VARCHAR(255), opt_d VARCHAR(255), correct_opt VARCHAR(1))")
 
     cur.execute("SELECT * FROM system_users WHERE role = 'superadmin'")
-    if not cur.fetchone(): cur.execute("INSERT INTO system_users (email, password_hash, role) VALUES (%s, %s, %s)", ('superadmin@engine.com', generate_password_hash('ceo123'), 'superadmin'))
+    if not cur.fetchone():
+        hashed_sa = generate_password_hash('ceo123')
+        cur.execute("INSERT INTO system_users (email, password_hash, role) VALUES (%s, %s, %s)", ('superadmin@engine.com', hashed_sa, 'superadmin'))
     conn.commit(); cur.close(); conn.close()
+
+@app.route('/api/setup_db')
+def setup_db():
+    initialize_database()
+    return jsonify({"message": "Multi-Tenant SaaS Engine Ready! Database patched."})
 
 def automated_weekly_backup():
     if not AWS_BUCKET_NAME: return
@@ -107,31 +135,34 @@ def automated_weekly_backup():
     cur.execute("SELECT school_id, school_name FROM institutions")
     schools = cur.fetchall()
     for school in schools:
-        backup = {"school_name": school['school_name'], "export_date": datetime.now().isoformat(), "data": {}}
-        cur.execute("SELECT * FROM subjects WHERE school_id = %s", (school['school_id'],)); backup['data']['subjects'] = cur.fetchall()
-        cur.execute("SELECT * FROM students WHERE school_id = %s", (school['school_id'],)); backup['data']['students'] = cur.fetchall()
-        cur.execute("SELECT * FROM fees WHERE school_id = %s", (school['school_id'],)); backup['data']['fees'] = cur.fetchall()
-        cur.execute("SELECT p.* FROM payments p JOIN fees f ON p.fee_id = f.fee_id WHERE f.school_id = %s", (school['school_id'],)); backup['data']['payments'] = cur.fetchall()
-        cur.execute("SELECT * FROM grades WHERE school_id = %s", (school['school_id'],)); backup['data']['grades'] = cur.fetchall()
-        try: s3_client.put_object(Bucket=AWS_BUCKET_NAME, Key=f"Automated_Backups/{school['school_name'].replace(' ', '_')}/Backup_{datetime.now().strftime('%Y%m%d')}.json", Body=json.dumps(backup, default=custom_json_serializer))
+        school_id = school['school_id']; school_name = school['school_name']
+        backup = {"school_name": school_name, "export_date": datetime.now().isoformat(), "data": {}}
+        cur.execute("SELECT * FROM subjects WHERE school_id = %s", (school_id,)); backup['data']['subjects'] = cur.fetchall()
+        cur.execute("SELECT * FROM students WHERE school_id = %s", (school_id,)); backup['data']['students'] = cur.fetchall()
+        cur.execute("SELECT * FROM fees WHERE school_id = %s", (school_id,)); backup['data']['fees'] = cur.fetchall()
+        cur.execute("SELECT p.* FROM payments p JOIN fees f ON p.fee_id = f.fee_id WHERE f.school_id = %s", (school_id,)); backup['data']['payments'] = cur.fetchall()
+        cur.execute("SELECT * FROM grades WHERE school_id = %s", (school_id,)); backup['data']['grades'] = cur.fetchall()
+        cur.execute("SELECT * FROM expenses WHERE school_id = %s", (school_id,)); backup['data']['expenses'] = cur.fetchall()
+        json_data = json.dumps(backup, default=custom_json_serializer)
+        filename = f"Automated_Backups/{school_name.replace(' ', '_')}/Backup_{datetime.now().strftime('%Y%m%d')}.json"
+        try: s3_client.put_object(Bucket=AWS_BUCKET_NAME, Key=filename, Body=json_data)
         except Exception: pass
     cur.close(); conn.close()
 
-@app.route('/')
-def index(): return redirect(url_for('dashboard'))
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=automated_weekly_backup, trigger="cron", day_of_week='sun', hour=23, minute=59)
+scheduler.start()
 
-# --- AUTH & SECURITY ROUTES ---
+# --- AUTH & SECURITY ENGINE ---
 @app.route('/api/login', methods=['POST'])
 def login():
-    try:
-        data = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
-        cur.execute("SELECT user_id, email, password_hash, role, linked_student_id, school_id FROM system_users WHERE email = %s", (data.get('email'),))
-        u = cur.fetchone(); cur.close(); conn.close()
-        if u and check_password_hash(u['password_hash'], data.get('password')):
-            login_user(User(u['user_id'], u['email'], u['role'], u['linked_student_id'], u['school_id']))
-            return jsonify({"message": f"Logged in as {u['role']}."})
-        return jsonify({"error": "Invalid credentials!"}), 401
-    except Exception as e: return jsonify({"error": str(e)}), 500
+    data = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT user_id, email, password_hash, role, linked_student_id, school_id FROM system_users WHERE email = %s", (data.get('email'),))
+    user_data = cur.fetchone(); cur.close(); conn.close()
+    if user_data and check_password_hash(user_data['password_hash'], data.get('password')):
+        user = User(user_data['user_id'], user_data['email'], user_data['role'], user_data['linked_student_id'], user_data['school_id'])
+        login_user(user); return jsonify({"message": f"Logged in as {user.role}."})
+    return jsonify({"error": "Invalid credentials!"}), 401
 
 @app.route('/api/logout', methods=['POST'])
 @login_required
@@ -142,8 +173,8 @@ def logout(): logout_user(); return jsonify({"message": "Logged out safely."})
 def verify_password():
     d = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT password_hash FROM system_users WHERE user_id = %s", (current_user.id,))
-    u = cur.fetchone(); cur.close(); conn.close()
-    if u and check_password_hash(u['password_hash'], d.get('password')): return jsonify({"message": "Vault unlocked."}), 200
+    user = cur.fetchone(); cur.close(); conn.close()
+    if user and check_password_hash(user['password_hash'], d.get('password')): return jsonify({"message": "Vault unlocked."}), 200
     return jsonify({"error": "Incorrect password. Access denied."}), 403
 
 @app.route('/api/change_password', methods=['POST'])
@@ -152,22 +183,24 @@ def change_password():
     d = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
     try:
         cur.execute("SELECT password_hash FROM system_users WHERE user_id = %s", (current_user.id,))
-        if not check_password_hash(cur.fetchone()['password_hash'], d.get('current_password')): return jsonify({"error": "Incorrect current password."}), 403
-        cur.execute("UPDATE system_users SET password_hash = %s WHERE user_id = %s", (generate_password_hash(d.get('new_password')), current_user.id))
-        conn.commit(); return jsonify({"message": "Your password has been updated!"}), 200
+        user = cur.fetchone()
+        if not check_password_hash(user['password_hash'], d.get('current_password')): return jsonify({"error": "Incorrect current password."}), 403
+        new_hash = generate_password_hash(d.get('new_password'))
+        cur.execute("UPDATE system_users SET password_hash = %s WHERE user_id = %s", (new_hash, current_user.id))
+        conn.commit(); return jsonify({"message": "Your private password has been successfully updated!"}), 200
     except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
     finally: cur.close(); conn.close()
 
 @app.route('/api/admin/reset_password', methods=['POST'])
 @login_required
 def admin_reset_password():
-    if current_user.role != 'admin': return jsonify({"error": "Unauthorized"}), 403
-    d = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
+    if current_user.role != 'admin': return jsonify({"error": "Admin clearance required."}), 403
+    d = request.get_json(); new_hash = generate_password_hash(d.get('new_password')); conn = get_db_connection(); cur = conn.cursor()
     try:
-        cur.execute("UPDATE system_users SET password_hash = %s WHERE email = %s AND school_id = %s RETURNING user_id", (generate_password_hash(d.get('new_password')), d.get('target_email'), current_user.school_id))
-        if not cur.fetchone(): return jsonify({"error": "User not found."}), 404
-        cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Forced Password Reset', f"Target: {d.get('target_email')}"))
-        conn.commit(); return jsonify({"message": "Password reset successfully!"}), 200
+        cur.execute("UPDATE system_users SET password_hash = %s WHERE email = %s AND school_id = %s RETURNING user_id", (new_hash, d.get('target_email'), current_user.school_id))
+        if not cur.fetchone(): return jsonify({"error": "User email not found in your school's database."}), 404
+        cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Forced Password Reset', f"Target Email: {d.get('target_email')}"))
+        conn.commit(); return jsonify({"message": f"Security override successful. Password reset for {d.get('target_email')}!"}), 200
     except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
     finally: cur.close(); conn.close()
 
@@ -175,11 +208,11 @@ def admin_reset_password():
 @login_required
 def superadmin_reset_admin():
     if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
-    d = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
+    d = request.get_json(); new_hash = generate_password_hash(d.get('new_password')); conn = get_db_connection(); cur = conn.cursor()
     try:
-        cur.execute("UPDATE system_users SET password_hash = %s WHERE email = %s RETURNING user_id", (generate_password_hash(d.get('new_password')), d.get('admin_email')))
-        if not cur.fetchone(): return jsonify({"error": "Admin not found."}), 404
-        conn.commit(); return jsonify({"message": "Global Override successful!"}), 200
+        cur.execute("UPDATE system_users SET password_hash = %s WHERE email = %s RETURNING user_id", (new_hash, d.get('admin_email')))
+        if not cur.fetchone(): return jsonify({"error": "Admin email not found in global registry."}), 404
+        conn.commit(); return jsonify({"message": f"Global Override successful. Password reset for {d.get('admin_email')}!"}), 200
     except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
     finally: cur.close(); conn.close()
 
@@ -187,14 +220,17 @@ def superadmin_reset_admin():
 @login_required
 def superadmin_update_credentials():
     if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
-    d = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
+    d = request.get_json(); new_email = d.get('new_email'); new_pass = d.get('new_password')
+    conn = get_db_connection(); cur = conn.cursor()
     try:
-        if d.get('new_email'): cur.execute("UPDATE system_users SET email = %s WHERE user_id = %s", (d.get('new_email'), current_user.id))
-        if d.get('new_password'): cur.execute("UPDATE system_users SET password_hash = %s WHERE user_id = %s", (generate_password_hash(d.get('new_password')), current_user.id))
-        conn.commit(); return jsonify({"message": "Master credentials updated!"}), 200
+        if new_email: cur.execute("UPDATE system_users SET email = %s WHERE user_id = %s", (new_email, current_user.id))
+        if new_pass: cur.execute("UPDATE system_users SET password_hash = %s WHERE user_id = %s", (generate_password_hash(new_pass), current_user.id))
+        conn.commit(); return jsonify({"message": "Master Super Admin credentials updated successfully!"}), 200
+    except psycopg2.IntegrityError: conn.rollback(); return jsonify({"error": "That email is already in use."}), 409
     except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
     finally: cur.close(); conn.close()
 
+# --- IMMUTABLE AUDIT LOGS ENDPOINT ---
 @app.route('/api/audit_logs', methods=['GET'])
 @login_required
 def get_audit_logs():
@@ -203,7 +239,7 @@ def get_audit_logs():
     cur.execute("SELECT TO_CHAR(timestamp, 'YYYY-MM-DD HH24:MI:SS') as time, user_email, action, target FROM audit_logs WHERE school_id = %s ORDER BY timestamp DESC LIMIT 200", (current_user.school_id,))
     logs = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": logs})
 
-# --- SUPER ADMIN ROUTES ---
+# --- SUPER ADMIN TENANT MANAGEMENT ---
 @app.route('/api/superadmin/schools', methods=['GET'])
 @login_required
 def get_schools():
@@ -219,10 +255,10 @@ def onboard_school():
     data = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
     try:
         cur.execute("INSERT INTO institutions (school_name, subscription_expiry_date) VALUES (%s, CURRENT_DATE + INTERVAL '1 year') RETURNING school_id", (data.get('school_name'),))
-        new_id = cur.fetchone()['school_id']
-        cur.execute("INSERT INTO system_users (school_id, email, password_hash, role) VALUES (%s, %s, %s, 'admin')", (new_id, data.get('admin_email'), generate_password_hash(data.get('admin_password'))))
+        new_school_id = cur.fetchone()['school_id']
+        cur.execute("INSERT INTO system_users (school_id, email, password_hash, role) VALUES (%s, %s, %s, 'admin')", (new_school_id, data.get('admin_email'), generate_password_hash(data.get('admin_password'))))
         conn.commit(); return jsonify({"message": f"Onboarded {data.get('school_name')}!"}), 201
-    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 409
+    except psycopg2.IntegrityError: conn.rollback(); return jsonify({"error": "School name or Admin email already exists!"}), 409
     finally: cur.close(); conn.close()
 
 @app.route('/api/superadmin/branding/<int:school_id>', methods=['POST'])
@@ -239,341 +275,42 @@ def update_branding(school_id):
             cur.execute("UPDATE institutions SET primary_color = %s, logo_key = %s WHERE school_id = %s", (color, logo_key, school_id))
         except Exception: pass
     else: cur.execute("UPDATE institutions SET primary_color = %s WHERE school_id = %s", (color, school_id))
-    conn.commit(); cur.close(); conn.close(); return jsonify({"message": "Branding updated successfully!"})
+    conn.commit(); cur.close(); conn.close(); return jsonify({"message": "School branding updated successfully!"})
 
-# --- ALL ADMIN OPERATIONAL ROUTES ---
-@app.route('/api/students', methods=['GET', 'POST'])
+@app.route('/api/superadmin/renew/<int:school_id>', methods=['POST'])
 @login_required
-@require_active_subscription
-def manage_students():
+def renew_school(school_id):
+    if current_user.role != 'superadmin': return jsonify({"error": "Unauthorized"}), 403
     conn = get_db_connection(); cur = conn.cursor()
-    if request.method == 'POST':
-        d = request.get_json(); photo_b64 = d.get('photo_b64'); photo_key = None
-        if photo_b64 and AWS_BUCKET_NAME:
-            try:
-                if ',' in photo_b64: photo_b64 = photo_b64.split(',')[1]
-                photo_key = f"student_photos/{current_user.school_id}/{uuid.uuid4().hex}.jpg"
-                s3_client.put_object(Bucket=AWS_BUCKET_NAME, Key=photo_key, Body=base64.b64decode(photo_b64), ContentType='image/jpeg')
-            except: pass
-        cur.execute("INSERT INTO students (school_id, first_name, last_name, current_class, transport_route, guardian_name, guardian_contact, boarding_status, house, photo_key) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING student_id", 
-                    (current_user.school_id, d.get('first_name'), d.get('last_name'), d.get('current_class', 'Unassigned'), d.get('transport_route', 'None'), d.get('guardian_name'), d.get('guardian_contact'), d.get('boarding_status', 'Day'), d.get('house', 'Unassigned'), photo_key))
-        new_id = cur.fetchone()['student_id']
-        cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Enrolled Student', f"ID {new_id}"))
-        conn.commit(); cur.close(); conn.close(); return jsonify({"message": f"Student Enrolled successfully! ID: {new_id}"}), 201
-    else:
-        cur.execute("SELECT student_id, first_name, last_name, current_class, transport_route, boarding_status, house, guardian_contact FROM students WHERE school_id = %s ORDER BY student_id DESC", (current_user.school_id,))
-        students = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": students})
+    cur.execute("UPDATE institutions SET subscription_expiry_date = CURRENT_DATE + INTERVAL '1 year' WHERE school_id = %s RETURNING school_name, subscription_expiry_date", (school_id,))
+    updated = cur.fetchone(); conn.commit(); cur.close(); conn.close()
+    return jsonify({"message": f"Contract Renewed! {updated['school_name']} active until {updated['subscription_expiry_date']}"})
 
-@app.route('/api/students/<int:student_id>', methods=['PUT', 'DELETE'])
-@login_required
-@require_active_subscription
-def update_delete_student(student_id):
-    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
-    conn = get_db_connection(); cur = conn.cursor()
-    if request.method == 'PUT':
-        d = request.get_json()
-        try:
-            cur.execute("UPDATE students SET first_name=%s, last_name=%s, current_class=%s, transport_route=%s, boarding_status=%s, house=%s, guardian_contact=%s WHERE student_id=%s AND school_id=%s", 
-                        (d.get('first_name'), d.get('last_name'), d.get('current_class'), d.get('transport_route'), d.get('boarding_status'), d.get('house'), d.get('guardian_contact'), student_id, current_user.school_id))
-            cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Edited Student Profile', f"ID {student_id}"))
-            conn.commit(); return jsonify({"message": f"Student ID {student_id} updated."}), 200
-        except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
-        finally: cur.close(); conn.close()
-    elif request.method == 'DELETE':
-        try:
-            cur.execute("SELECT photo_key FROM students WHERE student_id=%s AND school_id=%s", (student_id, current_user.school_id))
-            student = cur.fetchone()
-            if not student: return jsonify({"error": "Not found."}), 404
-            cur.execute("DELETE FROM students WHERE student_id=%s AND school_id=%s", (student_id, current_user.school_id))
-            cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Deleted Student Record', f"ID {student_id}"))
-            conn.commit()
-            if student['photo_key'] and AWS_BUCKET_NAME:
-                try: s3_client.delete_object(Bucket=AWS_BUCKET_NAME, Key=student['photo_key'])
-                except: pass
-            return jsonify({"message": f"Student ID {student_id} deleted."}), 200
-        except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
-        finally: cur.close(); conn.close()
+# --- ALL 5 NEW ENTERPRISE MODULES ---
 
-@app.route('/api/students/bulk', methods=['POST'])
-@login_required
-def bulk_enroll():
-    if current_user.role != 'admin': return jsonify({"error": "Admin only"}), 403
-    if 'file' not in request.files: return jsonify({"error": "No file uploaded"}), 400
-    try:
-        stream = StringIO(request.files['file'].stream.read().decode("UTF8"), newline=None)
-        csv_input = csv.reader(stream); next(csv_input, None) 
-        conn = get_db_connection(); cur = conn.cursor(); count = 0
-        for row in csv_input:
-            if len(row) >= 2: 
-                cur.execute("INSERT INTO students (school_id, first_name, last_name, current_class, guardian_name, guardian_contact, boarding_status, house) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                            (current_user.school_id, row[0].strip()[:100], row[1].strip()[:100], row[2].strip()[:100] if len(row)>2 else 'Unassigned', row[3].strip()[:100] if len(row)>3 else 'N/A', row[4].strip()[:20] if len(row)>4 else '', row[5].strip()[:20] if len(row)>5 else 'Day', row[6].strip()[:100] if len(row)>6 else 'Unassigned'))
-                count += 1
-        cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Bulk CSV Enrollment', f"Enrolled {count} students"))
-        conn.commit(); return jsonify({"message": f"Enrolled {count} students."}), 201
-    except Exception as e: return jsonify({"error": f"Upload failed: {str(e)}"}), 500
-    finally:
-        if 'cur' in locals(): cur.close(); conn.close()
-
-@app.route('/api/students/promote', methods=['POST'])
-@login_required
-def promote_students():
-    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
-    d = request.get_json()
-    if not d.get('from_class') or not d.get('to_class'): return jsonify({"error": "Provide both classes."}), 400
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("UPDATE students SET current_class = %s WHERE current_class = %s AND school_id = %s RETURNING student_id", (d.get('to_class'), d.get('from_class'), current_user.school_id))
-        promoted = cur.fetchall()
-        cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Promoted Cohort', f"Moved {len(promoted)} from {d.get('from_class')} to {d.get('to_class')}"))
-        conn.commit(); return jsonify({"message": f"Promoted {len(promoted)} students."}), 200
-    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
-    finally: cur.close(); conn.close()
-
-@app.route('/api/fees/bill', methods=['POST'])
-@login_required
-def bill_student():
-    d = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
-    try:
-        stu_id = int(d.get('student_id') or 0); amt = float(d.get('amount_due') or 0.0)
-        cur.execute("SELECT student_id FROM students WHERE student_id = %s AND school_id = %s", (stu_id, current_user.school_id))
-        if not cur.fetchone(): return jsonify({"error": "Student ID does not exist!"}), 404
-        cur.execute("INSERT INTO fees (school_id, student_id, fee_category, description, amount_due, academic_year, term) VALUES (%s, %s, %s, %s, %s, %s, %s)", 
-                    (current_user.school_id, stu_id, d.get('fee_category'), str(d.get('description') or '')[:250], amt, str(d.get('academic_year') or '')[:9], str(d.get('term') or '')[:20]))
-        cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Issued Bill', f"GHS {amt} to ID {stu_id}"))
-        conn.commit(); return jsonify({"message": "Bill issued successfully!"}), 201
-    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 400
-    finally: cur.close(); conn.close()
-
-@app.route('/api/fees/bulk_bill', methods=['POST'])
-@login_required
-def bulk_bill():
-    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
-    d = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("INSERT INTO fees (school_id, student_id, fee_category, description, amount_due, academic_year, term) SELECT school_id, student_id, %s, %s, %s, %s, %s FROM students WHERE current_class = %s AND school_id = %s RETURNING fee_id", 
-                    (d.get('fee_category'), d.get('description'), float(d.get('amount_due') or 0), d.get('academic_year'), d.get('term'), d.get('target_class'), current_user.school_id))
-        billed = cur.fetchall()
-        cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Executed Bulk Billing', f"Issued to {len(billed)} students in {d.get('target_class')}"))
-        conn.commit(); return jsonify({"message": f"Bulk Bill issued to {len(billed)} students!"}), 201
-    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 400
-    finally: cur.close(); conn.close()
-
-@app.route('/api/fees/<int:fee_id>', methods=['DELETE'])
-@login_required
-def reverse_bill(fee_id):
-    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("DELETE FROM fees WHERE fee_id = %s AND school_id = %s RETURNING student_id, amount_due", (fee_id, current_user.school_id))
-        res = cur.fetchone()
-        if not res: return jsonify({"error": "Bill not found."}), 404
-        cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Reversed Bill', f"Fee ID {fee_id} (GHS {res['amount_due']})"))
-        conn.commit(); return jsonify({"message": f"Bill {fee_id} successfully reversed."}), 200
-    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
-    finally: cur.close(); conn.close()
-
-@app.route('/api/fees/pay', methods=['POST'])
-@login_required
-def log_payment():
-    d = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
-    try:
-        fee_id = int(d.get('fee_id') or 0); amt = float(d.get('amount_paid') or 0.0)
-        cur.execute("SELECT fee_id FROM fees WHERE fee_id = %s AND school_id = %s", (fee_id, current_user.school_id))
-        if not cur.fetchone(): return jsonify({"error": "Fee ID does not exist!"}), 404
-        cur.execute("INSERT INTO payments (fee_id, amount_paid, payment_method) VALUES (%s, %s, %s)", (fee_id, amt, d.get('payment_method')))
-        cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Logged Payment', f"GHS {amt} via {d.get('payment_method')} (Fee {fee_id})"))
-        conn.commit(); return jsonify({"message": "Payment logged securely!"}), 201
-    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 400
-    finally: cur.close(); conn.close()
-
-@app.route('/api/momo/initialize', methods=['POST'])
-@login_required
-def momo_initialize():
-    d = request.get_json(); fee_id = int(d.get('fee_id')); amt = float(d.get('amount')); phone = str(d.get('phone') or '').strip()
-    conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT student_id, amount_due FROM fees WHERE fee_id = %s", (fee_id,))
-    fee = cur.fetchone()
-    if not fee: cur.close(); conn.close(); return jsonify({"error": "Fee bill not found."}), 404
-
-    if PAYSTACK_SECRET_KEY:
-        try:
-            res = requests.post("https://api.paystack.co/transaction/initialize", json={"email": current_user.email, "amount": int(amt * 100), "currency": "GHS", "channels": ["mobile_money", "card"], "metadata": {"fee_id": fee_id, "student_id": fee['student_id'], "phone": phone}}, headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"}).json()
-            cur.close(); conn.close()
-            if res.get('status'): return jsonify({"status": "paystack_redirect", "auth_url": res['data']['authorization_url']})
-            return jsonify({"error": res.get('message', 'Paystack rejected transaction.')}), 400
-        except Exception as e: cur.close(); conn.close(); return jsonify({"error": f"Gateway error: {str(e)}"}), 500
-    else:
-        try:
-            cur.execute("INSERT INTO payments (fee_id, amount_paid, payment_method) VALUES (%s, %s, %s)", (fee_id, amt, f"MTN MoMo Sandbox ({phone})"))
-            cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'MoMo Payment (Sandbox)', f"Paid GHS {amt} for Fee ID {fee_id}"))
-            conn.commit(); cur.close(); conn.close(); return jsonify({"status": "cleared", "message": f"[SANDBOX MODE] Simulated payment approved for {phone}!"}), 200
-        except Exception as e: conn.rollback(); cur.close(); conn.close(); return jsonify({"error": str(e)}), 500
-
-@app.route('/api/debtors', methods=['GET'])
-@login_required
-def get_debtors():
-    conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT s.student_id, s.first_name, s.last_name, s.guardian_contact, (SUM(f.amount_due) - COALESCE((SELECT SUM(amount_paid) FROM payments p JOIN fees f2 ON p.fee_id = f2.fee_id WHERE f2.student_id = s.student_id), 0)) as arrears FROM students s JOIN fees f ON s.student_id = f.student_id WHERE s.school_id = %s GROUP BY s.student_id, s.first_name, s.last_name, s.guardian_contact HAVING (SUM(f.amount_due) - COALESCE((SELECT SUM(amount_paid) FROM payments p JOIN fees f2 ON p.fee_id = f2.fee_id WHERE f2.student_id = s.student_id), 0)) > 0 ORDER BY arrears DESC", (current_user.school_id,))
-    debtors = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": debtors})
-
-@app.route('/api/statement/<int:student_id>', methods=['GET'])
-@login_required
-def get_statement(student_id):
-    if current_user.role == 'guardian' and current_user.linked_student_id != student_id: return jsonify({"error": "Access Denied."}), 403
-    conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT f.fee_id, f.student_id, f.fee_category, f.academic_year, f.term, f.description, f.amount_due, COALESCE(SUM(p.amount_paid), 0) as total_paid, (f.amount_due - COALESCE(SUM(p.amount_paid), 0)) as remaining_balance FROM fees f LEFT JOIN payments p ON f.fee_id = p.fee_id WHERE f.student_id = %s AND f.school_id = %s GROUP BY f.fee_id, f.student_id, f.fee_category, f.academic_year, f.term, f.description, f.amount_due ORDER BY f.date_issued DESC", (student_id, current_user.school_id))
-    st = cur.fetchall(); cur.close(); conn.close(); return jsonify({"statement": st}), 200
-
-@app.route('/api/analytics', methods=['GET'])
-@login_required
-def get_analytics():
-    if current_user.role != 'admin': return jsonify({"error": "Unauthorized"}), 403
-    conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT COALESCE(SUM(amount_due), 0) as total_due FROM fees WHERE school_id = %s", (current_user.school_id,))
-    td = float(cur.fetchone()['total_due'])
-    cur.execute("SELECT COALESCE(SUM(p.amount_paid), 0) as total_paid FROM payments p JOIN fees f ON p.fee_id = f.fee_id WHERE f.school_id = %s", (current_user.school_id,))
-    tp = float(cur.fetchone()['total_paid'])
-    cur.execute("SELECT COALESCE(SUM(amount), 0) as total_expenses FROM expenses WHERE school_id = %s", (current_user.school_id,))
-    te = float(cur.fetchone()['total_expenses'])
-    cur.execute("SELECT waec_grade, COUNT(*) as count FROM grades WHERE school_id = %s GROUP BY waec_grade ORDER BY waec_grade", (current_user.school_id,))
-    perf = cur.fetchall(); cur.close(); conn.close()
-    return jsonify({"financials": {"due": td, "paid": tp, "outstanding": td - tp, "expenses": te, "net_margin": tp - te}, "performance": perf})
-
-@app.route('/api/expenses', methods=['POST', 'GET'])
-@login_required
-def manage_expenses():
-    conn = get_db_connection(); cur = conn.cursor()
-    if request.method == 'POST':
-        d = request.get_json()
-        cur.execute("INSERT INTO expenses (school_id, category, description, amount) VALUES (%s, %s, %s, %s)", (current_user.school_id, d.get('category'), d.get('description'), d.get('amount')))
-        cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Logged Expense', f"GHS {d.get('amount')} for {d.get('category')}"))
-        conn.commit(); cur.close(); conn.close(); return jsonify({"message": "Expense logged securely."}), 201
-    else:
-        cur.execute("SELECT expense_id, category, description, amount, TO_CHAR(date_incurred, 'YYYY-MM-DD') as date FROM expenses WHERE school_id = %s ORDER BY date_incurred DESC", (current_user.school_id,))
-        e = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": e})
-
-@app.route('/api/attendance', methods=['POST'])
-@login_required
-def log_attendance():
-    d = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("INSERT INTO attendance (school_id, student_id, record_date, status) VALUES (%s, %s, %s, %s) ON CONFLICT (student_id, record_date) DO UPDATE SET status = EXCLUDED.status", (current_user.school_id, d.get('student_id'), d.get('record_date'), d.get('status')))
-        conn.commit(); return jsonify({"message": f"Attendance recorded for {d.get('record_date')}"})
-    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
-    finally: cur.close(); conn.close()
-
-@app.route('/api/grades', methods=['POST'])
-@login_required
-def add_grade():
-    d = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
-    try:
-        c_score = int(str(d.get('class_score') or '0').strip()); e_score = int(str(d.get('exam_score') or '0').strip())
-        stu_id = int(str(d.get('student_id') or '0').strip()); t_score = c_score + e_score; waec = get_waec_grade(t_score)
-        cur.execute("SELECT subject_id FROM subjects WHERE subject_name = %s AND school_id = %s", (d.get('subject_name'), current_user.school_id))
-        sub = cur.fetchone()
-        if not sub:
-            cur.execute("INSERT INTO subjects (school_id, subject_name) VALUES (%s, %s) RETURNING subject_id", (current_user.school_id, d.get('subject_name')))
-            sub_id = cur.fetchone()['subject_id']
-        else: sub_id = sub['subject_id']
-        cur.execute("INSERT INTO grades (school_id, student_id, subject_id, class_score, exam_score, total_score, waec_grade, academic_year, term, teacher_remarks) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", 
-                    (current_user.school_id, stu_id, sub_id, c_score, e_score, t_score, waec, d.get('academic_year'), d.get('term'), d.get('remarks')))
-        conn.commit(); return jsonify({"message": f"SBA Recorded! Total: {t_score}% ({waec})"})
-    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 400
-    finally: cur.close(); conn.close()
-
-@app.route('/api/report_card/<int:student_id>', methods=['GET'])
-@login_required
-def get_report_card(student_id):
-    if current_user.role == 'guardian' and current_user.linked_student_id != student_id: return jsonify({"error": "Access Denied."}), 403
-    conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT sub.subject_name, g.class_score, g.exam_score, g.total_score, g.waec_grade, g.teacher_remarks, g.term FROM grades g JOIN subjects sub ON g.subject_id = sub.subject_id WHERE g.student_id = %s AND g.school_id = %s", (student_id, current_user.school_id))
-    grades = cur.fetchall(); cur.close(); conn.close(); return jsonify({"grades": grades})
-
-@app.route('/api/sms/blast', methods=['POST'])
-@login_required
-def send_sms_blast():
-    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
-    d = request.get_json(); audience = d.get('audience'); message = d.get('message')
-    if not message: return jsonify({"error": "Message body cannot be empty."}), 400
-    conn = get_db_connection(); cur = conn.cursor()
-    if audience == 'all': cur.execute("SELECT DISTINCT guardian_contact FROM students WHERE school_id = %s AND guardian_contact IS NOT NULL", (current_user.school_id,))
-    elif audience == 'arrears': cur.execute("SELECT DISTINCT s.guardian_contact FROM students s JOIN fees f ON s.student_id = f.student_id LEFT JOIN payments p ON f.fee_id = p.fee_id WHERE s.school_id = %s AND s.guardian_contact IS NOT NULL GROUP BY s.guardian_contact, f.fee_id, f.amount_due HAVING (f.amount_due - COALESCE(SUM(p.amount_paid), 0)) > 0", (current_user.school_id,))
-    else: cur.execute("SELECT DISTINCT guardian_contact FROM students WHERE school_id = %s AND boarding_status = 'Boarding' AND guardian_contact IS NOT NULL", (current_user.school_id,))
-    raw_contacts = cur.fetchall(); cur.close(); conn.close()
-    contacts = [r['guardian_contact'].strip() for r in raw_contacts if r['guardian_contact']]
-    if not contacts: return jsonify({"error": "No numbers found."}), 404
-    
-    api_key = os.environ.get('SMS_API_KEY'); sender = os.environ.get('SMS_SENDER_ID', 'SMS_ADMIN')
-    if api_key:
-        try:
-            res = requests.post("https://sms.arkesel.com/api/v2/sms/send", json={"sender": sender, "message": message, "recipients": contacts}, headers={"api-key": api_key})
-            if res.status_code in [200, 201]: return jsonify({"message": f"Broadcast sent to {len(contacts)} parents!"})
-            return jsonify({"error": "Gateway rejected broadcast."}), 500
-        except Exception as e: return jsonify({"error": str(e)}), 500
-    return jsonify({"message": f"[SIMULATION] SMS sent to {len(contacts)} contacts."})
-
-@app.route('/api/register_staff', methods=['POST'])
-@login_required
-def register_staff():
-    if current_user.role != 'admin': return jsonify({"error": "Admin clearance required."}), 403
-    d = request.get_json(); hashed = generate_password_hash(d.get('password')); conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("INSERT INTO system_users (school_id, email, password_hash, role, phone, subject, base_salary) VALUES (%s, %s, %s, %s, %s, %s, %s)", 
-                    (current_user.school_id, d.get('email'), hashed, 'teacher', d.get('phone'), d.get('subject'), float(d.get('salary') or 0.0)))
-        conn.commit(); return jsonify({"message": "Staff Profile Created in HR Vault!"}), 201
-    except Exception: conn.rollback(); return jsonify({"error": "Email exists or format invalid."}), 409
-    finally: cur.close(); conn.close()
-
-@app.route('/api/register_guardian', methods=['POST'])
-@login_required
-def register_guardian():
-    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
-    d = request.get_json(); hashed = generate_password_hash(d.get('password')); conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("INSERT INTO system_users (school_id, email, password_hash, role, linked_student_id) VALUES (%s, %s, %s, %s, %s)", 
-                    (current_user.school_id, d.get('email'), hashed, 'guardian', int(d.get('linked_student_id'))))
-        conn.commit(); return jsonify({"message": "Guardian Access granted!"}), 201
-    except Exception: conn.rollback(); return jsonify({"error": "Error granting access."}), 409
-    finally: cur.close(); conn.close()
-
-@app.route('/api/staff', methods=['GET'])
-@login_required
-def get_staff():
-    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
-    conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT email, phone, subject, base_salary FROM system_users WHERE school_id = %s AND role = 'teacher'", (current_user.school_id,))
-    staff = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": staff})
-
-@app.route('/api/settings', methods=['POST'])
-@login_required
-def update_settings():
-    if current_user.role != 'admin': return jsonify({"error": "Admin only."}), 403
-    d = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
-    try:
-        cur.execute("UPDATE institutions SET address = %s, phone = %s WHERE school_id = %s", (d.get('address'), d.get('phone'), current_user.school_id))
-        conn.commit(); return jsonify({"message": "Profile updated!"})
-    except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
-    finally: cur.close(); conn.close()
-
+# 1. TRANSPORT MODULE
 @app.route('/api/transport', methods=['GET', 'POST'])
 @login_required
 def manage_transport():
     conn = get_db_connection(); cur = conn.cursor()
     if request.method == 'POST':
         if current_user.role != 'admin': return jsonify({"error": "Admin only"}), 403
-        d = request.get_json(); cur.execute("INSERT INTO transport_routes (school_id, route_name, driver_name, fare) VALUES (%s, %s, %s, %s)", (current_user.school_id, d.get('route_name'), d.get('driver_name'), d.get('fare')))
+        d = request.get_json()
+        cur.execute("INSERT INTO transport_routes (school_id, route_name, driver_name, fare) VALUES (%s, %s, %s, %s)", (current_user.school_id, d.get('route_name'), d.get('driver_name'), d.get('fare')))
         conn.commit(); cur.close(); conn.close(); return jsonify({"message": "Transport Route added!"}), 201
     else:
         cur.execute("SELECT route_id, route_name, driver_name, fare FROM transport_routes WHERE school_id = %s", (current_user.school_id,))
         routes = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": routes})
 
+# 2. INVENTORY & SCHOOL STORE MODULE
 @app.route('/api/inventory', methods=['GET', 'POST'])
 @login_required
 def manage_inventory():
     conn = get_db_connection(); cur = conn.cursor()
     if request.method == 'POST':
         if current_user.role != 'admin': return jsonify({"error": "Admin only"}), 403
-        d = request.get_json(); cur.execute("INSERT INTO inventory_items (school_id, item_name, price, stock) VALUES (%s, %s, %s, %s)", (current_user.school_id, d.get('item_name'), d.get('price'), d.get('stock')))
+        d = request.get_json()
+        cur.execute("INSERT INTO inventory_items (school_id, item_name, price, stock) VALUES (%s, %s, %s, %s)", (current_user.school_id, d.get('item_name'), d.get('price'), d.get('stock')))
         conn.commit(); cur.close(); conn.close(); return jsonify({"message": "Item added to Store Catalog!"}), 201
     else:
         cur.execute("SELECT item_id, item_name, price, stock FROM inventory_items WHERE school_id = %s", (current_user.school_id,))
@@ -583,7 +320,8 @@ def manage_inventory():
 @login_required
 def sell_inventory():
     if current_user.role != 'admin': return jsonify({"error": "Admin only"}), 403
-    d = request.get_json(); item_id = int(d.get('item_id')); qty = int(d.get('quantity')); stu_id = int(d.get('student_id'))
+    d = request.get_json()
+    item_id = int(d.get('item_id')); qty = int(d.get('quantity')); stu_id = int(d.get('student_id'))
     conn = get_db_connection(); cur = conn.cursor()
     try:
         cur.execute("SELECT item_name, price, stock FROM inventory_items WHERE item_id = %s AND school_id = %s", (item_id, current_user.school_id))
@@ -597,6 +335,7 @@ def sell_inventory():
     except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
     finally: cur.close(); conn.close()
 
+# 3. EXEAT & BOARDING MODULE (WITH LIVE SMS)
 @app.route('/api/exeats', methods=['GET', 'POST', 'PUT'])
 @login_required
 def manage_exeats():
@@ -608,26 +347,34 @@ def manage_exeats():
             cur.execute("SELECT first_name, guardian_contact FROM students WHERE student_id = %s AND school_id = %s", (stu_id, current_user.school_id))
             stu = cur.fetchone()
             if not stu: return jsonify({"error": "Student ID not found."}), 404
+            
             cur.execute("INSERT INTO exeats (school_id, student_id, exeat_type, reason, expected_return) VALUES (%s, %s, %s, %s, %s)", (current_user.school_id, stu_id, d.get('exeat_type'), d.get('reason'), d.get('expected_return')))
             cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Issued Exeat', f"To ID {stu_id} for {d.get('reason')}"))
             conn.commit()
             
-            api_key = os.environ.get('SMS_API_KEY'); sender = os.environ.get('SMS_SENDER_ID', 'SMS_ADMIN')
+            # Auto-SMS to Parent
+            api_key = os.environ.get('SMS_API_KEY'); sender = os.environ.get('SMS_SENDER_ID', 'SMS_ADMIN'); sms_msg = ""
             if api_key and stu['guardian_contact']:
-                try: requests.post("https://sms.arkesel.com/api/v2/sms/send", json={"sender": sender, "message": f"ALERT: Your ward {stu['first_name']} has been issued an Exeat ({d.get('exeat_type')}) for: {d.get('reason')}. Expected return: {d.get('expected_return')}.", "recipients": [stu['guardian_contact']]}, headers={"api-key": api_key})
-                except Exception: pass
-            return jsonify({"message": "Exeat issued securely."}), 201
+                try:
+                    msg = f"ALERT: Your ward {stu['first_name']} has been issued an Exeat ({d.get('exeat_type')}) for: {d.get('reason')}. Expected return: {d.get('expected_return')}."
+                    requests.post("https://sms.arkesel.com/api/v2/sms/send", json={"sender": sender, "message": msg, "recipients": [stu['guardian_contact']]}, headers={"api-key": api_key})
+                    sms_msg = " Parent notified via SMS."
+                except Exception: sms_msg = " SMS failed."
+            return jsonify({"message": f"Exeat issued securely.{sms_msg}"}), 201
         except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
         finally: cur.close(); conn.close()
+    
     elif request.method == 'PUT':
         if current_user.role != 'admin': return jsonify({"error": "Admin only"}), 403
         d = request.get_json()
         cur.execute("UPDATE exeats SET status = 'Returned' WHERE exeat_id = %s AND school_id = %s", (d.get('exeat_id'), current_user.school_id))
         conn.commit(); cur.close(); conn.close(); return jsonify({"message": "Exeat marked as Returned."})
+        
     else:
         cur.execute("SELECT e.exeat_id, e.student_id, s.first_name, s.last_name, e.exeat_type, e.reason, TO_CHAR(e.expected_return, 'YYYY-MM-DD') as date, e.status FROM exeats e JOIN students s ON e.student_id = s.student_id WHERE e.school_id = %s ORDER BY e.issue_date DESC", (current_user.school_id,))
         exs = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": exs})
 
+# 4. SICK BAY MODULE
 @app.route('/api/sickbay', methods=['GET', 'POST'])
 @login_required
 def manage_sickbay():
@@ -638,13 +385,27 @@ def manage_sickbay():
         try:
             cur.execute("INSERT INTO sick_bay_logs (school_id, student_id, symptoms, treatment) VALUES (%s, %s, %s, %s)", (current_user.school_id, stu_id, d.get('symptoms'), d.get('treatment')))
             cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Sick Bay Log', f"ID {stu_id}: {d.get('symptoms')}"))
-            conn.commit(); return jsonify({"message": "Medical visit recorded."}), 201
+            conn.commit()
+            
+            sms_msg = ""
+            if d.get('alert_parent'):
+                cur.execute("SELECT first_name, guardian_contact FROM students WHERE student_id = %s AND school_id = %s", (stu_id, current_user.school_id))
+                stu = cur.fetchone()
+                api_key = os.environ.get('SMS_API_KEY'); sender = os.environ.get('SMS_SENDER_ID', 'SMS_ADMIN')
+                if stu and api_key and stu['guardian_contact']:
+                    try:
+                        msg = f"MEDICAL ALERT: Your ward {stu['first_name']} visited the Sick Bay today. Symptoms: {d.get('symptoms')}. Please contact the school."
+                        requests.post("https://sms.arkesel.com/api/v2/sms/send", json={"sender": sender, "message": msg, "recipients": [stu['guardian_contact']]}, headers={"api-key": api_key})
+                        sms_msg = " Emergency SMS sent to parent."
+                    except Exception: sms_msg = " SMS failed."
+            return jsonify({"message": f"Medical record saved.{sms_msg}"}), 201
         except Exception as e: conn.rollback(); return jsonify({"error": str(e)}), 500
         finally: cur.close(); conn.close()
     else:
         cur.execute("SELECT sb.log_id, sb.student_id, s.first_name, s.last_name, sb.symptoms, sb.treatment, TO_CHAR(sb.log_date, 'YYYY-MM-DD HH24:MI') as time FROM sick_bay_logs sb JOIN students s ON sb.student_id = s.student_id WHERE sb.school_id = %s ORDER BY sb.log_date DESC", (current_user.school_id,))
         logs = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": logs})
 
+# 5. ACADEMIC CALENDAR MODULE
 @app.route('/api/calendar', methods=['GET', 'POST'])
 @login_required
 def manage_calendar():
@@ -658,44 +419,89 @@ def manage_calendar():
         cur.execute("SELECT event_title, TO_CHAR(event_date, 'YYYY-MM-DD') as date, description FROM academic_calendar WHERE school_id = %s ORDER BY event_date ASC", (current_user.school_id,))
         evs = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": evs})
 
-@app.route('/api/lesson_plans', methods=['GET', 'POST', 'PUT'])
+# --- OLD TENANT ENDPOINTS (ENROLLMENT & DIRECTORY) ---
+@app.route('/api/students', methods=['GET', 'POST'])
 @login_required
-def manage_lesson_plans():
+@require_active_subscription
+def manage_students():
     conn = get_db_connection(); cur = conn.cursor()
     if request.method == 'POST':
-        if current_user.role != 'teacher': return jsonify({"error": "Teachers only"}), 403
-        d = request.get_json()
-        cur.execute("INSERT INTO lesson_plans (school_id, teacher_email, subject, class_name, week_number, topic, plan_content) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                    (current_user.school_id, current_user.email, d.get('subject'), d.get('class_name'), int(d.get('week_number') or 1), d.get('topic'), d.get('plan_content')))
-        conn.commit(); cur.close(); conn.close(); return jsonify({"message": "Lesson Plan submitted for Headmaster approval!"}), 201
-    elif request.method == 'PUT':
-        if current_user.role != 'admin': return jsonify({"error": "Admin only"}), 403
-        d = request.get_json()
-        cur.execute("UPDATE lesson_plans SET status = %s, admin_remarks = %s WHERE plan_id = %s AND school_id = %s", (d.get('status'), d.get('remarks'), d.get('plan_id'), current_user.school_id))
-        cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Reviewed Lesson Plan', f"Plan ID {d.get('plan_id')} ({d.get('status')})"))
-        conn.commit(); cur.close(); conn.close(); return jsonify({"message": "Lesson plan review updated."}), 200
+        data = request.get_json(); photo_b64 = data.get('photo_b64'); photo_key = None
+        if photo_b64 and AWS_BUCKET_NAME:
+            try:
+                if ',' in photo_b64: photo_b64 = photo_b64.split(',')[1]
+                photo_key = f"student_photos/{current_user.school_id}/{uuid.uuid4().hex}.jpg"
+                s3_client.put_object(Bucket=AWS_BUCKET_NAME, Key=photo_key, Body=base64.b64decode(photo_b64), ContentType='image/jpeg')
+            except Exception: pass
+        cur.execute("INSERT INTO students (school_id, first_name, last_name, current_class, transport_route, guardian_name, guardian_contact, boarding_status, house, photo_key) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING student_id", 
+                    (current_user.school_id, data.get('first_name'), data.get('last_name'), data.get('current_class', 'Unassigned'), data.get('transport_route', 'None'), data.get('guardian_name'), data.get('guardian_contact'), data.get('boarding_status', 'Day'), data.get('house', 'Unassigned'), photo_key))
+        new_id = cur.fetchone()['student_id']
+        cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Enrolled Student', f"ID {new_id}"))
+        conn.commit(); cur.close(); conn.close()
+        return jsonify({"message": f"Student Enrolled successfully! ID: {new_id}"}), 201
     else:
-        if current_user.role == 'teacher': cur.execute("SELECT plan_id, subject, class_name, week_number, topic, status, admin_remarks, TO_CHAR(submitted_at, 'YYYY-MM-DD') as date FROM lesson_plans WHERE school_id = %s AND teacher_email = %s ORDER BY submitted_at DESC", (current_user.school_id, current_user.email))
-        else: cur.execute("SELECT plan_id, teacher_email, subject, class_name, week_number, topic, plan_content, status, admin_remarks, TO_CHAR(submitted_at, 'YYYY-MM-DD') as date FROM lesson_plans WHERE school_id = %s ORDER BY submitted_at DESC", (current_user.school_id,))
-        plans = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": plans})
+        cur.execute("SELECT student_id, first_name, last_name, current_class, transport_route, boarding_status, house, guardian_contact FROM students WHERE school_id = %s ORDER BY student_id DESC", (current_user.school_id,))
+        students = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": students})
 
-@app.route('/api/cbt/quiz', methods=['GET', 'POST'])
+@app.route('/api/students/<int:student_id>', methods=['PUT', 'DELETE'])
 @login_required
-def manage_cbt():
+@require_active_subscription
+def update_delete_student(student_id):
+    if current_user.role != 'admin': return jsonify({"error": "Admin clearance required."}), 403
     conn = get_db_connection(); cur = conn.cursor()
-    if request.method == 'POST':
-        if current_user.role not in ['admin', 'teacher']: return jsonify({"error": "Unauthorized"}), 403
+    if request.method == 'PUT':
         d = request.get_json()
-        cur.execute("INSERT INTO cbt_quizzes (school_id, subject_name, class_name, title, academic_year, term) VALUES (%s, %s, %s, %s, %s, %s) RETURNING quiz_id",
-                    (current_user.school_id, d.get('subject'), d.get('class_name'), d.get('title'), d.get('academic_year'), d.get('term')))
-        quiz_id = cur.fetchone()['quiz_id']
-        for q in d.get('questions', []):
-            cur.execute("INSERT INTO cbt_questions (quiz_id, question_text, opt_a, opt_b, opt_c, opt_d, correct_opt) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                        (quiz_id, q.get('text'), q.get('a'), q.get('b'), q.get('c'), q.get('d'), q.get('ans').upper()))
-        conn.commit(); cur.close(); conn.close(); return jsonify({"message": "CBT Quiz published successfully!"}), 201
-    else:
-        cur.execute("SELECT quiz_id, subject_name, class_name, title, academic_year, term, TO_CHAR(created_at, 'YYYY-MM-DD') as date FROM cbt_quizzes WHERE school_id = %s ORDER BY created_at DESC", (current_user.school_id,))
-        quizzes = cur.fetchall(); cur.close(); conn.close(); return jsonify({"data": quizzes})
+        try:
+            cur.execute("""
+                UPDATE students 
+                SET first_name = %s, last_name = %s, current_class = %s, transport_route = %s, boarding_status = %s, house = %s, guardian_contact = %s 
+                WHERE student_id = %s AND school_id = %s
+            """, (d.get('first_name'), d.get('last_name'), d.get('current_class'), d.get('transport_route'), d.get('boarding_status'), d.get('house'), d.get('guardian_contact'), student_id, current_user.school_id))
+            cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Edited Student Profile', f"ID {student_id}"))
+            conn.commit(); return jsonify({"message": f"Student ID {student_id} updated successfully."}), 200
+        except Exception as e:
+            conn.rollback(); return jsonify({"error": f"Update failed: {str(e)}"}), 500
+        finally: cur.close(); conn.close()
+    elif request.method == 'DELETE':
+        try:
+            cur.execute("SELECT photo_key FROM students WHERE student_id = %s AND school_id = %s", (student_id, current_user.school_id))
+            student = cur.fetchone()
+            if not student: return jsonify({"error": "Student record not found."}), 404
+            cur.execute("DELETE FROM students WHERE student_id = %s AND school_id = %s", (student_id, current_user.school_id))
+            cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Deleted Student Record', f"ID {student_id}"))
+            conn.commit()
+            if student['photo_key'] and AWS_BUCKET_NAME:
+                try: s3_client.delete_object(Bucket=AWS_BUCKET_NAME, Key=student['photo_key'])
+                except: pass
+            return jsonify({"message": f"Student ID {student_id} permanently deleted."}), 200
+        except Exception as e:
+            conn.rollback(); return jsonify({"error": f"Database Error: {str(e)}"}), 500
+        finally: cur.close(); conn.close()
+
+# --- OLD REPORT, ANALYTICS, SETTINGS ROUTES CONTINUED UNMODIFIED BELOW ---
+@app.route('/api/students/bulk', methods=['POST'])
+@login_required
+def bulk_enroll():
+    if current_user.role != 'admin': return jsonify({"error": "Admin only"}), 403
+    if 'file' not in request.files: return jsonify({"error": "No file uploaded"}), 400
+    file = request.files['file']
+    try:
+        stream = StringIO(file.stream.read().decode("UTF8"), newline=None)
+        csv_input = csv.reader(stream); next(csv_input, None) 
+        conn = get_db_connection(); cur = conn.cursor(); count = 0
+        for row in csv_input:
+            if len(row) >= 2: 
+                fname = row[0].strip()[:100]; lname = row[1].strip()[:100]; c_class = row[2].strip()[:100] if len(row) > 2 and row[2].strip() else 'Unassigned'
+                g_name = row[3].strip()[:100] if len(row) > 3 and row[3].strip() else 'N/A'; g_contact = row[4].strip()[:20] if len(row) > 4 and row[4].strip() else ''
+                b_status = row[5].strip()[:20] if len(row) > 5 and row[5].strip() else 'Day'; house = row[6].strip()[:100] if len(row) > 6 and row[6].strip() else 'Unassigned'
+                cur.execute("INSERT INTO students (school_id, first_name, last_name, current_class, guardian_name, guardian_contact, boarding_status, house) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                            (current_user.school_id, fname, lname, c_class, g_name, g_contact, b_status, house))
+                count += 1
+        cur.execute("INSERT INTO audit_logs (school_id, user_email, action, target) VALUES (%s, %s, %s, %s)", (current_user.school_id, current_user.email, 'Bulk CSV Enrollment', f"Enrolled {count} students"))
+        conn.commit(); return jsonify({"message": f"Bulk Upload Success! Enrolled {count} students."}), 201
+    except Exception as e: return jsonify({"error": f"Upload failed. Ensure CSV format is correct. Error: {str(e)}"}), 500
+    finally:
+        if 'cur' in locals(): cur.close(); conn.close()
 
 @app.route('/api/photo/<int:student_id>', methods=['GET'])
 def get_photo(student_id):
@@ -706,46 +512,8 @@ def get_photo(student_id):
         try:
             file_obj = s3_client.get_object(Bucket=AWS_BUCKET_NAME, Key=student['photo_key'])
             return Response(file_obj['Body'].read(), mimetype='image/jpeg')
-        except: pass
+        except Exception: pass
     return Response('<svg xmlns="http://www.w3.org/2000/svg" width="70" height="90"><rect width="70" height="90" fill="#eee"/><text x="15" y="50" font-family="Arial" font-size="12" fill="#999">PHOTO</text></svg>', mimetype='image/svg+xml')
-
-@app.route('/api/logo/<int:school_id>', methods=['GET'])
-def get_school_logo(school_id):
-    conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT logo_key FROM institutions WHERE school_id = %s", (school_id,))
-    inst = cur.fetchone(); cur.close(); conn.close()
-    if inst and inst['logo_key'] and AWS_BUCKET_NAME:
-        try:
-            file_obj = s3_client.get_object(Bucket=AWS_BUCKET_NAME, Key=inst['logo_key'])
-            return Response(file_obj['Body'].read(), mimetype='image/png')
-        except: pass
-    return Response('<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" style="background:var(--primary); padding:10px; border-radius:12px;"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>', mimetype='image/svg+xml')
-
-@app.route('/print_ids', methods=['GET'])
-@login_required
-def print_ids():
-    conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT student_id, first_name, last_name, current_class, boarding_status, house FROM students WHERE school_id = %s ORDER BY student_id", (current_user.school_id,))
-    students = cur.fetchall()
-    cur.execute("SELECT school_name, address, phone, primary_color FROM institutions WHERE school_id = %s", (current_user.school_id,))
-    inst = cur.fetchone(); cur.close(); conn.close(); primary_color = inst['primary_color'] or '#0f4c81'
-    
-    html = f"""<!DOCTYPE html><html><head><title>Print IDs</title><style>
-        body {{ font-family:Arial; background:#f0f0f0; padding:20px; }}
-        .page {{ display:grid; grid-template-columns:repeat(2,1fr); gap:15px; max-width:800px; margin:auto; }}
-        .id-card {{ background:white; border:2px solid {primary_color}; border-radius:8px; padding:15px; width:350px; height:200px; box-sizing:border-box; position:relative; overflow:hidden; }}
-        .header {{ background:{primary_color}; color:white; text-align:center; padding:5px; margin:-15px -15px 10px -15px; border-radius:6px 6px 0 0; font-weight:bold; font-size:14px; }}
-        .photo-box {{ width:70px; height:90px; border:1px solid #ccc; float:left; margin-right:12px; background:#eee; }}
-        .details {{ float:left; font-size:11px; line-height:1.5; width:150px; }}
-        .qr-box {{ float:right; width:70px; height:70px; }}
-        .footer {{ position:absolute; bottom:0; left:0; width:100%; background:#eee; text-align:center; font-size:9px; padding:4px 0; font-weight:bold; }}
-        @media print {{ body {{ background:white; padding:0; }} .no-print {{ display:none; }} }}
-    </style></head><body><button class='no-print' onclick='window.print()' style='padding:10px; margin-bottom:20px; cursor:pointer;'>🖨️ Print IDs</button><div class='page'>"""
-    for s in students:
-        c_name = s.get('current_class') or 'N/A'; qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=70x70&data=VERIFIED:{inst['school_name']}:STU-{s['student_id']}"
-        html += f"""<div class='id-card'><div class='header'>{inst['school_name']}</div><div class='photo-box'><img src='/api/photo/{s['student_id']}' style='width:100%; height:100%; object-fit:cover;'></div><div class='details'><strong>Name:</strong> {s['first_name']} {s['last_name']}<br><strong>ID:</strong> {inst['school_name'][:3].upper()}-{s['student_id']:04d}<br><strong>Class:</strong> {c_name}<br><strong>Status:</strong> {s['boarding_status']}</div><div class='qr-box'><img src='{qr_url}' style='width:100%; height:100%;'></div><div class='footer'>CONTACT: {inst['phone']} | {inst['address']}</div></div>"""
-    html += "</div></body></html>"
-    return html
 
 @app.route('/print_report/<int:student_id>', methods=['GET'])
 @login_required
@@ -754,80 +522,83 @@ def print_report(student_id):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT * FROM students WHERE student_id = %s AND school_id = %s", (student_id, current_user.school_id))
     student = cur.fetchone()
-    if not student: return "Student not found.", 404
+    if not student: return "Student record not found or access denied.", 404
     cur.execute("SELECT school_name, address, phone, primary_color FROM institutions WHERE school_id = %s", (current_user.school_id,))
     inst = cur.fetchone(); primary_color = inst['primary_color'] or '#0f4c81'
     cur.execute("SELECT sub.subject_name, g.class_score, g.exam_score, g.total_score, g.waec_grade, g.teacher_remarks, g.term, g.academic_year FROM grades g JOIN subjects sub ON g.subject_id = sub.subject_id WHERE g.student_id = %s AND g.school_id = %s ORDER BY g.academic_year DESC, g.term DESC, sub.subject_name", (student_id, current_user.school_id))
     grades = cur.fetchall(); cur.close(); conn.close()
 
-    rows = ""
-    for g in grades: rows += f"<tr><td>{g['subject_name']}</td><td>{g['class_score']}</td><td>{g['exam_score']}</td><td><strong>{g['total_score']}</strong></td><td><strong>{g['waec_grade']}</strong></td><td>{g['teacher_remarks']}</td><td>{g['term']} ({g['academic_year']})</td></tr>"
-    if not rows: rows = "<tr><td colspan='7' style='text-align:center;'>No academic records found.</td></tr>"
+    table_rows = ""
+    for g in grades: table_rows += f"<tr><td>{g['subject_name']}</td><td>{g['class_score']}</td><td>{g['exam_score']}</td><td><strong>{g['total_score']}</strong></td><td><strong>{g['waec_grade']}</strong></td><td>{g['teacher_remarks']}</td><td>{g['term']} ({g['academic_year']})</td></tr>"
+    if not table_rows: table_rows = "<tr><td colspan='7' style='text-align:center;'>No academic records found for this student.</td></tr>"
 
-    html = f"""<!DOCTYPE html><html><head><title>Report | {student['first_name']} {student['last_name']}</title><style>:root {{ --primary: {primary_color}; }} body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #eee; padding: 20px; color: #333; }} .page {{ background: white; max-width: 900px; margin: auto; padding: 40px; border-radius: 8px; }} .header {{ display: flex; justify-content: space-between; border-bottom: 3px solid var(--primary); padding-bottom: 20px; margin-bottom: 30px; }} table {{ width: 100%; border-collapse: collapse; margin-bottom: 40px; }} th, td {{ border: 1px solid #ddd; padding: 12px; text-align: left; }} th {{ background: var(--primary); color: white; }} tr:nth-child(even) {{ background-color: #f9f9f9; }} .signatures {{ display: flex; justify-content: space-between; margin-top: 80px; }} .sig-line {{ border-top: 2px solid #333; width: 250px; text-align: center; padding-top: 10px; font-weight: bold; }} @media print {{ body {{ background: white; padding: 0; }} .page {{ box-shadow: none; max-width: 100%; padding: 0; }} .no-print {{ display: none; }} }}</style></head><body><div style="text-align: center;"><button class="no-print" onclick="window.print()" style="padding:10px 20px; cursor:pointer; background:#28a745; color:white; border:none; border-radius:6px; font-weight:bold; margin-bottom:20px;">🖨️ Print Report</button></div><div class="page"><div class="header"><div style="display:flex; gap: 20px;"><img src="/api/logo/{current_user.school_id}" style="width:90px; height:90px; object-fit:contain;"><div><h1 style="color:var(--primary); margin:0; text-transform:uppercase;">{inst['school_name']}</h1><p style="margin:5px 0;">{inst['address']} | Tel: {inst['phone']}</p><h2 style="margin: 0; color: #555;">TERMINAL REPORT</h2></div></div><img src="/api/photo/{student['student_id']}" style="width:110px; height:130px; object-fit:cover; border:2px solid var(--primary);"></div><p><strong>NAME:</strong> {student['first_name'].upper()} {student['last_name'].upper()} &nbsp;&nbsp;|&nbsp;&nbsp; <strong>CLASS:</strong> {student['current_class']} &nbsp;&nbsp;|&nbsp;&nbsp; <strong>STATUS:</strong> {student['boarding_status']}</p><table><tr><th>Subject</th><th>Class (30%)</th><th>Exam (70%)</th><th>Total (100%)</th><th>Grade</th><th>Remarks</th><th>Term</th></tr>{rows}</table><div class="signatures"><div class="sig-line">Class Teacher's Signature</div><div class="sig-line">Headmaster's Signature</div></div></div></body></html>"""
+    html = f"""<!DOCTYPE html><html><head><title>Terminal Report | {student['first_name']} {student['last_name']}</title><style>:root {{ --primary: {primary_color}; }} body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #eee; padding: 20px; color: #333; }} .page {{ background: white; max-width: 900px; margin: auto; padding: 40px; box-shadow: 0 0 15px rgba(0,0,0,0.1); border-radius: 8px; }} .header {{ display: flex; justify-content: space-between; border-bottom: 3px solid var(--primary); padding-bottom: 20px; margin-bottom: 30px; }} .school-name {{ color: var(--primary); font-size: 28px; font-weight: bold; margin: 0 0 5px 0; text-transform: uppercase; }} .student-details {{ font-size: 16px; line-height: 1.8; margin-top: 15px; }} .photo {{ width: 120px; height: 140px; border: 2px solid var(--primary); object-fit: cover; border-radius: 5px; }} table {{ width: 100%; border-collapse: collapse; margin-bottom: 40px; }} th, td {{ border: 1px solid #ddd; padding: 12px; text-align: left; font-size: 14px; }} th {{ background: var(--primary); color: white; text-transform: uppercase; font-size: 13px; }} tr:nth-child(even) {{ background-color: #f9f9f9; }} .signatures {{ display: flex; justify-content: space-between; margin-top: 80px; padding: 0 20px; }} .sig-line {{ border-top: 2px solid #333; width: 250px; text-align: center; padding-top: 10px; font-weight: bold; font-size: 14px; text-transform: uppercase; }} .btn-print {{ padding:12px 25px; margin-bottom:20px; cursor:pointer; background:#28a745; color:white; border:none; border-radius:8px; font-weight:bold; font-size: 16px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }} @media print {{ body {{ background: white; padding: 0; }} .page {{ box-shadow: none; max-width: 100%; padding: 0; }} .no-print {{ display: none; }} }}</style></head><body><div style="text-align: center;"><button class="no-print btn-print" onclick="window.print()">🖨️ Print Official Report</button></div><div class="page"><div class="header"><div style="display:flex; gap: 20px;"><img src="/api/logo/{current_user.school_id}" style="width:90px; height:90px; object-fit:contain;"><div><h1 class="school-name">{inst['school_name']}</h1><div style="font-size:12px; color:#666; margin-bottom:15px;">{inst['address']} | Tel: {inst['phone']}</div><h2 style="margin: 0 0 10px 0; color: #555;">OFFICIAL TERMINAL REPORT</h2></div></div></div><div style="display:flex; justify-content: space-between; align-items: flex-end; margin-bottom: 25px;"><div class="student-details"><strong>STUDENT NAME:</strong> {student['first_name'].upper()} {student['last_name'].upper()}<br><strong>STUDENT ID:</strong> {inst['school_name'][:3].upper()}-{student['student_id']:04d}<br><strong>CURRENT CLASS:</strong> {student['current_class'].upper()}<br><strong>BOARDING STATUS:</strong> {student['boarding_status'].upper()}</div><img src="/api/photo/{student['student_id']}" class="photo"></div><table><tr><th>Subject</th><th>Class (30%)</th><th>Exam (70%)</th><th>Total (100%)</th><th>Grade</th><th>Teacher's Remarks</th><th>Academic Term</th></tr>{table_rows}</table><div class="signatures"><div class="sig-line">Class Teacher's Signature</div><div class="sig-line">Headmaster's Signature</div></div></div></body></html>"""
     return html
 
-@app.route('/print_transcript/<int:student_id>', methods=['GET'])
+@app.route('/print_ids', methods=['GET'])
 @login_required
-def print_transcript(student_id):
+def print_ids():
     conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT * FROM students WHERE student_id = %s AND school_id = %s", (student_id, current_user.school_id))
-    student = cur.fetchone()
-    if not student: return "Student record not found.", 404
+    cur.execute("SELECT student_id, first_name, last_name, current_class, boarding_status, house FROM students WHERE school_id = %s ORDER BY student_id", (current_user.school_id,))
+    students = cur.fetchall()
     cur.execute("SELECT school_name, address, phone, primary_color FROM institutions WHERE school_id = %s", (current_user.school_id,))
-    inst = cur.fetchone(); primary_color = inst['primary_color'] or '#0f4c81'
-    cur.execute("""SELECT sub.subject_name, g.class_score, g.exam_score, g.total_score, g.waec_grade, g.academic_year, g.term FROM grades g JOIN subjects sub ON g.subject_id = sub.subject_id WHERE g.student_id = %s AND g.school_id = %s ORDER BY g.academic_year ASC, g.term ASC, sub.subject_name ASC""", (student_id, current_user.school_id))
-    records = cur.fetchall(); cur.close(); conn.close()
+    inst = cur.fetchone(); cur.close(); conn.close()
+    primary_color = inst['primary_color'] or '#0f4c81'
     
-    rows = ""
-    for r in records: rows += f"<tr><td>{r['academic_year']}</td><td>{r['term']}</td><td>{r['subject_name']}</td><td>{r['class_score']}</td><td>{r['exam_score']}</td><td><strong>{r['total_score']}%</strong></td><td><strong>{r['waec_grade']}</strong></td></tr>"
-    html = f"""<!DOCTYPE html><html><head><title>Transcript | {student['first_name']} {student['last_name']}</title><style>body {{ font-family: 'Times New Roman', Times, serif; background: #eee; padding: 20px; }} .sheet {{ background: white; max-width: 900px; margin: auto; padding: 50px; border: 3px double #333; position: relative; box-shadow: 0 0 10px rgba(0,0,0,0.1); }} .header {{ text-align: center; border-bottom: 2px solid #333; padding-bottom: 20px; margin-bottom: 30px; }} table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }} th, td {{ border: 1px solid #333; padding: 8px 12px; font-size: 13px; text-align: left; }} th {{ background: #f2f2f2; text-transform: uppercase; }} .stamp-box {{ margin-top: 60px; display: flex; justify-content: space-between; }} .stamp {{ border-top: 1px solid #333; width: 220px; text-align: center; padding-top: 5px; font-weight: bold; font-size: 12px; }}</style></head><body><div style="text-align:center; margin-bottom:20px;"><button onclick="window.print()" style="padding:10px 20px; font-weight:bold; cursor:pointer;">🖨️ Print Transcript</button></div><div class="sheet"><div class="header"><h1 style="margin:0; text-transform:uppercase; font-size:26px; color:{primary_color};">{inst['school_name']}</h1><p style="margin:5px 0;">{inst['address']} | Tel: {inst['phone']}</p><h2 style="margin-top:15px; font-size:18px; text-decoration:underline;">OFFICIAL ACADEMIC TRANSCRIPT</h2></div><p><strong>Candidate:</strong> {student['first_name'].upper()} {student['last_name'].upper()} &nbsp;&nbsp;|&nbsp;&nbsp; <strong>Student ID:</strong> {inst['school_name'][:3].upper()}-{student['student_id']:04d} &nbsp;&nbsp;|&nbsp;&nbsp; <strong>Class:</strong> {student['current_class']}</p><table><tr><th>Academic Year</th><th>Term</th><th>Subject</th><th>Class (30)</th><th>Exam (70)</th><th>Total</th><th>Grade</th></tr>{rows}</table><div class="stamp-box"><div class="stamp">Academic Registrar</div><div class="stamp">Head of Institution / Stamp</div></div></div></body></html>"""
+    html = f"<!DOCTYPE html><html><head><title>Print IDs</title><style>body{{font-family:Arial;background:#f0f0f0;padding:20px;}}.page{{display:grid;grid-template-columns:repeat(2,1fr);gap:15px;max-width:800px;margin:auto;}}.id-card{{background:white;border:2px solid {primary_color};border-radius:8px;padding:15px;width:350px;height:200px;box-sizing:border-box;position:relative;overflow:hidden;}}.header{{background:{primary_color};color:white;text-align:center;padding:5px;margin:-15px -15px 10px -15px;border-radius:6px 6px 0 0;font-weight:bold;font-size:14px;}}.photo-box{{width:70px;height:90px;border:1px solid #ccc;float:left;margin-right:15px;background:#eee;}}.details{{float:left;font-size:12px;line-height:1.6;width:calc(100% - 90px);}}.footer{{position:absolute;bottom:0;left:0;width:100%;background:#eee;text-align:center;font-size:10px;padding:5px 0;font-weight:bold;}}@media print{{body{{background:white;padding:0;}}.no-print{{display:none;}}}}</style></head><body><button class='no-print' onclick='window.print()' style='padding:10px;margin-bottom:20px;cursor:pointer;'>🖨️ Print IDs</button><div class='page'>"
+    for s in students:
+        class_str = s.get('current_class') if s.get('current_class') and s.get('current_class') != 'Unassigned' else 'N/A'
+        html += f"<div class='id-card'><div class='header'>{inst['school_name']}</div><div class='photo-box'><img src='/api/photo/{s['student_id']}' style='width:100%;height:100%;object-fit:cover;'></div><div class='details'><strong>Name:</strong> {s['first_name']} {s['last_name']}<br><strong>ID:</strong> {inst['school_name'][:3].upper()}-{s['student_id']:04d}<br><strong>Class/Prog:</strong> {class_str}<br><strong>Status:</strong> {s['boarding_status']}</div><div class='footer'>CONTACT: {inst['phone']} | {inst['address']}</div></div>"
+    html += "</div></body></html>"
     return html
 
-# --- DASHBOARD ENGINE ---
+# --- 8. THE FRONTEND DASHBOARD WITH ALL 5 MODULES ---
 @app.route('/dashboard')
 def dashboard():
-    school_name = "Global ERP Engine"
-    primary_color = "#0f4c81"
-    try:
-        if current_user.is_authenticated and getattr(current_user, 'school_id', None):
-            conn = get_db_connection(); cur = conn.cursor()
-            cur.execute("SELECT school_name, primary_color FROM institutions WHERE school_id = %s", (current_user.school_id,))
-            inst = cur.fetchone(); cur.close(); conn.close()
-            if inst:
-                school_name = inst['school_name']
-                primary_color = inst['primary_color'] or "#0f4c81"
-    except: pass
+    school_name = "Global ERP Engine"; primary_color = "#0f4c81"
+    if current_user.is_authenticated and current_user.school_id:
+        conn = get_db_connection(); cur = conn.cursor()
+        cur.execute("SELECT school_name, primary_color FROM institutions WHERE school_id = %s", (current_user.school_id,))
+        inst = cur.fetchone(); cur.close(); conn.close()
+        if inst: school_name = inst['school_name']; primary_color = inst['primary_color'] or "#0f4c81"
 
-    # THE FULL UNTRUNCATED FRONTEND HTML
     html_template = """
     <!DOCTYPE html>
     <html lang="en">
     <head>
-        <meta charset="UTF-8"><title>{{ school_name }} | ERP Portal</title>
+        <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{{ school_name }} | ERP Portal</title>
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
-            :root { --primary: {{ primary_color }}; --secondary: #f4f7fa; --accent: #28a745; --danger: #dc3545; --info: #17a2b8; --warning: #ffc107; }
-            body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--secondary); margin: 0; display: flex; color: #333; }
+            :root { --primary: {{ primary_color }}; --secondary: #f4f7fa; --accent: #28a745; --text: #333; --danger: #dc3545; --info: #17a2b8; --warning: #ffc107;}
+            body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--secondary); margin: 0; display: flex; color: var(--text); }
+            
             .sidebar { width: 260px; background: var(--primary); color: white; min-height: 100vh; padding: 20px; box-sizing: border-box; position: fixed; overflow-y: auto; box-shadow: 2px 0 15px rgba(0,0,0,0.1); z-index: 100;}
-            .sidebar-header { margin-bottom: 25px; padding-bottom: 15px; border-bottom: 1px solid rgba(255,255,255,0.15); display: flex; align-items: center; gap: 12px; }
-            .sidebar h2 { margin: 0; font-size: 1.1rem; line-height: 1.3; font-weight: 600;}
-            .sidebar button { background: transparent; color: rgba(255,255,255,0.85); border: none; padding: 10px 14px; width: 100%; text-align: left; margin-bottom: 4px; border-radius: 8px; cursor: pointer; transition: all 0.2s ease; font-size: 0.95rem; font-weight: 500;}
-            .sidebar button:hover { background: rgba(255,255,255,0.15); color: white; padding-left: 18px;}
-            .main-content { margin-left: 260px; flex: 1; padding: 35px; box-sizing: border-box; min-height: 100vh; }
-            .card { background: white; padding: 28px; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.04); border: 1px solid #eaeaea; margin-bottom: 25px;}
+            .sidebar-header { margin-bottom: 30px; padding-bottom: 15px; border-bottom: 1px solid rgba(255,255,255,0.15); display: flex; align-items: center; gap: 12px; }
+            .sidebar h2 { margin: 0; font-size: 1.1rem; line-height: 1.3; font-weight: 600; letter-spacing: 0.5px;}
+            .sidebar button { background: transparent; color: rgba(255,255,255,0.85); border: none; padding: 10px 15px; width: 100%; text-align: left; margin-bottom: 5px; border-radius: 8px; cursor: pointer; transition: all 0.2s ease; font-size: 0.95rem; font-weight: 500;}
+            .sidebar button:hover { background: rgba(255,255,255,0.15); color: white; padding-left: 20px;}
+            
+            .main-content { margin-left: 260px; flex: 1; padding: 40px; box-sizing: border-box; min-height: 100vh; }
+            
+            .card { background: white; padding: 30px; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.04); border: 1px solid #eaeaea; margin-bottom: 25px; transition: transform 0.2s ease;}
             h3 { margin-top: 0; color: var(--primary); border-bottom: 2px solid #f0f0f0; padding-bottom: 10px; margin-bottom: 20px;}
-            input, select, textarea { width: 100%; padding: 12px; margin-bottom: 15px; border: 1px solid #ced4da; border-radius: 8px; box-sizing: border-box; font-family: inherit;}
+            
+            input, select, textarea { width: 100%; padding: 12px; margin-bottom: 15px; border: 1px solid #ced4da; border-radius: 8px; box-sizing: border-box; transition: all 0.2s ease; font-family: inherit;}
             input:focus, select:focus, textarea:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(0,0,0,0.05); }
-            .btn { background: var(--primary); color: white; border: none; padding: 12px 20px; border-radius: 8px; cursor: pointer; font-weight: bold; width: 100%; margin-bottom: 10px; transition: all 0.2s ease; box-shadow: 0 4px 6px rgba(0,0,0,0.1);}
+            
+            .btn { background: var(--primary); color: white; border: none; padding: 12px 20px; border-radius: 8px; cursor: pointer; font-weight: bold; width: 100%; margin-bottom: 10px; transition: all 0.3s ease; box-shadow: 0 4px 6px rgba(0,0,0,0.1);}
             .btn:hover { transform: translateY(-2px); box-shadow: 0 6px 12px rgba(0,0,0,0.15); filter: brightness(1.05);}
             .btn-success { background: var(--accent); } .btn-danger { background: var(--danger); } .btn-info { background: var(--info); } .btn-warning { background: var(--warning); color: #333;}
+            
             .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-            .metric-box { padding: 20px; border-radius: 12px; color: white; text-align: center; font-size: 1.1rem; font-weight: bold;}
-            #toast { display: none; position: fixed; bottom: 30px; right: 30px; padding: 15px 25px; color: white; background: var(--accent); border-radius: 8px; z-index: 1000; font-weight: bold; box-shadow: 0 10px 30px rgba(0,0,0,0.2);}
+            .metric-box { padding: 20px; border-radius: 12px; color: white; text-align: center; font-size: 1.1rem; font-weight: bold; box-shadow: 0 4px 15px rgba(0,0,0,0.1);}
+            
+            #toast { display: none; position: fixed; bottom: 30px; right: 30px; padding: 15px 25px; color: white; background: var(--accent); border-radius: 8px; z-index: 1000; font-weight: bold; box-shadow: 0 10px 30px rgba(0,0,0,0.2); animation: fadein 0.5s;}
             .hidden { display: none !important; }
             .table-row { transition: background 0.2s ease; }
             .table-row:hover { background-color: #f8f9fa !important; }
+            
+            @keyframes fadein { from {bottom: 0; opacity: 0;} to {bottom: 30px; opacity: 1;} }
         </style>
     </head>
     <body>
@@ -835,20 +606,20 @@ def dashboard():
         <div class="sidebar">
             <div class="sidebar-header">
                 {% if current_user.is_authenticated and current_user.school_id %}
-                    <img src="/api/logo/{{ current_user.school_id }}" style="width: 42px; height: 42px; object-fit: contain; background: white; border-radius: 8px; padding: 2px;">
+                    <img src="/api/logo/{{ current_user.school_id }}" style="width: 45px; height: 45px; object-fit: contain; background: white; border-radius: 8px; padding: 2px;">
                 {% else %}
-                    <span style="font-size: 28px;">🌍</span>
+                    <span style="font-size: 30px;">🌍</span>
                 {% endif %}
                 <h2>{{ school_name }}</h2>
             </div>
             
             {% if current_user.is_authenticated %}
-                <div style="font-size: 0.8rem; color: rgba(255,255,255,0.6); margin-bottom: 20px; text-transform: uppercase; font-weight: bold;">Role: {{ current_user.role }}</div>
+                <div style="font-size: 0.8rem; color: rgba(255,255,255,0.6); margin-bottom: 20px; text-transform: uppercase; font-weight: bold; letter-spacing: 1px;">Access Level: {{ current_user.role }}</div>
                 
                 {% if current_user.role == 'superadmin' %}
                     <button onclick="window.location.reload()">🏢 Global Tenants</button>
                     <button onclick="showSection('sa-settings-section')">⚙️ Master Settings</button>
-                    <button class="btn-success" onclick="sendAction('/api/setup_db', {}, true)" style="color:white; margin-top:20px;">🔄 Sync Engine</button>
+                    <button class="btn-success" onclick="sendAction('/api/setup_db', {}, true)" style="color:white; margin-top:20px;">🔄 Sync Database Engine</button>
                 
                 {% elif current_user.role == 'admin' %}
                     <button onclick="showSection('analytics-section')">📊 Corporate Dashboard</button>
@@ -856,11 +627,14 @@ def dashboard():
                     <button onclick="showSection('admissions-section')">🎓 Admissions & Directory</button>
                     <button onclick="showSection('attendance-section')">📅 Roll Call & Feeding</button>
                     <button onclick="showSection('academics-section')">📚 Academic Reporting</button>
+                    
+                    <!-- NEW ENTERPRISE MODULES -->
                     <button onclick="showSection('transport-section')">🚌 Transport Logistics</button>
                     <button onclick="showSection('store-section')">📦 School Store & POS</button>
                     <button onclick="showSection('exeat-section')">🎫 Boarding & Exeats</button>
                     <button onclick="showSection('sickbay-section')">🏥 Sick Bay Log</button>
                     <button onclick="showSection('calendar-section')">📅 Academic Calendar</button>
+                    
                     <button onclick="showSection('sms-section')">📟 Live SMS Gateway</button>
                     <button onclick="showSection('hr-section')">🧑‍🏫 Staff HR & Portals</button>
                     <button onclick="secureSection('settings-section')">⚙️ Security & Settings 🔒</button>
@@ -877,21 +651,34 @@ def dashboard():
                     <button onclick="showSection('settings-section')">⚙️ Account Security</button>
                 {% endif %}
                 
-                <div style="margin-top: 30px; padding-bottom: 20px;">
-                    <button class="btn-danger" style="color:white;" onclick="logout()">🛑 Secure Logout</button>
+                <div style="margin-top: 40px; padding-bottom: 20px;">
+                    <button class="btn-danger" style="color:white; box-shadow: 0 4px 15px rgba(220,53,69,0.3);" onclick="logout()">🛑 Secure Logout</button>
                 </div>
             {% else %}
-                <button class="btn-success" style="color:white;" onclick="sendAction('/api/setup_db', {}, true)">Sync System</button>
+                <button class="btn-success" style="color:white;" onclick="sendAction('/api/setup_db', {}, true)">1. Sync System Core</button>
             {% endif %}
         </div>
 
         <main class="main-content">
+            {% if current_user.is_authenticated and current_user.school_id %}
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 30px;">
+                <div>
+                    <h1 style="margin:0; color: var(--primary); font-size: 28px;">Enterprise Control Panel</h1>
+                    <p style="margin: 5px 0 0 0; color: #666;">Welcome back to the {{ school_name }} administration portal.</p>
+                </div>
+            </div>
+            {% else %}
+                <h1 style="color: var(--primary); margin-bottom: 30px;">System Gateway</h1>
+            {% endif %}
+
             {% if not current_user.is_authenticated %}
-            <div class="card" style="max-width: 400px; margin: 50px auto; border-top: 5px solid var(--primary);">
+            <div class="card" style="max-width: 400px; margin: 50px auto; border-top: 5px solid var(--primary);" id="login-box">
                 <h3 style="text-align: center; border:none;">Authorized Personnel Only</h3>
-                <input type="email" id="email" placeholder="Official Email Address">
-                <input type="password" id="pass" placeholder="Secure Password">
-                <button class="btn" style="margin-top: 10px;" onclick="login()">Authenticate Login</button>
+                <div id="login-fields">
+                    <input type="email" id="email" placeholder="Official Email Address">
+                    <input type="password" id="pass" placeholder="Secure Password">
+                    <button class="btn" style="margin-top: 10px;" onclick="login()">Authenticate Login</button>
+                </div>
             </div>
             
             {% elif current_user.role == 'guardian' %}
@@ -907,20 +694,15 @@ def dashboard():
                         <button class="btn btn-warning" style="width:auto; color: #333;" onclick="loadStatement({{ current_user.linked_student_id }})">View Financial Ledger</button>
                     </div>
                 </div>
-                <hr style="margin:20px 0; border:1px solid #eee;">
-                <h4>Pay Fees via Mobile Money</h4>
-                <div class="grid-2">
-                    <input type="number" id="momoFeeId" placeholder="Target Fee ID">
-                    <input type="number" id="momoAmount" placeholder="Amount (GHS)">
-                </div>
-                <input type="text" id="momoPhone" placeholder="MoMo Phone Number (e.g. 0244123456)">
-                <button class="btn btn-warning" onclick="initiateMoMo()">Authorize MoMo Payment</button>
             </div>
 
             {% elif current_user.role == 'superadmin' %}
-            <div id="sa-settings-section" class="card hidden">
-                <h3>⚙️ Master Settings</h3>
-                <div class="grid-2"><input type="email" id="saNewEmail" placeholder="New Email"><input type="password" id="saNewPass" placeholder="New Password"></div>
+            <div id="sa-settings-section" class="card admin-section hidden" style="border: 2px solid #333;">
+                <h3>⚙️ Master Settings & Credentials</h3>
+                <div class="grid-2">
+                    <input type="email" id="saNewEmail" placeholder="New Super Admin Email (Optional)">
+                    <input type="password" id="saNewPass" placeholder="New Secure Password (Optional)">
+                </div>
                 <button class="btn" style="background:#333;" onclick="updateSACredentials()">Update Master Credentials</button>
             </div>
             <div class="card" style="border: 2px solid var(--accent);">
@@ -951,8 +733,10 @@ def dashboard():
                 <button class="btn btn-danger" onclick="saResetAdmin()">Execute Global Override</button>
             </div>
             <div class="card">
-                <h3>Global Server Tenants</h3>
-                <button class="btn" onclick="loadSchools()">🔄 Refresh Server Data</button>
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 20px;">
+                    <h3 style="margin:0; border:none;">Global Server Tenants</h3>
+                    <button class="btn" style="width:auto; margin:0;" onclick="loadSchools()">🔄 Refresh Server Data</button>
+                </div>
                 <div id="school-container"></div>
             </div>
 
@@ -972,13 +756,13 @@ def dashboard():
                     </div>
                 </div>
 
-                <!-- Financials Section -->
+                <!-- Financials Section (Vault Locked) -->
                 <div id="finance-section" class="card admin-section hidden" style="border-top: 5px solid var(--danger);">
-                    <h3>💰 Financial Ledger & Billing Operations</h3>
+                    <h3>💰 Financial Ledger & Billing Operations (SECURED)</h3>
                     <div class="grid-2">
                         <div>
                             <div style="background: #f8f9fa; padding: 20px; border-radius: 12px; margin-bottom: 20px; border: 1px solid #eee;">
-                                <h4 style="margin-top:0; color: var(--primary);">1. Issue Segmented Bill</h4>
+                                <h4 style="margin-top:0; color: var(--primary);">1. Issue Segmented Bill (Individual)</h4>
                                 <input type="number" id="bStuId" placeholder="Student ID (Required)">
                                 <select id="bCat"><option value="Consolidated Fee">Consolidated Term Fee</option><option value="Tuition">Tuition Fee</option><option value="PTA Dues">PTA Dues</option><option value="Feeding Fee">Feeding Fee</option><option value="Exams Fee">Exams Fee</option><option value="Arrears (Past Term)">Arrears (Past Term)</option></select>
                                 <div class="grid-2"><input type="text" id="bTerm" placeholder="Term"><input type="text" id="bYear" placeholder="Year"></div>
@@ -1053,10 +837,6 @@ def dashboard():
                                 <button class="btn btn-warning" style="color:#333;" onclick="window.open('/print_ids', '_blank')">🖨️ Print Batch IDs</button>
                                 <button class="btn btn-info" onclick="loadRoster()">View Directory</button>
                             </div>
-                            <div style="margin-top: 15px;" class="grid-2">
-                                <input type="number" id="trStuId" placeholder="ID for Transcript">
-                                <button class="btn btn-primary" onclick="generateTranscript()">📜 Get Transcript</button>
-                            </div>
                         </div>
                         <div style="background: #fff3cd; padding: 20px; border-radius: 12px; border: 1px solid var(--warning); margin-bottom: 20px;">
                             <h4 style="margin-top:0; color: #856404;">✏️ Data Correction Editor</h4>
@@ -1086,7 +866,8 @@ def dashboard():
                     </div>
                     <div>
                         <div style="background: #e9ecef; padding: 20px; border-radius: 12px; border: 1px solid #ccc; height:100%; box-sizing:border-box;">
-                            <h3 style="margin-top:0; color:#333;">Active Transport Routes</h3>
+                            <h3 style="margin-top:0; color:#333;">Transport Logistics</h3>
+                            <p style="font-size:0.9rem; color:#555;">To assign a student to a bus route, use the <b>Admissions</b> tab (Edit Data Correction tool) to update their Transport Route field.</p>
                             <button class="btn btn-info" onclick="loadTransport()">View All Active Routes</button>
                         </div>
                     </div>
@@ -1109,6 +890,7 @@ def dashboard():
                     <div>
                         <div style="background: #e9ecef; padding: 20px; border-radius: 12px; border: 1px solid #ccc; height:100%; box-sizing:border-box;">
                             <h3 style="margin-top:0; color:#333;">🛒 Point-of-Sale (POS)</h3>
+                            <p style="font-size:0.9rem; color:#555;">Record over-the-counter sales. Stock will automatically deduct.</p>
                             <input type="number" id="posStuId" placeholder="Buyer Student ID">
                             <div class="grid-2">
                                 <input type="number" id="posItemId" placeholder="Item ID">
@@ -1124,6 +906,7 @@ def dashboard():
                     <div>
                         <div style="background: #f8f9fa; padding: 20px; border-radius: 12px; border: 1px solid #eee;">
                             <h3 style="margin-top:0; color:#e83e8c;">🎫 Issue Digital Exeat</h3>
+                            <p style="font-size:0.85rem; color:#666;">Issuing an exeat will immediately trigger a live SMS alert to the student's guardian.</p>
                             <input type="number" id="exStuId" placeholder="Student ID">
                             <select id="exType"><option value="Weekend Exeat">Weekend Exeat</option><option value="Medical Exeat">Medical Emergency</option><option value="Special Permission">Special Permission</option></select>
                             <input type="text" id="exReason" placeholder="Reason for leaving campus">
@@ -1150,24 +933,116 @@ def dashboard():
                             <input type="number" id="sbStuId" placeholder="Student ID">
                             <input type="text" id="sbSymp" placeholder="Symptoms (e.g. High fever, headache)">
                             <input type="text" id="sbTreat" placeholder="Treatment / Action Taken">
-                            <button class="btn" style="background:#d63384;" onclick="sendAction('/api/sickbay', {student_id: document.getElementById('sbStuId').value, symptoms: document.getElementById('sbSymp').value, treatment: document.getElementById('sbTreat').value})">Log Medical Record</button>
+                            <div style="margin-bottom:15px; display:flex; align-items:center; gap:10px;">
+                                <input type="checkbox" id="sbAlert" style="width:20px; height:20px; margin:0;">
+                                <label style="font-weight:bold; color:var(--danger);">SEND EMERGENCY SMS TO PARENT</label>
+                            </div>
+                            <button class="btn" style="background:#d63384;" onclick="sendAction('/api/sickbay', {student_id: document.getElementById('sbStuId').value, symptoms: document.getElementById('sbSymp').value, treatment: document.getElementById('sbTreat').value, alert_parent: document.getElementById('sbAlert').checked})">Log Medical Record</button>
                         </div>
                     </div>
                     <div>
                         <div style="background: #e9ecef; padding: 20px; border-radius: 12px; border: 1px solid #ccc; height:100%; box-sizing:border-box;">
-                            <h3 style="margin-top:0; color:#333;">Infirmary History</h3>
+                            <h3 style="margin-top:0; color:#333;">Infirmary Ledger</h3>
+                            <p style="font-size:0.9rem; color:#555;">Maintain an immutable log of all medical treatments administered on campus to prevent liability.</p>
                             <button class="btn btn-info" onclick="loadSickBay()">View Medical History Logs</button>
                         </div>
                     </div>
                 </div>
 
+                {% endif %}
+
+                <!-- Shared Teacher/Admin/Guardian Sections -->
+                
+                <div id="calendar-section" class="card admin-section hidden" style="border-top: 5px solid #20c997;">
+                    <h3>📅 Academic Master Calendar</h3>
+                    <div class="grid-2">
+                        {% if current_user.role == 'admin' %}
+                        <div style="background: #f8f9fa; padding: 20px; border-radius: 12px; border: 1px solid #eee;">
+                            <h4 style="margin-top:0; color:#20c997;">Add Key Term Event</h4>
+                            <input type="text" id="calTitle" placeholder="Event Title (e.g. Mid-Term Break)">
+                            <input type="date" id="calDate">
+                            <input type="text" id="calDesc" placeholder="Description">
+                            <button class="btn" style="background:#20c997;" onclick="sendAction('/api/calendar', {title: document.getElementById('calTitle').value, date: document.getElementById('calDate').value, desc: document.getElementById('calDesc').value})">Publish to Master Calendar</button>
+                        </div>
+                        {% endif %}
+                        <div style="background: #e9ecef; padding: 20px; border-radius: 12px; border: 1px solid #ccc; {% if current_user.role != 'admin' %}grid-column: span 2;{% endif %}">
+                            <h4 style="margin-top:0; color:#333;">Upcoming Term Events</h4>
+                            <button class="btn btn-info" onclick="loadCalendar()">View Full Calendar</button>
+                        </div>
+                    </div>
+                </div>
+
+                {% if current_user.role in ['admin', 'teacher'] %}
+                <div id="attendance-section" class="card admin-section {% if current_user.role == 'admin' %}hidden{% endif %}" style="border-top: 5px solid var(--info);">
+                    <h3>📅 Daily Roll Call & Feeding Optimization Tracker</h3>
+                    <div style="background: #e9ecef; padding: 25px; border-radius: 12px; max-width: 800px; border: 1px solid #dee2e6;">
+                        <div class="grid-2" style="align-items: end;">
+                            <div>
+                                <label style="font-weight:bold; font-size:0.9rem; color:#555; display:block; margin-bottom:5px;">Select Date</label>
+                                <input type="date" id="attDate" value="" style="margin-bottom:0;">
+                            </div>
+                            <div>
+                                <label style="font-weight:bold; font-size:0.9rem; color:#555; display:block; margin-bottom:5px;">Target Student ID</label>
+                                <input type="number" id="attStuId" placeholder="ID" style="margin-bottom:0;">
+                            </div>
+                        </div>
+                        <div class="grid-2" style="margin-top: 20px;">
+                            <select id="attStatus" style="margin-bottom:0; font-weight:bold;">
+                                <option value="Present">✅ Present (Include in Daily Feeding)</option>
+                                <option value="Absent">❌ Absent (Remove from Daily Feeding)</option>
+                            </select>
+                            <button class="btn btn-info" style="margin-bottom:0;" onclick="sendAction('/api/attendance', {student_id: document.getElementById('attStuId').value, record_date: document.getElementById('attDate').value, status: document.getElementById('attStatus').value})">Commit Attendance Record</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="academics-section" class="card grid-2 admin-section hidden" style="border-top: 5px solid var(--accent);">
+                    <div>
+                        <div style="background: #f8f9fa; padding: 20px; border-radius: 12px; border: 1px solid #eee;">
+                            <h3 style="margin-top:0; border:none; padding:0; margin-bottom:15px; color:var(--primary);">Record SBA Grade (30/70 Matrix)</h3>
+                            <div class="grid-2">
+                                <input type="number" id="gStuId" placeholder="Student ID (Required)">
+                                <input type="text" id="gSub" placeholder="Subject Name">
+                            </div>
+                            <div class="grid-2">
+                                <input type="number" id="gClass" placeholder="Class Score (30%)">
+                                <input type="number" id="gExam" placeholder="Exam Score (70%)">
+                            </div>
+                            <div class="grid-2">
+                                <input type="text" id="gTerm" placeholder="Term (e.g. Term 1)">
+                                <input type="text" id="gYear" placeholder="Year (e.g. 2026)">
+                            </div>
+                            <input type="text" id="gRem" placeholder="Teacher's Qualitative Remark (e.g. Very impressive)">
+                            <button class="btn btn-success" onclick="sendAction('/api/grades', {student_id: document.getElementById('gStuId').value, subject_name: document.getElementById('gSub').value, class_score: document.getElementById('gClass').value, exam_score: document.getElementById('gExam').value, term: document.getElementById('gTerm').value, academic_year: document.getElementById('gYear').value, remarks: document.getElementById('gRem').value})">Save Academic Record to Vault</button>
+                        </div>
+                    </div>
+                    <div>
+                        <div style="background: #e9ecef; padding: 20px; border-radius: 12px; border: 1px solid #dee2e6; height: 100%; box-sizing: border-box;">
+                            <h3 style="margin-top:0; border:none; padding:0; margin-bottom:15px; color:var(--primary);">Terminal Report Generation</h3>
+                            <p style="font-size: 0.9rem; color: #555; line-height: 1.5; margin-bottom: 20px;">Review raw grading inputs in the table viewer to check for data entry errors, or generate a beautifully formatted, official print-ready report card for the student.</p>
+                            <label style="font-weight:bold; font-size:0.9rem; color:#555; display:block; margin-bottom:5px;">Target Student ID</label>
+                            <input type="number" id="repId" placeholder="Enter ID to pull records...">
+                            <div class="grid-2" style="margin-top: 15px;">
+                                <button class="btn btn-info" onclick="loadReport()">View Raw Data</button>
+                                <button class="btn btn-success" onclick="printReportCard()">🖨️ Print Official Report</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                {% endif %}
+
+                {% if current_user.role == 'admin' %}
                 <!-- SMS Desk Section -->
                 <div id="sms-section" class="card admin-section hidden" style="border-top: 5px solid var(--info);">
                     <h3>📟 Live SMS Communication Desk</h3>
                     <div class="grid-2">
                         <div style="background: #f8f9fa; padding: 20px; border-radius: 12px; border: 1px solid #eee;">
                             <label style="font-weight:bold; display:block; margin-bottom:10px; font-size:1.1rem; color:var(--primary);">1. Select Target Audience</label>
-                            <select id="smsAudience" style="font-size:1.05rem; padding:15px;"><option value="all">Broadcast to ALL Active Parents</option><option value="arrears">Only Parents with Unpaid Tuition Arrears</option><option value="boarding">Only Parents of Boarding Students</option></select>
+                            <select id="smsAudience" style="font-size:1.05rem; padding:15px;">
+                                <option value="all">Broadcast to ALL Active Parents</option>
+                                <option value="arrears">Only Parents with Unpaid Tuition Arrears</option>
+                                <option value="boarding">Only Parents of Boarding Students</option>
+                            </select>
                         </div>
                         <div style="background: #e9ecef; padding: 20px; border-radius: 12px; border: 1px solid #dee2e6;">
                             <label style="font-weight:bold; display:block; margin-bottom:10px; font-size:1.1rem; color:var(--primary);">2. Compose Payload</label>
@@ -1182,110 +1057,36 @@ def dashboard():
                     <div>
                         <div style="background: #f8f9fa; padding: 20px; border-radius: 12px; margin-bottom: 20px; border: 1px solid #eee;">
                             <h3 style="margin-top:0; border:none; padding:0; margin-bottom:15px; color:var(--primary);">Register Staff Profile</h3>
-                            <div class="grid-2"><input type="email" id="tEmail" placeholder="Teacher Email (Login ID)"><input type="password" id="tPass" placeholder="Temporary Password"></div>
-                            <div class="grid-2"><input type="text" id="tPhone" placeholder="Mobile Number"><input type="text" id="tSubj" placeholder="Primary Assigned Subject"></div>
+                            <div class="grid-2">
+                                <input type="email" id="tEmail" placeholder="Teacher Email (Login ID)">
+                                <input type="password" id="tPass" placeholder="Temporary Password">
+                            </div>
+                            <div class="grid-2">
+                                <input type="text" id="tPhone" placeholder="Mobile Number">
+                                <input type="text" id="tSubj" placeholder="Primary Assigned Subject">
+                            </div>
                             <input type="number" id="tSal" placeholder="Monthly Base Salary (GHS)">
                             <button class="btn btn-success" onclick="registerStaff()">Add Teacher to HR Directory</button>
                         </div>
+                        
                         <div style="background: #e9ecef; padding: 20px; border-radius: 12px; border: 1px solid #dee2e6;">
                             <h3 style="margin-top:0; border:none; padding:0; margin-bottom:10px; color:var(--primary);">Guardian Portal Access</h3>
-                            <div class="grid-2"><input type="email" id="gEmail" placeholder="Parent Email Address"><input type="password" id="gPass" placeholder="Secure Password"></div>
+                            <div class="grid-2">
+                                <input type="email" id="gEmail" placeholder="Parent Email Address">
+                                <input type="password" id="gPass" placeholder="Secure Password">
+                            </div>
                             <input type="number" id="gStuId" placeholder="Target Linked Student ID">
                             <button class="btn btn-primary" onclick="registerGuardian()">Grant Parent Portal Access</button>
                         </div>
                     </div>
                     <div>
-                        <div style="background: white; padding: 20px; border-radius: 12px; border: 1px solid #eee; height: 100%; box-sizing: border-box;">
+                        <div style="background: white; padding: 20px; border-radius: 12px; border: 1px solid #eee; height: 100%; box-sizing: border-box; box-shadow: 0 4px 6px rgba(0,0,0,0.02);">
                             <h3 style="margin-top:0; border:none; padding:0; margin-bottom:15px; color:var(--primary);">Compliance & Payroll Vault</h3>
                             <button class="btn btn-info" onclick="loadStaff()">View Official Staff Directory</button>
                         </div>
                     </div>
                 </div>
                 {% endif %}
-
-                <!-- Shared Teacher/Admin Sections -->
-                <div id="attendance-section" class="card admin-section {% if current_user.role == 'admin' %}hidden{% endif %}" style="border-top: 5px solid var(--info);">
-                    <h3>📅 Daily Roll Call & Feeding Optimization</h3>
-                    <div style="background: #e9ecef; padding: 25px; border-radius: 12px; max-width: 800px; border: 1px solid #dee2e6;">
-                        <div class="grid-2" style="align-items: end;">
-                            <div><label style="font-weight:bold; font-size:0.9rem; color:#555; display:block; margin-bottom:5px;">Select Date</label><input type="date" id="attDate" value="" style="margin-bottom:0;"></div>
-                            <div><label style="font-weight:bold; font-size:0.9rem; color:#555; display:block; margin-bottom:5px;">Target Student ID</label><input type="number" id="attStuId" placeholder="ID" style="margin-bottom:0;"></div>
-                        </div>
-                        <div class="grid-2" style="margin-top: 20px;">
-                            <select id="attStatus" style="margin-bottom:0; font-weight:bold;"><option value="Present">✅ Present (Include in Daily Feeding)</option><option value="Absent">❌ Absent (Remove from Daily Feeding)</option></select>
-                            <button class="btn btn-info" style="margin-bottom:0;" onclick="sendAction('/api/attendance', {student_id: document.getElementById('attStuId').value, record_date: document.getElementById('attDate').value, status: document.getElementById('attStatus').value})">Commit Attendance</button>
-                        </div>
-                    </div>
-                </div>
-
-                <div id="academics-section" class="card grid-2 admin-section hidden" style="border-top: 5px solid var(--accent);">
-                    <div>
-                        <div style="background: #f8f9fa; padding: 20px; border-radius: 12px; border: 1px solid #eee;">
-                            <h3 style="margin-top:0; border:none; padding:0; margin-bottom:15px; color:var(--primary);">Record SBA Grade (30/70 Matrix)</h3>
-                            <div class="grid-2"><input type="number" id="gStuId" placeholder="Student ID (Required)"><input type="text" id="gSub" placeholder="Subject Name"></div>
-                            <div class="grid-2"><input type="number" id="gClass" placeholder="Class Score (30%)"><input type="number" id="gExam" placeholder="Exam Score (70%)"></div>
-                            <div class="grid-2"><input type="text" id="gTerm" placeholder="Term (e.g. Term 1)"><input type="text" id="gYear" placeholder="Year (e.g. 2026)"></div>
-                            <input type="text" id="gRem" placeholder="Teacher's Qualitative Remark">
-                            <button class="btn btn-success" onclick="sendAction('/api/grades', {student_id: document.getElementById('gStuId').value, subject_name: document.getElementById('gSub').value, class_score: document.getElementById('gClass').value, exam_score: document.getElementById('gExam').value, term: document.getElementById('gTerm').value, academic_year: document.getElementById('gYear').value, remarks: document.getElementById('gRem').value})">Save Academic Record</button>
-                        </div>
-                    </div>
-                    <div>
-                        <div style="background: #e9ecef; padding: 20px; border-radius: 12px; border: 1px solid #dee2e6; height: 100%; box-sizing: border-box;">
-                            <h3 style="margin-top:0; border:none; padding:0; margin-bottom:15px; color:var(--primary);">Terminal Report Generation</h3>
-                            <label style="font-weight:bold; font-size:0.9rem; color:#555; display:block; margin-bottom:5px;">Target Student ID</label>
-                            <input type="number" id="repId" placeholder="Enter Student ID">
-                            <div class="grid-2" style="margin-top: 15px;">
-                                <button class="btn btn-info" onclick="loadReport()">View Raw Data</button>
-                                <button class="btn btn-success" onclick="printReportCard()">🖨️ Print Official Report</button>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <div id="lesson-section" class="card hidden" style="border-top: 5px solid #ffc107;">
-                    <h3>📚 GES Lesson Plan Inspection Vault</h3>
-                    {% if current_user.role == 'teacher' %}
-                    <div style="background: #f8f9fa; padding: 20px; border-radius: 12px; border: 1px solid #eee; margin-bottom: 20px;">
-                        <div class="grid-2"><input type="text" id="lpSubj" placeholder="Subject"><input type="text" id="lpClass" placeholder="Class"></div>
-                        <div class="grid-2"><input type="number" id="lpWeek" placeholder="Week Number"><input type="text" id="lpTopic" placeholder="Topic"></div>
-                        <textarea id="lpContent" placeholder="Paste lesson plan notes here..." style="height: 100px; resize:none;"></textarea>
-                        <button class="btn btn-success" onclick="sendAction('/api/lesson_plans', {subject: document.getElementById('lpSubj').value, class_name: document.getElementById('lpClass').value, week_number: document.getElementById('lpWeek').value, topic: document.getElementById('lpTopic').value, plan_content: document.getElementById('lpContent').value})">Submit to Headmaster</button>
-                    </div>
-                    {% endif %}
-                    <button class="btn btn-info" style="width:auto; margin-bottom:15px;" onclick="loadLessonPlans()">Refresh Submitted Notes</button>
-                    <div id="plan-container"></div>
-                </div>
-
-                <div id="cbt-section" class="card hidden" style="border-top: 5px solid #17a2b8;">
-                    <h3>💻 Computer-Based Testing (CBT) Engine</h3>
-                    <div style="background:#f8f9fa; padding:15px; border-radius:8px; margin-bottom:20px;">
-                        <h4>Publish New Multiple-Choice Test</h4>
-                        <div class="grid-2"><input type="text" id="cbtSubject" placeholder="Subject"><input type="text" id="cbtClass" placeholder="Class"></div>
-                        <input type="text" id="cbtTitle" placeholder="Assessment Title (e.g. Midterm Objective Quiz)">
-                        <div class="grid-2"><input type="text" id="cbtYear" placeholder="Academic Year (e.g. 2026)"><input type="text" id="cbtTerm" placeholder="Term"></div>
-                        <textarea id="cbtQText" placeholder="Sample Question: What is the capital of Ghana?"></textarea>
-                        <div class="grid-2"><input type="text" id="cbtOptA" placeholder="Option A"><input type="text" id="cbtOptB" placeholder="Option B"><input type="text" id="cbtOptC" placeholder="Option C"><input type="text" id="cbtOptD" placeholder="Option D"></div>
-                        <input type="text" id="cbtCorrect" placeholder="Correct Option Letter (A, B, C, or D)">
-                        <button class="btn btn-success" onclick="publishQuiz()">Publish Test & Synchronize to Grades</button>
-                    </div>
-                </div>
-
-                <div id="calendar-section" class="card admin-section hidden" style="border-top: 5px solid #20c997;">
-                    <h3>📅 Academic Master Calendar</h3>
-                    <div class="grid-2">
-                        {% if current_user.role == 'admin' %}
-                        <div style="background: #f8f9fa; padding: 20px; border-radius: 12px; border: 1px solid #eee;">
-                            <h4 style="margin-top:0; color:#20c997;">Add Key Term Event</h4>
-                            <input type="text" id="calTitle" placeholder="Event Title (e.g. Mid-Term Break)"><input type="date" id="calDate"><input type="text" id="calDesc" placeholder="Description">
-                            <button class="btn" style="background:#20c997;" onclick="sendAction('/api/calendar', {title: document.getElementById('calTitle').value, date: document.getElementById('calDate').value, desc: document.getElementById('calDesc').value})">Publish to Master Calendar</button>
-                        </div>
-                        {% endif %}
-                        <div style="background: #e9ecef; padding: 20px; border-radius: 12px; border: 1px solid #ccc; {% if current_user.role != 'admin' %}grid-column: span 2;{% endif %}">
-                            <h4 style="margin-top:0; color:#333;">Upcoming Term Events</h4>
-                            <button class="btn btn-info" onclick="loadCalendar()">View Full Calendar</button>
-                        </div>
-                    </div>
-                </div>
             {% endif %}
 
             <!-- UNIVERSAL SETTINGS & SECURITY TAB -->
@@ -1293,39 +1094,42 @@ def dashboard():
             <div id="settings-section" class="card admin-section hidden" style="border-top: 5px solid #333;">
                 <h3>🔒 Security & Access Management (SECURED)</h3>
                 <div class="grid-2">
-                    <div style="background: #fff; padding: 25px; border-radius: 12px; border: 1px solid #ccc;">
-                        <h4 style="margin-top:0;">Change Personal Password</h4>
+                    <div style="background: #fff; padding: 25px; border-radius: 12px; border: 1px solid #ccc; box-shadow: 0 4px 10px rgba(0,0,0,0.05);">
+                        <h4 style="margin-top:0; color: #333;">Change Personal Password</h4>
                         <input type="password" id="myOldPass" placeholder="Current Password">
                         <input type="password" id="myNewPass" placeholder="New Secure Password">
                         <button class="btn" style="background:#333;" onclick="changeMyPassword()">Update My Password</button>
                     </div>
+
                     {% if current_user.role == 'admin' %}
                     <div style="background: #f8d7da; padding: 25px; border-radius: 12px; border: 1px solid var(--danger);">
                         <h4 style="margin-top:0; color: #721c24;">Master Credential Override</h4>
-                        <input type="email" id="resetTargetEmail" placeholder="Target User Email">
+                        <input type="email" id="resetTargetEmail" placeholder="Target User Email (e.g. teacher@school.com)">
                         <input type="password" id="resetNewPass" placeholder="Assign New Temporary Password">
                         <button class="btn btn-danger" onclick="adminResetPassword()">Execute Force Reset</button>
                     </div>
                     {% endif %}
                 </div>
+
                 {% if current_user.role == 'admin' %}
-                <div style="background: #fff; padding: 25px; border-radius: 12px; border: 1px solid #ccc; margin-top: 20px;">
-                    <h4 style="margin-top:0;">📜 Security Audit Trail</h4>
+                <div style="background: #fff; padding: 25px; border-radius: 12px; border: 1px solid #ccc; box-shadow: 0 4px 10px rgba(0,0,0,0.05); margin-top: 20px;">
+                    <h4 style="margin-top:0; color: #333;">📜 Security Audit Trail</h4>
                     <button class="btn btn-primary" onclick="loadAuditLogs()">View Master Audit Logs</button>
                 </div>
+
                 <h3 style="margin-top:40px;">⚙️ Institution Profile Settings</h3>
                 <div style="background: #f8f9fa; padding: 25px; border-radius: 12px; border: 1px solid #eee; max-width: 600px;">
-                    <label style="font-weight:bold; color:var(--primary); margin-bottom:8px; display:block;">Official School Address</label>
-                    <input type="text" id="setAddress" placeholder="e.g., P.O Box 123, Winneba">
+                    <label style="font-weight:bold; color:var(--primary); margin-bottom:8px; display:block;">Official School Address / Location</label>
+                    <input type="text" id="setAddress" placeholder="e.g., P.O Box 123, Winneba" style="font-size:1.05rem;">
                     <label style="font-weight:bold; color:var(--primary); margin-bottom:8px; display:block; margin-top:15px;">Official Contact Number</label>
-                    <input type="text" id="setPhone" placeholder="e.g., 0244123456">
-                    <button class="btn btn-success" style="margin-top: 15px;" onclick="sendAction('/api/settings', {address: document.getElementById('setAddress').value, phone: document.getElementById('setPhone').value})">Save Profile Updates</button>
+                    <input type="text" id="setPhone" placeholder="e.g., 0244123456" style="font-size:1.05rem;">
+                    <button class="btn btn-success" style="margin-top: 15px; font-size:1.05rem;" onclick="sendAction('/api/settings', {address: document.getElementById('setAddress').value, phone: document.getElementById('setPhone').value})">Save Profile Updates</button>
                 </div>
                 {% endif %}
             </div>
             {% endif %}
 
-            <!-- Shared Universal Data Viewer -->
+            <!-- Shared Data Viewer -->
             {% if current_user.is_authenticated %}
             <div class="card hidden" id="data-viewer" style="border: 2px solid var(--primary); box-shadow: 0 15px 35px rgba(0,0,0,0.1); border-radius: 16px; overflow:hidden; padding: 0;">
                 <div style="background: var(--primary); padding: 20px 30px; display:flex; justify-content:space-between; align-items:center;">
@@ -1345,7 +1149,7 @@ def dashboard():
                 clearTimeout(inactivityTimeout);
                 if(document.getElementById('email') == null) {
                     inactivityTimeout = setTimeout(() => {
-                        alert("Session expired due to inactivity.");
+                        alert("Security Alert: Your session has expired due to 15 minutes of inactivity.");
                         logout();
                     }, 15 * 60 * 1000);
                 }
@@ -1354,7 +1158,7 @@ def dashboard():
             document.onmousemove = resetTimer; document.onkeypress = resetTimer;
 
             function showSection(sectionId) {
-                const sections = ['analytics-section', 'finance-section', 'admissions-section', 'attendance-section', 'academics-section', 'sms-section', 'hr-section', 'guardian-section', 'settings-section', 'sa-settings-section', 'transport-section', 'store-section', 'exeat-section', 'sickbay-section', 'calendar-section', 'lesson-section', 'cbt-section'];
+                const sections = ['analytics-section', 'finance-section', 'admissions-section', 'attendance-section', 'academics-section', 'sms-section', 'hr-section', 'guardian-section', 'settings-section', 'sa-settings-section', 'transport-section', 'store-section', 'exeat-section', 'sickbay-section', 'calendar-section'];
                 sections.forEach(id => {
                     const el = document.getElementById(id);
                     if(el) el.classList.add('hidden');
@@ -1368,11 +1172,11 @@ def dashboard():
 
             async function secureSection(sectionId) {
                 if (unlockedSections[sectionId]) { showSection(sectionId); return; }
-                const pass = prompt("SECURE VAULT: Enter password to proceed.");
+                const pass = prompt("SECURE VAULT: Please enter your personal password to access this restricted section.");
                 if (!pass) return;
                 try {
                     const res = await fetch('/api/verify_password', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({password: pass}) });
-                    if(res.ok) { unlockedSections[sectionId] = true; showSection(sectionId); showToast("Vault Unlocked"); } 
+                    if(res.ok) { unlockedSections[sectionId] = true; showSection(sectionId); showToast("Vault Unlocked Successfully"); } 
                     else { const data = await res.json(); showToast(data.error, true); }
                 } catch(e) { showToast("Connection failed", true); }
             }
@@ -1433,9 +1237,11 @@ def dashboard():
                 } catch(e) { showToast("Connection failed", true); }
             }
 
+            // --- CREDENTIAL MANAGEMENT ---
             async function updateSACredentials() {
                 const email = document.getElementById('saNewEmail').value; const pass = document.getElementById('saNewPass').value;
                 if(!email && !pass) { showToast("Enter a new email or password.", true); return; }
+                if(!confirm("Are you sure you want to update the master credentials?")) return;
                 try {
                     const res = await fetch('/api/superadmin/credentials', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({new_email: email, new_password: pass}) });
                     const data = await res.json();
@@ -1458,7 +1264,7 @@ def dashboard():
             async function adminResetPassword() {
                 const email = document.getElementById('resetTargetEmail').value; const newP = document.getElementById('resetNewPass').value;
                 if(!email || !newP) { showToast("Provide Target Email and New Password.", true); return; }
-                if(!confirm(`FORCE RESET the password for ${email}?`)) return;
+                if(!confirm(`Are you sure you want to FORCE RESET the password for ${email}?`)) return;
                 try {
                     const res = await fetch('/api/admin/reset_password', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({target_email: email, new_password: newP}) });
                     const data = await res.json();
@@ -1470,7 +1276,7 @@ def dashboard():
             async function saResetAdmin() {
                 const email = document.getElementById('saResetEmail').value; const newP = document.getElementById('saResetPass').value;
                 if(!email || !newP) { showToast("Provide Target Email and New Password.", true); return; }
-                if(!confirm(`FORCE RESET the admin password for ${email}?`)) return;
+                if(!confirm(`Are you sure you want to FORCE RESET the admin password for ${email}?`)) return;
                 try {
                     const res = await fetch('/api/superadmin/reset_admin', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({admin_email: email, new_password: newP}) });
                     const data = await res.json();
@@ -1512,7 +1318,7 @@ def dashboard():
                 const payload = {
                     first_name: document.getElementById('editFirst').value, last_name: document.getElementById('editLast').value,
                     current_class: document.getElementById('editClass').value, boarding_status: document.getElementById('editBoarding').value,
-                    guardian_contact: prompt("Update Guardian Phone Number:"), house: prompt("Update House Assignment:"), transport_route: prompt("Update Transport Route:")
+                    guardian_contact: prompt("Update Guardian Phone Number:"), house: prompt("Update House Assignment:"), transport_route: prompt("Update Transport Route (or type 'None'):")
                 };
                 try {
                     const res = await fetch('/api/students/' + id, { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
@@ -1523,8 +1329,8 @@ def dashboard():
 
             async function bulkEnrollCSV() {
                 const fileInput = document.getElementById('csvUpload');
-                if (!fileInput.files.length) { showToast("Select a CSV file.", true); return; }
-                const formData = new FormData(); formData.append('file', fileInput.files[0]); showToast("Uploading roster...", false);
+                if (!fileInput.files.length) { showToast("Please select a CSV file.", true); return; }
+                const formData = new FormData(); formData.append('file', fileInput.files[0]); showToast("Uploading roster, please wait...", false);
                 try {
                     const res = await fetch('/api/students/bulk', { method: 'POST', body: formData });
                     const data = await res.json();
@@ -1548,7 +1354,7 @@ def dashboard():
             }
 
             async function deleteStudent(id) {
-                if(!confirm("WARNING: This will permanently delete the student and ALL associated grades, fees, and records. Continue?")) return;
+                if(!confirm("WARNING: This will permanently delete the student and ALL associated grades, fees, and attendance records. Continue?")) return;
                 try {
                     const res = await fetch('/api/students/' + id, { method: 'DELETE' });
                     const data = await res.json();
@@ -1557,7 +1363,7 @@ def dashboard():
             }
 
             async function deleteBill(feeId, stuId) {
-                if(!confirm("Reverse this bill and erase its record?")) return;
+                if(!confirm("Are you sure you want to completely REVERSE this bill and delete its record?")) return;
                 try {
                     const res = await fetch('/api/fees/' + feeId, { method: 'DELETE' });
                     const data = await res.json();
@@ -1577,11 +1383,14 @@ def dashboard():
             }
 
             async function registerStaff() {
-                const payload = { email: document.getElementById('tEmail').value, password: document.getElementById('tPass').value, phone: document.getElementById('tPhone').value, subject: document.getElementById('tSubj').value, salary: document.getElementById('tSal').value };
+                const payload = {
+                    email: document.getElementById('tEmail').value, password: document.getElementById('tPass').value,
+                    phone: document.getElementById('tPhone').value, subject: document.getElementById('tSubj').value, salary: document.getElementById('tSal').value
+                };
                 try {
                     const res = await fetch('/api/register_staff', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
                     const data = await res.json();
-                    if(res.ok) { showToast(data.message); document.getElementById('tEmail').value = ''; document.getElementById('tPass').value = ''; loadStaff(); } 
+                    if(res.ok) { showToast(data.message); document.getElementById('tEmail').value = ''; document.getElementById('tPass').value = ''; document.getElementById('tPhone').value = ''; document.getElementById('tSubj').value = ''; document.getElementById('tSal').value = ''; loadStaff(); } 
                     else { showToast(data.error, true); }
                 } catch(e) { showToast("Connection failed", true); }
             }
@@ -1591,14 +1400,17 @@ def dashboard():
                 try {
                     const res = await fetch('/api/register_guardian', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
                     const data = await res.json();
-                    if(res.ok) { showToast(data.message); document.getElementById('gEmail').value = ''; document.getElementById('gPass').value = ''; } 
+                    if(res.ok) { showToast(data.message); document.getElementById('gEmail').value = ''; document.getElementById('gPass').value = ''; document.getElementById('gStuId').value = ''; } 
                     else { showToast(data.error, true); }
                 } catch(e) { showToast("Connection failed", true); }
             }
 
             async function issueBill() {
                 const stuId = document.getElementById('bStuId').value;
-                const payload = { student_id: stuId, fee_category: document.getElementById('bCat').value, amount_due: document.getElementById('bAmount').value, academic_year: document.getElementById('bYear').value, term: document.getElementById('bTerm').value, description: document.getElementById('bDesc').value };
+                const payload = {
+                    student_id: stuId, fee_category: document.getElementById('bCat').value, amount_due: document.getElementById('bAmount').value,
+                    academic_year: document.getElementById('bYear').value, term: document.getElementById('bTerm').value, description: document.getElementById('bDesc').value
+                };
                 try {
                     const res = await fetch('/api/fees/bill', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
                     const data = await res.json();
@@ -1609,9 +1421,9 @@ def dashboard():
 
             async function processPayment(feeId, balance, stuId) {
                 if(balance <= 0) { showToast("This bill is fully paid.", true); return; }
-                const amount = prompt("Payment amount (GHS) for Fee ID " + feeId + ". Outstanding: GHS " + balance);
+                const amount = prompt("Enter payment amount (GHS) for Fee ID " + feeId + ". Outstanding Balance: GHS " + balance);
                 if(!amount || isNaN(amount) || amount <= 0) return;
-                const method = prompt("Payment method (Cash / MoMo):", "Cash");
+                const method = prompt("Enter payment method (Cash / MoMo):", "Cash");
                 if(!method) return;
                 try {
                     const res = await fetch('/api/fees/pay', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({fee_id: feeId, amount_paid: amount, payment_method: method}) });
@@ -1620,52 +1432,16 @@ def dashboard():
                 } catch(e) { showToast("Connection failed", true); }
             }
 
-            async function initiateMoMo() {
-                const res = await fetch('/api/momo/initialize', {
-                    method:'POST', headers:{'Content-Type':'application/json'},
-                    body: JSON.stringify({fee_id: document.getElementById('momoFeeId').value, amount: document.getElementById('momoAmount').value, phone: document.getElementById('momoPhone').value})
-                });
-                const d = await res.json();
-                if(d.status === 'paystack_redirect') window.location.href = d.auth_url;
-                else showToast(d.message || d.error);
-            }
-
-            function generateTranscript() {
-                const id = document.getElementById('trStuId').value;
-                if(!id) return showToast("Enter Student ID");
-                window.open('/print_transcript/' + id, '_blank');
-            }
-
             function printReportCard() {
                 const id = document.getElementById('repId').value;
                 if (!id) { showToast("Please enter a Student ID", true); return; }
                 window.open('/print_report/' + id, '_blank');
             }
 
-            async function publishQuiz() {
-                const payload = {
-                    subject: document.getElementById('cbtSubject').value, class_name: document.getElementById('cbtClass').value, title: document.getElementById('cbtTitle').value,
-                    academic_year: document.getElementById('cbtYear').value, term: document.getElementById('cbtTerm').value,
-                    questions: [{text: document.getElementById('cbtQText').value, a: document.getElementById('cbtOptA').value, b: document.getElementById('cbtOptB').value, c: document.getElementById('cbtOptC').value, d: document.getElementById('cbtOptD').value, ans: document.getElementById('cbtCorrect').value}]
-                };
-                sendAction('/api/cbt/quiz', payload);
-            }
-
-            async function loadLessonPlans() {
-                const res = await fetch('/api/lesson_plans'); const d = await res.json();
-                let html = '<table style="width:100%; border-collapse:collapse;"><tr><th style="padding:10px; border-bottom:2px solid #ddd; text-align:left;">Teacher</th><th style="padding:10px; border-bottom:2px solid #ddd; text-align:left;">Subject</th><th style="padding:10px; border-bottom:2px solid #ddd; text-align:left;">Topic</th><th style="padding:10px; border-bottom:2px solid #ddd; text-align:left;">Status</th><th style="padding:10px; border-bottom:2px solid #ddd; text-align:left;">Action</th></tr>';
-                d.data.forEach(p => { html += `<tr><td style="padding:10px; border-bottom:1px solid #eee;">${p.teacher_email}</td><td style="padding:10px; border-bottom:1px solid #eee;">${p.subject}</td><td style="padding:10px; border-bottom:1px solid #eee;">${p.topic}</td><td style="padding:10px; border-bottom:1px solid #eee;"><b>${p.status}</b></td><td style="padding:10px; border-bottom:1px solid #eee;"><button class="btn btn-success" style="padding:6px 12px; margin:0;" onclick="reviewPlan(${p.plan_id}, 'Approved')">Approve</button></td></tr>`; });
-                document.getElementById('plan-container').innerHTML = html + '</table>';
-            }
-
-            async function reviewPlan(id, status) {
-                const res = await fetch('/api/lesson_plans', { method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({plan_id: id, status: status, remarks:'Inspected and approved by Headmaster.'}) });
-                const d = await res.json(); showToast(d.message); loadLessonPlans();
-            }
-
+            // --- SUPERADMIN SPECIFIC FUNCTIONS ---
             function openBrandingModal(schoolId, currentColor, schoolName) {
                 document.getElementById('branding-div').classList.remove('hidden'); document.getElementById('brandSchoolId').value = schoolId;
-                document.getElementById('brandColor').value = currentColor || '#0f4c81';
+                document.getElementById('brandColor').value = currentColor || '#0f4c81'; document.getElementById('brandSchoolName').innerText = schoolName;
                 document.getElementById('branding-div').scrollIntoView({behavior: "smooth"});
             }
 
@@ -1695,6 +1471,9 @@ def dashboard():
                         <td style="padding:15px; border-bottom:1px solid #eee;">
                             <button class="btn btn-warning" style="width: auto; padding: 6px 12px; margin: 2px; color:#333;" onclick="openBrandingModal(${s.school_id}, '${s.primary_color}', '${s.school_name}')">🎨 Brand</button>
                             <button class="btn btn-success" style="width: auto; padding: 6px 12px; margin: 2px;" onclick="sendAction('/api/superadmin/renew/${s.school_id}', {})">Renew</button>
+                            <button class="btn btn-info" style="width: auto; padding: 6px 12px; margin: 2px;" onclick="window.location.href='/api/superadmin/backup/${s.school_id}'">⬇️ Backup</button>
+                            <input type="file" id="file_${s.school_id}" accept=".json" style="display:none;" onchange="uploadRestore(${s.school_id})">
+                            <button class="btn btn-danger" style="width: auto; padding: 6px 12px; margin: 2px;" onclick="document.getElementById('file_${s.school_id}').click()">⬆️ Restore</button>
                         </td></tr>`;
                 });
                 document.getElementById('school-container').innerHTML = html + '</table>';
@@ -1705,6 +1484,18 @@ def dashboard():
                 const data = await res.json(); if (res.ok) { showToast(data.message); loadSchools(); } else { showToast(data.error, true); }
             }
 
+            async function uploadRestore(schoolId) {
+                const fileInput = document.getElementById('file_' + schoolId); if (!fileInput.files.length) return;
+                const formData = new FormData(); formData.append('file', fileInput.files[0]); showToast("Restoring data, please wait...", false);
+                try {
+                    const res = await fetch('/api/superadmin/restore/' + schoolId, { method: 'POST', body: formData });
+                    const data = await res.json();
+                    if (res.ok) showToast(data.message); else showToast(data.error, true);
+                } catch(e) { showToast("Upload failed", true); }
+                fileInput.value = ''; 
+            }
+
+            // --- DATA RENDERERS ---
             function renderTable(title, headers, rows, keys) {
                 const viewer = document.getElementById('data-viewer'); document.getElementById('viewer-title').innerText = title; const container = document.getElementById('table-container');
                 if (!rows || rows.length === 0) { container.innerHTML = '<div style="padding: 20px; color:#666;">No records found in database.</div>'; viewer.classList.remove('hidden'); return; }
@@ -1744,11 +1535,13 @@ def dashboard():
             async function loadExeats() { const res = await fetch('/api/exeats'); const data = await res.json(); renderTable("Active Boarding Exeats", ['Exeat ID', 'Student ID', 'First Name', 'Last Name', 'Type', 'Reason', 'Expected Return Date', 'Status'], data.data, ['exeat_id', 'student_id', 'first_name', 'last_name', 'exeat_type', 'reason', 'date', 'action_return_exeat']); }
             async function loadSickBay() { const res = await fetch('/api/sickbay'); const data = await res.json(); renderTable("Infirmary Medical Logs", ['Log ID', 'Time/Date', 'Student ID', 'First Name', 'Last Name', 'Symptoms', 'Treatment Administered'], data.data, ['log_id', 'time', 'student_id', 'first_name', 'last_name', 'symptoms', 'treatment']); }
             async function loadCalendar() { const res = await fetch('/api/calendar'); const data = await res.json(); renderTable("Academic Term Calendar", ['Event Date', 'Event Title', 'Description'], data.data, ['date', 'event_title', 'description']); }
+            
             async function loadReport() {
                 const id = document.getElementById('repId').value; if(!id) { showToast("Please enter a Student ID", true); return; }
                 const res = await fetch('/api/report_card/' + id); if (!res.ok) { showToast("Not Found", true); return; }
                 const data = await res.json(); renderTable("Raw Grading Data", ['Subject', 'Class', 'Exam', 'Total', 'Grade', 'Remarks', 'Term'], data.grades, ['subject_name', 'class_score', 'exam_score', 'total_score', 'waec_grade', 'teacher_remarks', 'term']);
             }
+            
             async function loadStatement(overrideId) {
                 const id = overrideId || (document.getElementById('stateStuId') ? document.getElementById('stateStuId').value : null);
                 if(!id) { showToast("Please enter a Student ID", true); return; }
@@ -1782,19 +1575,15 @@ def dashboard():
     </body>
     </html>
     """
-    return render_template_string(html_template, school_name=school_name, primary_color=primary_color)
+    return render_template_string(html_template, current_user=current_user, school_name=school_name, primary_color=primary_color)
 
-# --- BOOT SEQUENCE ---
+# --- AUTOMATIC BOOT SEQUENCE ---
 with app.app_context():
     try:
         initialize_database()
         print("SaaS Database Engine synchronized successfully on boot.")
     except Exception as e:
-        print(f"Boot synchronization skipped: {e}")
-
-scheduler = BackgroundScheduler()
-scheduler.add_job(func=automated_weekly_backup, trigger="cron", day_of_week='sun', hour=23, minute=59)
-scheduler.start()
+        print(f"Boot synchronization skipped (Database may be asleep): {e}")
 
 if __name__ == '__main__':
     app.run(debug=False, host='0.0.0.0', port=5000)
