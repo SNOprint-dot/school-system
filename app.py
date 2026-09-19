@@ -91,7 +91,6 @@ def initialize_database():
     cur.execute("CREATE TABLE IF NOT EXISTS institutions (school_id SERIAL PRIMARY KEY, school_name VARCHAR(150) NOT NULL UNIQUE, subscription_expiry_date DATE NOT NULL)")
     cur.execute("ALTER TABLE institutions ADD COLUMN IF NOT EXISTS address VARCHAR(255) DEFAULT 'Ghana'")
     cur.execute("ALTER TABLE institutions ADD COLUMN IF NOT EXISTS phone VARCHAR(50) DEFAULT '0000000000'")
-    
     cur.execute("ALTER TABLE institutions ADD COLUMN IF NOT EXISTS primary_color VARCHAR(20) DEFAULT '#0f4c81'")
     cur.execute("ALTER TABLE institutions ADD COLUMN IF NOT EXISTS logo_key VARCHAR(255)")
     
@@ -155,7 +154,7 @@ scheduler = BackgroundScheduler()
 scheduler.add_job(func=automated_weekly_backup, trigger="cron", day_of_week='sun', hour=23, minute=59)
 scheduler.start()
 
-# --- AUTH & SUPER ADMIN ---
+# --- AUTH, SECURITY & SUPER ADMIN ---
 @app.route('/api/login', methods=['POST'])
 def login():
     data = request.get_json(); conn = get_db_connection(); cur = conn.cursor()
@@ -170,6 +169,40 @@ def login():
 @login_required
 def logout():
     logout_user(); return jsonify({"message": "Logged out safely."})
+
+@app.route('/api/change_password', methods=['POST'])
+@login_required
+def change_password():
+    d = request.get_json()
+    conn = get_db_connection(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT password_hash FROM system_users WHERE user_id = %s", (current_user.id,))
+        user = cur.fetchone()
+        if not check_password_hash(user['password_hash'], d.get('current_password')):
+            return jsonify({"error": "Incorrect current password."}), 403
+        
+        new_hash = generate_password_hash(d.get('new_password'))
+        cur.execute("UPDATE system_users SET password_hash = %s WHERE user_id = %s", (new_hash, current_user.id))
+        conn.commit(); return jsonify({"message": "Your private password has been successfully updated!"}), 200
+    except Exception as e:
+        conn.rollback(); return jsonify({"error": str(e)}), 500
+    finally: cur.close(); conn.close()
+
+@app.route('/api/admin/reset_password', methods=['POST'])
+@login_required
+def admin_reset_password():
+    if current_user.role != 'admin': return jsonify({"error": "Admin clearance required."}), 403
+    d = request.get_json()
+    new_hash = generate_password_hash(d.get('new_password'))
+    conn = get_db_connection(); cur = conn.cursor()
+    try:
+        cur.execute("UPDATE system_users SET password_hash = %s WHERE email = %s AND school_id = %s RETURNING user_id", 
+                    (new_hash, d.get('target_email'), current_user.school_id))
+        if not cur.fetchone(): return jsonify({"error": "User email not found in your school's database."}), 404
+        conn.commit(); return jsonify({"message": f"Security override successful. Password reset for {d.get('target_email')}!"}), 200
+    except Exception as e:
+        conn.rollback(); return jsonify({"error": str(e)}), 500
+    finally: cur.close(); conn.close()
 
 @app.route('/api/superadmin/schools', methods=['GET'])
 @login_required
@@ -406,10 +439,11 @@ def print_ids():
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT student_id, first_name, last_name, current_class, boarding_status, house FROM students WHERE school_id = %s ORDER BY student_id", (current_user.school_id,))
     students = cur.fetchall()
-    cur.execute("SELECT school_name, address, phone FROM institutions WHERE school_id = %s", (current_user.school_id,))
+    cur.execute("SELECT school_name, address, phone, primary_color FROM institutions WHERE school_id = %s", (current_user.school_id,))
     inst = cur.fetchone(); cur.close(); conn.close()
+    primary_color = inst['primary_color'] or '#0f4c81'
     
-    html = f"<!DOCTYPE html><html><head><title>Print IDs</title><style>body{{font-family:Arial;background:#f0f0f0;padding:20px;}}.page{{display:grid;grid-template-columns:repeat(2,1fr);gap:15px;max-width:800px;margin:auto;}}.id-card{{background:white;border:2px solid var(--primary, #0f4c81);border-radius:8px;padding:15px;width:350px;height:200px;box-sizing:border-box;position:relative;overflow:hidden;}}.header{{background:var(--primary, #0f4c81);color:white;text-align:center;padding:5px;margin:-15px -15px 10px -15px;border-radius:6px 6px 0 0;font-weight:bold;font-size:14px;}}.photo-box{{width:70px;height:90px;border:1px solid #ccc;float:left;margin-right:15px;background:#eee;}}.details{{float:left;font-size:12px;line-height:1.6;width:calc(100% - 90px);}}.footer{{position:absolute;bottom:0;left:0;width:100%;background:#eee;text-align:center;font-size:10px;padding:5px 0;font-weight:bold;}}@media print{{body{{background:white;padding:0;}}.no-print{{display:none;}}}}</style></head><body><button class='no-print' onclick='window.print()' style='padding:10px;margin-bottom:20px;cursor:pointer;'>🖨️ Print IDs</button><div class='page'>"
+    html = f"<!DOCTYPE html><html><head><title>Print IDs</title><style>body{{font-family:Arial;background:#f0f0f0;padding:20px;}}.page{{display:grid;grid-template-columns:repeat(2,1fr);gap:15px;max-width:800px;margin:auto;}}.id-card{{background:white;border:2px solid {primary_color};border-radius:8px;padding:15px;width:350px;height:200px;box-sizing:border-box;position:relative;overflow:hidden;}}.header{{background:{primary_color};color:white;text-align:center;padding:5px;margin:-15px -15px 10px -15px;border-radius:6px 6px 0 0;font-weight:bold;font-size:14px;}}.photo-box{{width:70px;height:90px;border:1px solid #ccc;float:left;margin-right:15px;background:#eee;}}.details{{float:left;font-size:12px;line-height:1.6;width:calc(100% - 90px);}}.footer{{position:absolute;bottom:0;left:0;width:100%;background:#eee;text-align:center;font-size:10px;padding:5px 0;font-weight:bold;}}@media print{{body{{background:white;padding:0;}}.no-print{{display:none;}}}}</style></head><body><button class='no-print' onclick='window.print()' style='padding:10px;margin-bottom:20px;cursor:pointer;'>🖨️ Print IDs</button><div class='page'>"
     for s in students:
         class_str = s.get('current_class') if s.get('current_class') and s.get('current_class') != 'Unassigned' else 'N/A'
         html += f"<div class='id-card'><div class='header'>{inst['school_name']}</div><div class='photo-box'><img src='/api/photo/{s['student_id']}' style='width:100%;height:100%;object-fit:cover;'></div><div class='details'><strong>Name:</strong> {s['first_name']} {s['last_name']}<br><strong>ID:</strong> {inst['school_name'][:3].upper()}-{s['student_id']:04d}<br><strong>Class/Prog:</strong> {class_str}<br><strong>Status:</strong> {s['boarding_status']}</div><div class='footer'>CONTACT: {inst['phone']} | {inst['address']}</div></div>"
@@ -750,51 +784,6 @@ def send_sms_blast():
     else:
         return jsonify({"message": f"[SIMULATION] SMS processed for {len(contacts)} parents. Add SMS_API_KEY to Render to go live."}), 200
 
-# --- THE HR VAULT & GUARDIAN ACCESS REGISTRATION ---
-@app.route('/api/register_staff', methods=['POST'])
-@login_required
-def register_staff():
-    if current_user.role != 'admin': return jsonify({"error": "Admin clearance required."}), 403
-    d = request.get_json()
-    hashed = generate_password_hash(d.get('password'))
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        base_salary = float(d.get('salary') or 0.0)
-        cur.execute("INSERT INTO system_users (school_id, email, password_hash, role, phone, subject, base_salary) VALUES (%s, %s, %s, %s, %s, %s, %s)", 
-                    (current_user.school_id, d.get('email'), hashed, 'teacher', d.get('phone'), d.get('subject'), base_salary))
-        conn.commit(); return jsonify({"message": "Staff Profile Created in HR Vault!"}), 201
-    except Exception:
-        conn.rollback(); return jsonify({"error": "Email exists or invalid data format."}), 409
-    finally: cur.close(); conn.close()
-
-@app.route('/api/register_guardian', methods=['POST'])
-@login_required
-def register_guardian():
-    if current_user.role != 'admin': return jsonify({"error": "Admin clearance required."}), 403
-    d = request.get_json()
-    hashed = generate_password_hash(d.get('password'))
-    conn = get_db_connection(); cur = conn.cursor()
-    try:
-        stu_id = int(str(d.get('linked_student_id') or '0').strip())
-        cur.execute("SELECT student_id FROM students WHERE student_id = %s AND school_id = %s", (stu_id, current_user.school_id))
-        if not cur.fetchone(): return jsonify({"error": "Student ID does not exist!"}), 404
-        
-        cur.execute("INSERT INTO system_users (school_id, email, password_hash, role, linked_student_id) VALUES (%s, %s, %s, %s, %s)", 
-                    (current_user.school_id, d.get('email'), hashed, 'guardian', stu_id))
-        conn.commit(); return jsonify({"message": f"Guardian Access created for Student ID {stu_id}!"}), 201
-    except ValueError: return jsonify({"error": "Invalid Student ID."}), 400
-    except Exception: conn.rollback(); return jsonify({"error": "Email already registered."}), 409
-    finally: cur.close(); conn.close()
-
-@app.route('/api/staff', methods=['GET'])
-@login_required
-def get_staff():
-    if current_user.role != 'admin': return jsonify({"error": "Admin clearance required."}), 403
-    conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("SELECT email, phone, subject, base_salary FROM system_users WHERE school_id = %s AND role = 'teacher' ORDER BY email", (current_user.school_id,))
-    staff = cur.fetchall(); cur.close(); conn.close()
-    return jsonify({"data": staff})
-
 # --- INSTITUTION SETTINGS ---
 @app.route('/api/settings', methods=['POST'])
 @login_required
@@ -812,7 +801,6 @@ def update_settings():
 # --- 8. THE FRONTEND DASHBOARD WITH BRANDING ENGINE ---
 @app.route('/dashboard')
 def dashboard():
-    # Tenant Branding Variable Fetcher
     school_name = "Global ERP Engine"
     primary_color = "#0f4c81"
     
@@ -862,7 +850,6 @@ def dashboard():
             .hidden { display: none !important; }
             
             .table-row { transition: background 0.2s ease; }
-            .table-row:hover { background-color: #f8f9fa !important; }
             
             @keyframes fadein { from {bottom: 0; opacity: 0;} to {bottom: 30px; opacity: 1;} }
         </style>
@@ -894,14 +881,16 @@ def dashboard():
                     <button onclick="showSection('academics-section')">📚 Academic Reporting</button>
                     <button onclick="showSection('sms-section')">📟 Live SMS Gateway</button>
                     <button onclick="showSection('hr-section')">🧑‍🏫 Staff HR & Parent Access</button>
-                    <button onclick="showSection('settings-section')">⚙️ Profile Settings</button>
+                    <button onclick="showSection('settings-section')">⚙️ Security & Settings</button>
                 
                 {% elif current_user.role == 'teacher' %}
                     <button onclick="showSection('attendance-section')">📅 Daily Roll Call</button>
                     <button onclick="showSection('academics-section')">📚 SBA Grading Matrix</button>
+                    <button onclick="showSection('settings-section')">⚙️ Account Security</button>
                 
                 {% elif current_user.role == 'guardian' %}
                     <button onclick="showSection('guardian-section')">👨‍👩‍👧 Guardian Portal</button>
+                    <button onclick="showSection('settings-section')">⚙️ Account Security</button>
                 {% endif %}
                 
                 <div style="margin-top: 40px; padding-bottom: 20px;">
@@ -1138,22 +1127,6 @@ def dashboard():
                         </div>
                     </div>
                 </div>
-                
-                <!-- School Settings Profile -->
-                <div id="settings-section" class="card admin-section hidden" style="border-top: 5px solid var(--primary);">
-                    <h3>⚙️ Institution Profile & Branding Settings</h3>
-                    <p style="font-size: 0.95rem; color: #555; margin-bottom: 25px;">Update your school's official contact details. These will print directly onto the headers of your generated Student ID Cards and Terminal Report Cards.</p>
-                    <div style="background: #f8f9fa; padding: 25px; border-radius: 12px; border: 1px solid #eee; max-width: 600px;">
-                        <label style="font-weight:bold; color:var(--primary); margin-bottom:8px; display:block;">Official School Address / Location</label>
-                        <input type="text" id="setAddress" placeholder="e.g., P.O Box 123, Winneba, Central Region" style="font-size:1.05rem;">
-                        
-                        <label style="font-weight:bold; color:var(--primary); margin-bottom:8px; display:block; margin-top:15px;">Official Contact Number</label>
-                        <input type="text" id="setPhone" placeholder="e.g., 0244123456" style="font-size:1.05rem;">
-                        
-                        <button class="btn btn-success" style="margin-top: 15px; font-size:1.05rem;" onclick="sendAction('/api/settings', {address: document.getElementById('setAddress').value, phone: document.getElementById('setPhone').value})">Save Profile Updates</button>
-                    </div>
-                    <p style="font-size: 0.85rem; color: #888; margin-top: 20px;"><i>Note: To change your institution's name, core theme color, or logo, please contact your Super Admin.</i></p>
-                </div>
                 {% endif %}
 
                 <!-- Shared Teacher/Admin Sections -->
@@ -1273,15 +1246,59 @@ def dashboard():
                     </div>
                 </div>
                 {% endif %}
+            {% endif %}
 
-                <!-- Shared Data Viewer (With Offline CSV Export) -->
-                <div class="card hidden" id="data-viewer" style="border: 2px solid var(--primary); box-shadow: 0 15px 35px rgba(0,0,0,0.1); border-radius: 16px; overflow:hidden; padding: 0;">
-                    <div style="background: var(--primary); padding: 20px 30px; display:flex; justify-content:space-between; align-items:center;">
-                        <h3 id="viewer-title" style="border:none; margin:0; padding:0; color:white; font-size:1.2rem;">Data Explorer</h3>
-                        <button class="btn" style="background:rgba(255,255,255,0.2); color:white; width:auto; margin:0; border-radius:6px; box-shadow:none;" onclick="exportTableToCSV('Exported_Data.csv')">⬇️ Download to Excel/CSV</button>
+            <!-- UNIVERSAL SETTINGS & SECURITY TAB (Visible to ALL logged-in users) -->
+            {% if current_user.is_authenticated and current_user.role != 'superadmin' %}
+            <div id="settings-section" class="card admin-section hidden" style="border-top: 5px solid #333;">
+                <h3>🔒 Security & Access Management</h3>
+                
+                <div class="grid-2">
+                    <div style="background: #fff; padding: 25px; border-radius: 12px; border: 1px solid #ccc; box-shadow: 0 4px 10px rgba(0,0,0,0.05);">
+                        <h4 style="margin-top:0; color: #333;">Change Personal Password</h4>
+                        <p style="font-size: 0.9rem; color: #555; margin-bottom: 20px;">Change the temporary password you were given to a secure, private password.</p>
+                        <input type="password" id="myOldPass" placeholder="Current Password">
+                        <input type="password" id="myNewPass" placeholder="New Secure Password">
+                        <button class="btn" style="background:#333;" onclick="changeMyPassword()">Update My Password</button>
                     </div>
-                    <div id="table-container" style="padding: 30px; overflow-x: auto;"></div>
+
+                    {% if current_user.role == 'admin' %}
+                    <div style="background: #f8d7da; padding: 25px; border-radius: 12px; border: 1px solid var(--danger);">
+                        <h4 style="margin-top:0; color: #721c24;">Master Credential Override</h4>
+                        <p style="font-size: 0.9rem; color: #721c24; margin-bottom: 20px;">Force-reset a forgotten password for any Teacher or Guardian, or instantly lock out an old staff member.</p>
+                        <input type="email" id="resetTargetEmail" placeholder="Target User Email (e.g. teacher@school.com)">
+                        <input type="password" id="resetNewPass" placeholder="Assign New Temporary Password">
+                        <button class="btn btn-danger" onclick="adminResetPassword()">Execute Force Reset</button>
+                    </div>
+                    {% endif %}
                 </div>
+
+                {% if current_user.role == 'admin' %}
+                <h3 style="margin-top:40px;">⚙️ Institution Profile Settings</h3>
+                <div style="background: #f8f9fa; padding: 25px; border-radius: 12px; border: 1px solid #eee; max-width: 600px;">
+                    <p style="font-size: 0.9rem; color: #555; margin-bottom: 20px;">Update your school's official contact details. These will print directly onto the headers of your generated Student ID Cards and Terminal Report Cards.</p>
+                    <label style="font-weight:bold; color:var(--primary); margin-bottom:8px; display:block;">Official School Address / Location</label>
+                    <input type="text" id="setAddress" placeholder="e.g., P.O Box 123, Winneba, Central Region" style="font-size:1.05rem;">
+                    
+                    <label style="font-weight:bold; color:var(--primary); margin-bottom:8px; display:block; margin-top:15px;">Official Contact Number</label>
+                    <input type="text" id="setPhone" placeholder="e.g., 0244123456" style="font-size:1.05rem;">
+                    
+                    <button class="btn btn-success" style="margin-top: 15px; font-size:1.05rem;" onclick="sendAction('/api/settings', {address: document.getElementById('setAddress').value, phone: document.getElementById('setPhone').value})">Save Profile Updates</button>
+                </div>
+                <p style="font-size: 0.85rem; color: #888; margin-top: 20px;"><i>Note: To change your institution's name, core theme color, or logo, please contact your Super Admin.</i></p>
+                {% endif %}
+            </div>
+            {% endif %}
+
+            <!-- Shared Data Viewer (With Offline CSV Export) -->
+            {% if current_user.is_authenticated %}
+            <div class="card hidden" id="data-viewer" style="border: 2px solid var(--primary); box-shadow: 0 15px 35px rgba(0,0,0,0.1); border-radius: 16px; overflow:hidden; padding: 0;">
+                <div style="background: var(--primary); padding: 20px 30px; display:flex; justify-content:space-between; align-items:center;">
+                    <h3 id="viewer-title" style="border:none; margin:0; padding:0; color:white; font-size:1.2rem;">Data Explorer</h3>
+                    <button class="btn" style="background:rgba(255,255,255,0.2); color:white; width:auto; margin:0; border-radius:6px; box-shadow:none;" onclick="exportTableToCSV('Exported_Data.csv')">⬇️ Download to Excel/CSV</button>
+                </div>
+                <div id="table-container" style="padding: 30px; overflow-x: auto;"></div>
+            </div>
             {% endif %}
         </main>
 
@@ -1307,7 +1324,6 @@ def dashboard():
                 setTimeout(() => { toast.style.display = 'none'; }, 5000);
             }
 
-            // CSV EXPORT ENGINE (Fixed string syntax)
             function downloadCSV(csv, filename) {
                 let csvFile = new Blob([csv], {type: "text/csv"});
                 let downloadLink = document.createElement("a");
@@ -1357,6 +1373,31 @@ def dashboard():
                     }
                     else if (res.status === 402) showToast(data.error, true); 
                     else showToast(data.error || "Error", true);
+                } catch(e) { showToast("Connection failed", true); }
+            }
+
+            async function changeMyPassword() {
+                const oldP = document.getElementById('myOldPass').value;
+                const newP = document.getElementById('myNewPass').value;
+                if(!oldP || !newP) { showToast("Provide both passwords.", true); return; }
+                try {
+                    const res = await fetch('/api/change_password', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({current_password: oldP, new_password: newP}) });
+                    const data = await res.json();
+                    if(res.ok) { showToast(data.message); document.getElementById('myOldPass').value = ''; document.getElementById('myNewPass').value = ''; } 
+                    else { showToast(data.error, true); }
+                } catch(e) { showToast("Connection failed", true); }
+            }
+
+            async function adminResetPassword() {
+                const email = document.getElementById('resetTargetEmail').value;
+                const newP = document.getElementById('resetNewPass').value;
+                if(!email || !newP) { showToast("Provide Target Email and New Password.", true); return; }
+                if(!confirm(`Are you sure you want to FORCE RESET the password for ${email}?`)) return;
+                try {
+                    const res = await fetch('/api/admin/reset_password', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({target_email: email, new_password: newP}) });
+                    const data = await res.json();
+                    if(res.ok) { showToast(data.message); document.getElementById('resetTargetEmail').value = ''; document.getElementById('resetNewPass').value = ''; } 
+                    else { showToast(data.error, true); }
                 } catch(e) { showToast("Connection failed", true); }
             }
             
