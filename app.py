@@ -275,7 +275,6 @@ def delete_student(student_id):
         student = cur.fetchone()
         if not student: return jsonify({"error": "Student record not found."}), 404
         
-        # PostgreSQL CASCADE drops all associated grades, fees, and attendance records
         cur.execute("DELETE FROM students WHERE student_id = %s AND school_id = %s", (student_id, current_user.school_id))
         conn.commit()
         
@@ -410,6 +409,27 @@ def log_payment():
         cur.close()
         conn.close()
 
+# --- THE DEBTORS ENGINE ---
+@app.route('/api/debtors', methods=['GET'])
+@login_required
+def get_debtors():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    query = """
+        SELECT s.student_id, s.first_name, s.last_name, s.guardian_contact,
+               (SUM(f.amount_due) - COALESCE((SELECT SUM(amount_paid) FROM payments p JOIN fees f2 ON p.fee_id = f2.fee_id WHERE f2.student_id = s.student_id), 0)) as arrears
+        FROM students s
+        JOIN fees f ON s.student_id = f.student_id
+        WHERE s.school_id = %s
+        GROUP BY s.student_id, s.first_name, s.last_name, s.guardian_contact
+        HAVING (SUM(f.amount_due) - COALESCE((SELECT SUM(amount_paid) FROM payments p JOIN fees f2 ON p.fee_id = f2.fee_id WHERE f2.student_id = s.student_id), 0)) > 0
+        ORDER BY arrears DESC
+    """
+    cur.execute(query, (current_user.school_id,))
+    debtors = cur.fetchall()
+    cur.close(); conn.close()
+    return jsonify({"data": debtors})
+
 @app.route('/api/grades', methods=['POST'])
 @login_required
 def add_grade():
@@ -466,7 +486,7 @@ def get_report_card(student_id):
 def get_statement(student_id):
     if current_user.role == 'guardian' and current_user.linked_student_id != student_id: return jsonify({"error": "Access Denied."}), 403
     conn = get_db_connection(); cur = conn.cursor()
-    query = "SELECT f.fee_id, f.fee_category, f.academic_year, f.term, f.description, f.amount_due, COALESCE(SUM(p.amount_paid), 0) as total_paid, (f.amount_due - COALESCE(SUM(p.amount_paid), 0)) as remaining_balance FROM fees f LEFT JOIN payments p ON f.fee_id = p.fee_id WHERE f.student_id = %s AND f.school_id = %s GROUP BY f.fee_id, f.fee_category, f.academic_year, f.term, f.description, f.amount_due ORDER BY f.date_issued DESC"
+    query = "SELECT f.fee_id, f.student_id, f.fee_category, f.academic_year, f.term, f.description, f.amount_due, COALESCE(SUM(p.amount_paid), 0) as total_paid, (f.amount_due - COALESCE(SUM(p.amount_paid), 0)) as remaining_balance FROM fees f LEFT JOIN payments p ON f.fee_id = p.fee_id WHERE f.student_id = %s AND f.school_id = %s GROUP BY f.fee_id, f.student_id, f.fee_category, f.academic_year, f.term, f.description, f.amount_due ORDER BY f.date_issued DESC"
     cur.execute(query, (student_id, current_user.school_id))
     statement = cur.fetchall(); cur.close(); conn.close(); return jsonify({"statement": statement}), 200
 
@@ -581,7 +601,7 @@ def dashboard():
                     <button class="btn-success" onclick="sendAction('/api/setup_db', {}, true)">Sync Database</button>
                 {% elif current_user.role == 'admin' %}
                     <button onclick="showSection('analytics-section')">📊 Dashboard</button>
-                    <button onclick="showSection('finance-section')">💰 Financials</button>
+                    <button onclick="showSection('finance-section')">💰 Financials & Billing</button>
                     <button onclick="showSection('admissions-section')">🎓 Admissions & IDs</button>
                     <button onclick="showSection('attendance-section')">📅 Roll Call</button>
                     <button onclick="showSection('academics-section')">📚 Academics</button>
@@ -632,7 +652,7 @@ def dashboard():
                 </div>
             </div>
 
-            <!-- Financials Section -->
+            <!-- Financials Section (OVERHAULED) -->
             <div id="finance-section" class="card admin-section hidden" style="border: 2px solid var(--danger);">
                 <h3>💰 Financial Ledger & Operations</h3>
                 <div class="grid-2">
@@ -653,21 +673,26 @@ def dashboard():
                         </div>
                         <input type="number" id="bAmount" placeholder="Amount Due (GHS)">
                         <input type="text" id="bDesc" placeholder="Description / Memo">
-                        <button class="btn btn-success" onclick="sendAction('/api/fees/bill', {student_id: document.getElementById('bStuId').value, fee_category: document.getElementById('bCat').value, amount_due: document.getElementById('bAmount').value, academic_year: document.getElementById('bYear').value, term: document.getElementById('bTerm').value, description: document.getElementById('bDesc').value})">Issue Bill</button>
+                        <button class="btn btn-success" onclick="issueBill()">Issue Bill & View Ledger</button>
                     </div>
 
                     <div>
-                        <div style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
-                            <h4 style="margin-top:0;">2. Record Payment</h4>
+                        <div style="background: #e9ecef; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                            <h4 style="margin-top:0;">2. Student Ledger & Payments</h4>
+                            <p style="font-size: 0.85rem; color: #555;">Search a student to instantly view their bills, check balances, and record payments.</p>
                             <div class="grid-2">
-                                <input type="number" id="pFeeId" placeholder="Fee ID">
-                                <input type="number" id="pAmount" placeholder="Amount (GHS)">
+                                <input type="number" id="stateStuId" placeholder="Student ID">
+                                <button class="btn btn-primary" style="background: var(--primary);" onclick="loadStatement()">Open Ledger</button>
                             </div>
-                            <select id="pMethod"><option value="Cash">Cash</option><option value="Mobile Money (MoMo)">Mobile Money</option></select>
-                            <button class="btn btn-success" onclick="sendAction('/api/fees/pay', {fee_id: document.getElementById('pFeeId').value, amount_paid: document.getElementById('pAmount').value, payment_method: document.getElementById('pMethod').value})">Log Payment</button>
                         </div>
-                        <div style="background: #fff3cd; padding: 15px; border-radius: 8px; border: 1px solid var(--warning);">
-                            <h4 style="margin-top:0;">3. Log Operational Expense</h4>
+                        
+                        <div style="background: #fff3cd; padding: 15px; border-radius: 8px; border: 1px solid var(--warning); margin-bottom: 15px;">
+                            <h4 style="margin-top:0;">3. Arrears & Debtors Tracker</h4>
+                            <button class="btn btn-warning" onclick="loadDebtors()">View All Students Who Owe</button>
+                        </div>
+                        
+                        <div style="background: #f8d7da; padding: 15px; border-radius: 8px; border: 1px solid var(--danger);">
+                            <h4 style="margin-top:0;">4. Log Operational Expense</h4>
                             <select id="eCat"><option value="Staff Salaries">Staff Salaries</option><option value="Boarding Provisions">Boarding Provisions</option><option value="Utilities">Utilities</option></select>
                             <div class="grid-2"><input type="text" id="eDesc" placeholder="Desc"><input type="number" id="eAmount" placeholder="Amount"></div>
                             <button class="btn btn-danger" onclick="sendAction('/api/expenses', {category: document.getElementById('eCat').value, description: document.getElementById('eDesc').value, amount: document.getElementById('eAmount').value})">Log Outflow</button>
@@ -742,8 +767,6 @@ def dashboard():
                     <h3>Terminal Reports</h3>
                     <input type="number" id="repId" placeholder="Student ID">
                     <button class="btn btn-success" onclick="loadReport()">View Terminal Report Card</button>
-                    <hr style="margin:20px 0; border:1px solid #eee;">
-                    <button class="btn btn-info" onclick="loadStatement()">View Financial Statement</button>
                 </div>
             </div>
 
@@ -890,6 +913,47 @@ def dashboard():
                 } catch(e) { showToast("Connection failed", true); }
             }
 
+            // --- THE NEW ISSUANCE AND PAYMENT ENGINE ---
+            async function issueBill() {
+                const stuId = document.getElementById('bStuId').value;
+                const payload = {
+                    student_id: stuId,
+                    fee_category: document.getElementById('bCat').value,
+                    amount_due: document.getElementById('bAmount').value,
+                    academic_year: document.getElementById('bYear').value,
+                    term: document.getElementById('bTerm').value,
+                    description: document.getElementById('bDesc').value
+                };
+                try {
+                    const res = await fetch('/api/fees/bill', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+                    const data = await res.json();
+                    if(res.ok) {
+                        showToast(data.message);
+                        document.getElementById('bAmount').value = '';
+                        document.getElementById('bDesc').value = '';
+                        // Instantly auto-load the statement so they can visually confirm
+                        loadStatement(stuId);
+                    } else { showToast(data.error, true); }
+                } catch(e) { showToast("Connection failed", true); }
+            }
+
+            async function processPayment(feeId, balance, stuId) {
+                if(balance <= 0) { showToast("This bill is fully paid.", true); return; }
+                const amount = prompt("Enter payment amount (GHS) for Fee ID " + feeId + ":\\nOutstanding Balance: GHS " + balance);
+                if(!amount || isNaN(amount) || amount <= 0) return;
+                const method = prompt("Enter payment method (Cash / MoMo):", "Cash");
+                if(!method) return;
+                
+                try {
+                    const res = await fetch('/api/fees/pay', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({fee_id: feeId, amount_paid: amount, payment_method: method}) });
+                    const data = await res.json();
+                    if(res.ok) {
+                        showToast(data.message);
+                        loadStatement(stuId); // Auto-refresh the ledger to show the new balance
+                    } else { showToast(data.error, true); }
+                } catch(e) { showToast("Connection failed", true); }
+            }
+
             async function loadSchools() {
                 const res = await fetch('/api/superadmin/schools');
                 if(!res.ok) return;
@@ -951,10 +1015,22 @@ def dashboard():
                         let val = row[k];
                         if (k === 'photo') {
                             html += `<td style="padding:10px; border-bottom:1px solid #ddd; width: 60px;"><img src="/api/photo/${row['student_id']}" style="width:45px; height:45px; border-radius:50%; object-fit:cover; border:2px solid #ccc; background:#eee;"></td>`;
-                        } else if (k === 'action_delete_student') {
-                            html += `<td style="padding:10px; border-bottom:1px solid #ddd;"><button class="btn btn-danger" style="padding:4px 8px; font-size:0.8rem; margin:0; width:auto;" onclick="deleteStudent(${row['student_id']})">Delete</button></td>`;
-                        } else if (k === 'remaining_balance' && val > 0) {
-                            html += `<td style="color:#dc3545; font-weight:bold; padding:10px; border-bottom:1px solid #ddd;">${val}</td>`;
+                        } else if (k === 'action_pay') {
+                            if (row['remaining_balance'] > 0) {
+                                html += `<td style="padding:10px; border-bottom:1px solid #ddd;"><button class="btn btn-success" style="padding:4px 12px; font-size:0.85rem; margin:0; width:auto;" onclick="processPayment(${row['fee_id']}, ${row['remaining_balance']}, ${row['student_id']})">Pay Bill</button></td>`;
+                            } else {
+                                html += `<td style="padding:10px; border-bottom:1px solid #ddd; color:var(--accent); font-weight:bold;">Cleared</td>`;
+                            }
+                        } else if (k === 'action_roster') {
+                            html += `<td style="padding:10px; border-bottom:1px solid #ddd;">
+                                <button class="btn btn-info" style="padding:4px 8px; font-size:0.8rem; margin:0 2px; width:auto;" onclick="showSection('finance-section'); loadStatement(${row['student_id']});">💰 Ledger</button>
+                                <button class="btn btn-danger" style="padding:4px 8px; font-size:0.8rem; margin:0 2px; width:auto;" onclick="deleteStudent(${row['student_id']})">🗑️</button>
+                            </td>`;
+                        } else if (k === 'action_debtor') {
+                            html += `<td style="padding:10px; border-bottom:1px solid #ddd;"><button class="btn btn-info" style="padding:4px 8px; font-size:0.8rem; margin:0; width:auto;" onclick="loadStatement(${row['student_id']})">Open Ledger</button></td>`;
+                        } else if (k === 'remaining_balance' || k === 'arrears') {
+                            let color = val > 0 ? '#dc3545' : '#28a745';
+                            html += `<td style="color:${color}; font-weight:bold; padding:10px; border-bottom:1px solid #ddd;">${val}</td>`;
                         } else if (k === 'boarding_status') {
                             let badge = val === 'Boarding' ? 'background:#0f4c81;color:white;' : 'background:#eee;color:black;';
                             html += `<td style="padding:10px; border-bottom:1px solid #ddd;"><span style="${badge}padding:3px 8px;border-radius:12px;font-size:0.8rem;">${val}</span></td>`;
@@ -971,11 +1047,15 @@ def dashboard():
 
             async function loadRoster() {
                 const res = await fetch('/api/students'); const data = await res.json();
-                renderTable("Student Roster", ['Photo', 'ID', 'First Name', 'Last Name', 'Status', 'House', 'Guardian Contact', 'Action'], data.data, ['photo', 'student_id', 'first_name', 'last_name', 'boarding_status', 'house', 'guardian_contact', 'action_delete_student']);
+                renderTable("Student Roster", ['Photo', 'ID', 'First Name', 'Last Name', 'Status', 'House', 'Guardian Contact', 'Actions'], data.data, ['photo', 'student_id', 'first_name', 'last_name', 'boarding_status', 'house', 'guardian_contact', 'action_roster']);
             }
             async function loadExpenses() {
                 const res = await fetch('/api/expenses'); const data = await res.json();
                 renderTable("Expense Ledger", ['Date', 'Category', 'Description', 'Amount (GHS)'], data.data, ['date', 'category', 'description', 'amount']);
+            }
+            async function loadDebtors() {
+                const res = await fetch('/api/debtors'); const data = await res.json();
+                renderTable("Arrears & Debtors Tracker", ['ID', 'First Name', 'Last Name', 'Parent Contact', 'Total Owed (GHS)', 'Action'], data.data, ['student_id', 'first_name', 'last_name', 'guardian_contact', 'arrears', 'action_debtor']);
             }
             async function loadReport() {
                 const id = document.getElementById('repId').value;
@@ -984,12 +1064,13 @@ def dashboard():
                 const data = await res.json();
                 renderTable("Terminal Report Card", ['Subject', 'Class', 'Exam', 'Total', 'Grade', 'Remarks', 'Term'], data.grades, ['subject_name', 'class_score', 'exam_score', 'total_score', 'waec_grade', 'teacher_remarks', 'term']);
             }
-            async function loadStatement() {
-                const id = document.getElementById('repId').value;
+            async function loadStatement(overrideId) {
+                const id = overrideId || document.getElementById('stateStuId').value;
+                if(!id) { showToast("Please enter a Student ID", true); return; }
                 const res = await fetch('/api/statement/' + id);
-                if (!res.ok) { showToast("Not Found", true); return; }
+                if (!res.ok) { showToast("Ledger Not Found", true); return; }
                 const data = await res.json();
-                renderTable("Segmented Ledger", ['Fee ID', 'Category', 'Year', 'Term', 'Due', 'Paid', 'Arrears'], data.statement, ['fee_id', 'fee_category', 'academic_year', 'term', 'amount_due', 'total_paid', 'remaining_balance']);
+                renderTable("Financial Ledger (Student ID: " + id + ")", ['Bill Type', 'Year', 'Term', 'Desc', 'Due', 'Paid', 'Balance', 'Action'], data.statement, ['fee_category', 'academic_year', 'term', 'description', 'amount_due', 'total_paid', 'remaining_balance', 'action_pay']);
             }
 
             let financeChartInstance = null;
