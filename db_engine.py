@@ -41,11 +41,14 @@ class User(UserMixin):
 
     @staticmethod
     def get(user_id):
-        conn = get_db_connection(); cur = conn.cursor()
-        cur.execute("SELECT user_id, email, role, linked_student_id, school_id FROM system_users WHERE user_id = %s", (user_id,))
-        user_data = cur.fetchone(); cur.close(); conn.close()
-        if user_data: return User(user_data['user_id'], user_data['email'], user_data['role'], user_data['linked_student_id'], user_data['school_id'])
-        return None
+        try:
+            conn = get_db_connection(); cur = conn.cursor()
+            cur.execute("SELECT user_id, email, role, linked_student_id, school_id FROM system_users WHERE user_id = %s", (user_id,))
+            user_data = cur.fetchone(); cur.close(); conn.close()
+            if user_data: return User(user_data['user_id'], user_data['email'], user_data['role'], user_data['linked_student_id'], user_data['school_id'])
+            return None
+        except Exception:
+            return None
 
 def initialize_database():
     conn = get_db_connection(); cur = conn.cursor()
